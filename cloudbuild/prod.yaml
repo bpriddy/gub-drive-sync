@@ -1,0 +1,75 @@
+###############################################################################
+# Cloud Build — production environment
+# Trigger: push to `main` (single-env today; once prod exists, this becomes
+# the prod config and dev moves to its own branch).
+#
+# Cloud Run Job. No traffic/promotion (`jobs deploy` updates the
+# definition; the next `jobs:run` uses it).
+###############################################################################
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: gub-drive-sync
+  _JOB: gub-drive-sync-prod
+  _DB_SECRET: gub-drive-sync-db-url-prod
+  _BOT_CLIENT_ID_SEC: gub-drive-sync-bot-oauth-client-id-prod
+  _BOT_CLIENT_SEC_SEC: gub-drive-sync-bot-oauth-client-secret-prod
+  _GEMINI_SECRET: gub-drive-sync-gemini-api-key-prod
+  _MAILGUN_SECRET: gub-drive-sync-mailgun-api-key-prod
+  _CLOUDSQL_INSTANCE: gub-platform
+  _DRIVE_ROOT_FOLDER_ID: ""
+  _GUB_ADMIN_BASE_URL: http://localhost:5173
+  _GUB_REVIEW_BASE_URL: ""
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+steps:
+  - id: typecheck
+    name: node:22-slim
+    entrypoint: sh
+    args:
+      - -c
+      - npm ci && npx prisma generate && npx tsc --noEmit
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB:$SHORT_SHA
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB:latest
+      - .
+    waitFor: [typecheck]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB
+    waitFor: [build]
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - $_JOB
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB:$SHORT_SHA
+      - --region=$_REGION
+      - --tasks=1
+      - --parallelism=1
+      - --max-retries=0
+      - --task-timeout=86400s
+      - --memory=1Gi
+      - --cpu=1
+      - --service-account=sa-$_JOB@$PROJECT_ID.iam.gserviceaccount.com
+      - --set-cloudsql-instances=$PROJECT_ID:$_REGION:$_CLOUDSQL_INSTANCE
+      - --set-env-vars=NODE_ENV=production,GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=$_REGION,DRIVE_SYNC_JOB_NAME=$_JOB,DRIVE_ROOT_FOLDER_ID=$_DRIVE_ROOT_FOLDER_ID,DRIVE_DELAY_BETWEEN_ACCOUNTS_MS=5000,DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS=2000,DRIVE_DELAY_BETWEEN_FILES_MS=500,DRIVE_MAX_FILE_SIZE_BYTES=26214400,DRIVE_PROPOSAL_TTL_DAYS=14,GEMINI_MAX_INPUT_CHARS=40000,MAIL_DRIVER=mailgun,MAIL_FROM_NAME=GUB,MAILGUN_REGION=us,GUB_ADMIN_BASE_URL=$_GUB_ADMIN_BASE_URL,GUB_REVIEW_BASE_URL=$_GUB_REVIEW_BASE_URL
+      - --set-secrets=DATABASE_URL=$_DB_SECRET:latest,GUB_BOT_OAUTH_CLIENT_ID=$_BOT_CLIENT_ID_SEC:latest,GUB_BOT_OAUTH_CLIENT_SECRET=$_BOT_CLIENT_SEC_SEC:latest,GEMINI_API_KEY=$_GEMINI_SECRET:latest,MAILGUN_API_KEY=$_MAILGUN_SECRET:latest
+    waitFor: [push]

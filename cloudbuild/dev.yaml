@@ -1,0 +1,111 @@
+###############################################################################
+# Cloud Build — dev environment
+# Trigger: push to `main` (single-env convention today; see README)
+#
+# Deploys a Cloud Run **Job**, not a Service. The Job has no HTTP surface,
+# no port, no ingress. It is started only via the Cloud Run Admin API
+# (`jobs:run`) by:
+#   - Cloud Scheduler          → mode=poll
+#   - gub-admin "Sync now"     → mode=run-full-sync
+#   - The Job itself           → mode=continue (chunked-sync continuation)
+#   - Operator gcloud          → any mode, manual
+# `jobs deploy` has no traffic/promotion step (that's Services only);
+# next `jobs:run` uses the new image.
+#
+# Substitutions:
+#   _REGION             e.g. us-central1
+#   _AR_REPO            Artifact Registry repo (gub-drive-sync)
+#   _JOB                Cloud Run Job name (gub-drive-sync-dev)
+#   _DB_SECRET          Secret Manager name for DATABASE_URL
+#   _BOT_CLIENT_ID_SEC  Secret name for GUB_BOT_OAUTH_CLIENT_ID
+#   _BOT_CLIENT_SEC_SEC Secret name for GUB_BOT_OAUTH_CLIENT_SECRET
+#   _GEMINI_SECRET      Secret name for GEMINI_API_KEY (optional in dev)
+#   _MAILGUN_SECRET     Secret name for MAILGUN_API_KEY (optional in dev)
+#   _CLOUDSQL_INSTANCE  Cloud SQL instance ID (gub-platform)
+#   _DRIVE_ROOT_FOLDER_ID  Configured per-env via substitution (no secret;
+#                          it's not sensitive, just an env-specific id).
+#   _GUB_ADMIN_BASE_URL    e.g. https://gub-admin-dev-<hash>.run.app
+#   _GUB_REVIEW_BASE_URL   e.g. https://gub-review-dev-<hash>.run.app
+###############################################################################
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: gub-drive-sync
+  _JOB: gub-drive-sync-dev
+  _DB_SECRET: gub-drive-sync-db-url-dev
+  _BOT_CLIENT_ID_SEC: gub-drive-sync-bot-oauth-client-id-dev
+  _BOT_CLIENT_SEC_SEC: gub-drive-sync-bot-oauth-client-secret-dev
+  _GEMINI_SECRET: gub-drive-sync-gemini-api-key-dev
+  _MAILGUN_SECRET: gub-drive-sync-mailgun-api-key-dev
+  _CLOUDSQL_INSTANCE: gub-platform
+  _DRIVE_ROOT_FOLDER_ID: ""
+  _GUB_ADMIN_BASE_URL: http://localhost:5173
+  _GUB_REVIEW_BASE_URL: ""
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_MEDIUM
+
+steps:
+  # ── 1. Type check ─────────────────────────────────────────────────────────
+  - id: typecheck
+    name: node:22-slim
+    entrypoint: sh
+    args:
+      - -c
+      - npm ci && npx prisma generate && npx tsc --noEmit
+
+  # ── 2. Build image ────────────────────────────────────────────────────────
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB:$SHORT_SHA
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB:latest
+      - .
+    waitFor: [typecheck]
+
+  # ── 3. Push image ─────────────────────────────────────────────────────────
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB
+    waitFor: [build]
+
+  # ── 4. Deploy the Cloud Run Job ───────────────────────────────────────────
+  # Job posture:
+  #   --tasks=1 --parallelism=1   one container per execution; the runner
+  #                               is single-threaded by design (drive sync
+  #                               serializes file extraction).
+  #   --max-retries=0             the runner has its own reaper +
+  #                               concurrency guard; a Cloud Run task
+  #                               retry would just re-enter and either
+  #                               409 or re-do work that's already done.
+  #   --task-timeout=86400s       outer guard. Real budgets live inside:
+  #                               CHUNK_BUDGET_MS=50min in drive.runner.ts,
+  #                               and the reaper's 24h/1h thresholds.
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - $_JOB
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB:$SHORT_SHA
+      - --region=$_REGION
+      - --tasks=1
+      - --parallelism=1
+      - --max-retries=0
+      - --task-timeout=86400s
+      - --memory=1Gi
+      - --cpu=1
+      - --service-account=sa-$_JOB@$PROJECT_ID.iam.gserviceaccount.com
+      - --set-cloudsql-instances=$PROJECT_ID:$_REGION:$_CLOUDSQL_INSTANCE
+      - --set-env-vars=NODE_ENV=production,GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=$_REGION,DRIVE_SYNC_JOB_NAME=$_JOB,DRIVE_ROOT_FOLDER_ID=$_DRIVE_ROOT_FOLDER_ID,DRIVE_DELAY_BETWEEN_ACCOUNTS_MS=5000,DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS=2000,DRIVE_DELAY_BETWEEN_FILES_MS=500,DRIVE_MAX_FILE_SIZE_BYTES=26214400,DRIVE_PROPOSAL_TTL_DAYS=14,GEMINI_MAX_INPUT_CHARS=40000,MAIL_DRIVER=console,MAIL_FROM_NAME=GUB,MAILGUN_REGION=us,GUB_ADMIN_BASE_URL=$_GUB_ADMIN_BASE_URL,GUB_REVIEW_BASE_URL=$_GUB_REVIEW_BASE_URL
+      - --set-secrets=DATABASE_URL=$_DB_SECRET:latest,GUB_BOT_OAUTH_CLIENT_ID=$_BOT_CLIENT_ID_SEC:latest,GUB_BOT_OAUTH_CLIENT_SECRET=$_BOT_CLIENT_SEC_SEC:latest,GEMINI_API_KEY=$_GEMINI_SECRET:latest,MAILGUN_API_KEY=$_MAILGUN_SECRET:latest
+    waitFor: [push]

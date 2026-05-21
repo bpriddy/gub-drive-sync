@@ -1,0 +1,223 @@
+# gub-drive-sync
+
+A **Cloud Run Job** (not a service) that runs the machine-driven Google
+Drive sync for GUB. It hosts the six modes that used to live as HTTP
+endpoints in `gcp-universal-backend`:
+
+| Mode | What it does | Who triggers it |
+|---|---|---|
+| `poll` | Incremental `changes.list` delta; dispatches a full sync only when in-scope changes exist | Cloud Scheduler (`drive-poll-<env>`) |
+| `run-full-sync` | Bootstrap / "Sync now"; full discover + scan; captures fresh page token at end | gub-admin Sync button + operator gcloud |
+| `continue` | Self-trigger continuation when a chunked sync hits its 50-min wall-clock budget | This Job itself (Admin API → its own Job, fresh execution) |
+| `cron` | Legacy alias for `run-full-sync` | (kept for compat) |
+| `notify` | On-demand reviewer email fan-out | Operator gcloud (rarely) |
+| `sweep-expired` | Flip pending proposals past `expires_at` to `state='expired'` | Cron / operator |
+
+The reviewer-facing magic-link endpoints (`GET /review/:token`,
+`POST /review/:token/decide`) stay in `gcp-universal-backend` for now —
+those are browser-reachable surfaces that the Cloud Run Job model can't
+host. The eventual home for them is a standalone non-IAP token-auth
+service (pattern B in the standalone-service topology), but that's a
+separate workstream.
+
+## Why a Cloud Run Job
+
+- **Zero public surface.** A Job has no URL, no port, no HTTP listener.
+  Nothing to scan or DDoS. The only way it starts is the Cloud Run Admin
+  API (`jobs:run`), which is IAM-gated.
+- **No IAP fight.** gub-admin sits behind Cloud Run integrated IAP. A
+  machine trigger (Cloud Scheduler, a self-trigger callback) can't pass
+  IAP — same wall gub-bot-oauth and gub-research-worker hit. A Job
+  sidesteps it entirely: there's no door for IAP to guard.
+- **Long-running.** Full Drive syncs can take 50-min chunks; the runner
+  pauses and self-triggers a fresh execution at chunk boundaries. A
+  Cloud Run **service** request maxes at 60 min; a Job's task-timeout
+  ceiling is 24 h. Plenty of margin.
+- **Sensitive code isolated.** The Drive bot's OAuth client secret, the
+  Gemini key, and Mailgun creds live only in this Job's Secret Manager
+  mount. Neither GUB nor gub-admin sees them post-migration.
+
+## Architecture
+
+```
+TRIGGERS (no Cloud Scheduler clock for run-full-sync; an explicit cause
+          fires each Job execution):
+
+  Cloud Scheduler `drive-poll-<env>`  ──→  jobs:run, args=["poll"]
+                                           │
+                                           │ if in-scope changes:
+                                           ▼
+                                       jobs:run, args=["run-full-sync"]
+                                       (kicked off inside the same Job
+                                        process via the runner)
+
+  gub-admin "Sync now" button       ──→   jobs:run, args=["run-full-sync"]
+
+  Operator gcloud                   ──→   jobs:run --args=...
+
+THE RUNNER (one process per execution):
+
+  main.ts (dispatch on argv[2])
+    │
+    ├── poll               → reaper + runIncrementalPoll
+    ├── run-full-sync      → reaper + startFullSync (chunked, in-process)
+    ├── continue           → reaper + continuePausedSync
+    ├── cron               → alias for run-full-sync
+    ├── notify             → notifyReviewers
+    └── sweep-expired      → sweepExpiredProposals
+
+  CHUNKED FULL SYNC:
+    50-min wall-clock budget per chunk. When budget trips:
+      1. Persist sync_run.status='paused' + chunk_phase + chunk_index
+      2. jobs:run on THIS job, args=["continue", "--sync-run-id", X]
+      3. Exit cleanly. A fresh execution picks up from the checkpoint.
+```
+
+The self-trigger replaces the old HTTP self-POST. The runtime SA has
+`roles/run.developer` scoped to its own job (set by `setup-gcp.sh`
+after first deploy). Concurrent executions are safe by design: the
+runner's concurrency guard in `startFullSync()` refuses to start a new
+sync while one is `running` or `paused`.
+
+## What stays in `gcp-universal-backend`
+
+| Thing | Why |
+|---|---|
+| `drive.review.ts` + `GET/POST /review/:token` endpoints | Email-link reviewer surface; reviewers don't have IAP sessions, so this needs a browser-reachable host. Pattern-B home is deferred — stays in GUB for the first pass. |
+| `drive.schema.ts` (the writable-field allowlists + validators) | Source of truth lives in GUB so `drive.review.ts` can use it. **Mirrored into this repo** — see the loud banner at the top of `src/drive/schema.ts`. |
+| `drive_*` migrations (`drive_change_proposals`, `drive_file_snapshots`, `drive_scan_logs`, `drive_sync_state`, `sync_runs` extensions) | Schema lives in GUB; this Job reads + writes via its own Prisma client (full mirror of `prisma/schema.prisma`, same pattern gub-admin + gub-research-worker use). |
+
+## What this Job needs
+
+See `.env.example`. Required at runtime:
+- `DATABASE_URL` — shared GUB DB
+- `GUB_BOT_OAUTH_CLIENT_ID` + `GUB_BOT_OAUTH_CLIENT_SECRET` — the same
+  bot-OAuth client that gub-admin uses for the consent flow. At runtime
+  we mint short-lived access tokens from the `drive` bot's refresh
+  token (`bot_credentials` row, written by gub-admin's Settings → Sync
+  Credentials → Authorize on `drive`).
+- `GCP_PROJECT_ID` + `GCP_REGION` + `DRIVE_SYNC_JOB_NAME` — so the
+  runner can self-trigger continuation executions.
+
+Optional (degrade gracefully):
+- `GEMINI_API_KEY` — unset falls back to a mock driver that returns
+  schema-shaped empty responses. Pipeline still runs end-to-end in dev.
+- `MAILGUN_API_KEY` + `MAILGUN_DOMAIN` + `MAIL_FROM_ADDRESS` — unset
+  falls back to console-driver dry-run.
+- `DRIVE_ROOT_FOLDER_ID` — when unset, new-entity discovery is a no-op.
+  Per-entity scans still work.
+
+## Local dev
+
+```bash
+cp .env.example .env       # fill DATABASE_URL + GUB_BOT_OAUTH_*
+npm install
+npm run dev poll           # or run-full-sync / continue / etc.
+```
+
+`npm run dev` runs `src/main.ts` via `tsx`. The first positional arg is
+the mode; subsequent flags are mode-specific (`--sync-run-id=<uuid>` for
+`continue`).
+
+## CI / CD
+
+Same convention as the other GUB repos. Single Cloud Build trigger on
+`main` → `cloudbuild/dev.yaml`, deploying the Cloud Run Job
+`gub-drive-sync-dev`. `staging.yaml` / `prod.yaml` are committed for
+when prod exists; their triggers are added then. Unlike a Service, a
+Job has **no traffic/promotion step** — `jobs deploy` updates the
+definition and the next `jobs:run` uses the new image.
+
+### First-time GCP bootstrap
+
+```bash
+./scripts/setup-gcp.sh <project-id> us-central1
+```
+
+Idempotent. Creates: the Artifact Registry repo; per-env runtime SAs
+(`sa-gub-drive-sync-{dev,staging,prod}`) with cloudsql.client +
+secretmanager.secretAccessor + log/trace/metric writer; five Secret
+Manager placeholders per env (db url, bot OAuth client id, bot OAuth
+client secret, Gemini key, Mailgun key); Cloud Build SA permissions;
+the `main` trigger; and (after the Job exists) three job-scoped
+bindings:
+
+| Member | Role | Reason |
+|---|---|---|
+| `sa-gub-admin-<env>` | `roles/run.developer` | Sync button fires the Job |
+| `sa-gub-drive-sync-<env>` | `roles/run.developer` | Runner self-triggers `continue` |
+| `sa-gcp-universal-backend-<env>` | `roles/run.invoker` | Cloud Scheduler `drive-poll-<env>` fires the Job (OIDC) |
+
+The script prints the remaining manual steps:
+
+1. Connect the GitHub repo to Cloud Build (browser, one-time).
+2. Populate the five secrets per env.
+3. Push to `main` → first deploy creates the Job.
+4. **Re-run `setup-gcp.sh`** — the three job-scoped bindings can't be
+   created until the Job exists.
+5. Apply the updated `gcp-universal-backend/terraform/drive_poll.tf` so
+   the Cloud Scheduler `drive-poll-<env>` job posts to the Admin API
+   instead of GUB. (Done as a separate `terraform apply` — coordinate
+   with the operator.)
+6. Update gub-admin env: add `DRIVE_SYNC_JOB_NAME=gub-drive-sync-<env>`
+   so its Sync button fires the right Job. See gub-admin/cloudbuild/
+   <env>.yaml.
+
+## Triggering manually
+
+```bash
+# Operator laptop (ADC) — fire one mode:
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=poll
+
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=run-full-sync
+
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=continue,--sync-run-id,<uuid>
+
+# Sweep expired proposals:
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=sweep-expired
+```
+
+## Prod implementation checklist
+
+When a prod environment exists:
+
+1. `./scripts/setup-gcp.sh <prod-project> us-central1` (idempotent).
+2. Connect the repo to Cloud Build if new project.
+3. Populate secrets per the script's printed instructions.
+4. Push `main`; first deploy creates `gub-drive-sync-prod`.
+5. Re-run `setup-gcp.sh` to bind the three job-scoped roles.
+6. Apply terraform to retarget `drive-poll-prod` Cloud Scheduler at the
+   Admin API.
+7. Confirm gub-admin's prod env carries `GCP_PROJECT_ID` / `GCP_REGION`
+   / `DRIVE_SYNC_JOB_NAME=gub-drive-sync-prod`.
+8. Smoke test: hit gub-admin's Sync button on the Drive data source,
+   watch the Job execution in Cloud Run job history, confirm a fresh
+   `sync_runs` row lands with `status='success'` (or `paused` then a
+   second execution running `continue` if the run chunked).
+
+## Known temporary debt
+
+**`drive.schema.ts` is mirrored, not shared.** This repo's
+`src/drive/schema.ts` is a duplicate of
+`gcp-universal-backend/src/modules/integrations/google-drive/drive.schema.ts`.
+Both versions must stay in lockstep — they encode the same writable-field
+allowlists, Zod validators, current-state shapers, and `FieldWriteSpec`
+table. Adding a new writable field requires editing both files plus a
+migration.
+
+This is intentional for the first pass:
+
+- Same pattern as `prisma/schema.prisma` (mirrored across GUB,
+  gub-admin, gub-research-worker, and this repo).
+- Pulling into a shared `@gub/drive-schema` npm package adds release
+  ceremony pre-launch that buys little.
+- The allowlist changes are rare (the casting tool is past the
+  what-fields-do-we-track phase).
+
+A loud banner at the top of `src/drive/schema.ts` calls this out, and so
+does `gcp-universal-backend/src/modules/integrations/google-drive/drive.schema.ts`.
+Future consolidation into a shared package is captured as a follow-up.
