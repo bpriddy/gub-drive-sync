@@ -28,6 +28,15 @@
 #   _GUB_REVIEW_BASE_URL   e.g. https://gub-review-dev-<hash>.run.app
 ###############################################################################
 
+# Specifying serviceAccount in the build config (not just at the trigger
+# level) is what makes Cloud Build's logs-config validation reliable when
+# a custom SA is used. With this set, the options.logging directive below
+# is unambiguously the source of truth — no merging-with-trigger-config
+# surprises that fail validation with the "build.service_account
+# specified, must use logs_bucket / REGIONAL_USER_OWNED_BUCKET /
+# CLOUD_LOGGING_ONLY" error.
+serviceAccount: 'projects/$PROJECT_ID/serviceAccounts/sa-gub-drive-sync-dev@$PROJECT_ID.iam.gserviceaccount.com'
+
 substitutions:
   _REGION: us-central1
   _AR_REPO: gub-drive-sync
