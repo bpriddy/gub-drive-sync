@@ -38,6 +38,7 @@ import { GoogleAuth } from 'google-auth-library';
 import { config } from '../config';
 import { prisma } from '../prisma';
 import { logger } from '../logger';
+import { progress, summarizeError } from '../progress';
 import { discoverNewEntities } from './discover';
 import { notifyReviewers } from './notify';
 import { captureStartPageTokenAfterFullSync } from './poll';
@@ -229,24 +230,39 @@ async function executeFullSync(
 
   const overBudget = (): boolean => Date.now() - startedAt > CHUNK_BUDGET_MS;
 
+  progress.start('Drive sync started', syncRunId);
+
   try {
     // ── Phase 1: Discovery ────────────────────────────────────────────────
     // Discovery is one shot per run — never resumed mid-phase, only skipped
     // entirely if we're resuming from a later phase.
     if (startPhase <= PHASE_DISCOVERY) {
+      progress.phase('Phase 1: Discovery');
+      if (!config.DRIVE_ROOT_FOLDER_ID) {
+        progress.phaseNote('skipped — DRIVE_ROOT_FOLDER_ID unset');
+      }
       const discover = await discoverNewEntities({ syncRunId });
       totals.accountsProposed = discover.accountsProposed;
       totals.campaignsProposed = discover.campaignsProposed;
       totals.foldersSkipped = discover.foldersSkipped;
+      if (config.DRIVE_ROOT_FOLDER_ID) {
+        progress.info(
+          `${discover.accountsProposed} new accounts, ${discover.campaignsProposed} new campaigns, ${discover.foldersSkipped} folders skipped`,
+        );
+      }
     }
 
     // ── Phase 2: Linked accounts ──────────────────────────────────────────
     if (startPhase <= PHASE_ACCOUNTS && !pauseAt) {
+      progress.phase('Phase 2: Accounts');
       const accounts = await prisma.account.findMany({
         where: { driveFolderId: { not: null } },
         select: { id: true, name: true },
         orderBy: { id: 'asc' }, // stable ordering across resumes
       });
+      if (accounts.length === 0) {
+        progress.phaseNote('no accounts with drive_folder_id');
+      }
       const fromIndex = startPhase === PHASE_ACCOUNTS ? startIndex : 0;
       for (let i = fromIndex; i < accounts.length; i++) {
         if (overBudget()) {
@@ -254,6 +270,8 @@ async function executeFullSync(
           break;
         }
         const account = accounts[i]!;
+        progress.entity(`account: ${account.name}`);
+        const entityStartedAt = Date.now();
         try {
           const res = await scanEntity({
             entityType: 'account',
@@ -262,9 +280,28 @@ async function executeFullSync(
           });
           tallyScanResult(totals, res);
           totals.accountsScanned++;
+          progress.entityDone(account.name, {
+            filesSeen: res.scan.filesSeen,
+            filesExtracted: res.scan.filesExtracted,
+            filesSkipped:
+              res.scan.filesSkippedDelta +
+              res.scan.filesSkippedMime +
+              res.scan.filesSkippedSize +
+              res.scan.filesEmpty,
+            filesErrored: res.scan.errors,
+            proposalsCreated: res.proposalsCreated,
+            notesWritten: res.notesWritten,
+            ambiguousWritten: res.ambiguousWritten,
+            durationMs: Date.now() - entityStartedAt,
+          });
         } catch (err) {
           totals.errors++;
-          logger.error({ err, accountId: account.id }, '[drive.runner] scanEntity(account) failed');
+          // Demoted to debug: progress.entityError surfaces a one-line
+          // summary; the full payload is written to drive_scan_logs by
+          // the inner code paths that detect it (or stays in the thrown
+          // Error if it bubbled all the way out).
+          logger.debug({ err, accountId: account.id }, '[drive.runner] scanEntity(account) failed');
+          progress.entityError(`account: ${account.name}`, summarizeError(err));
         }
         await pace(config.DRIVE_DELAY_BETWEEN_ACCOUNTS_MS);
       }
@@ -272,11 +309,15 @@ async function executeFullSync(
 
     // ── Phase 3: Linked campaigns ─────────────────────────────────────────
     if (startPhase <= PHASE_CAMPAIGNS && !pauseAt) {
+      progress.phase('Phase 3: Campaigns');
       const campaigns = await prisma.campaign.findMany({
         where: { driveFolderId: { not: null } },
         select: { id: true, name: true, accountId: true },
         orderBy: { id: 'asc' },
       });
+      if (campaigns.length === 0) {
+        progress.phaseNote('no campaigns with drive_folder_id');
+      }
       const fromIndex = startPhase === PHASE_CAMPAIGNS ? startIndex : 0;
       for (let i = fromIndex; i < campaigns.length; i++) {
         if (overBudget()) {
@@ -284,6 +325,8 @@ async function executeFullSync(
           break;
         }
         const campaign = campaigns[i]!;
+        progress.entity(`campaign: ${campaign.name}`);
+        const entityStartedAt = Date.now();
         try {
           const res = await scanEntity({
             entityType: 'campaign',
@@ -293,9 +336,24 @@ async function executeFullSync(
           });
           tallyScanResult(totals, res);
           totals.campaignsScanned++;
+          progress.entityDone(campaign.name, {
+            filesSeen: res.scan.filesSeen,
+            filesExtracted: res.scan.filesExtracted,
+            filesSkipped:
+              res.scan.filesSkippedDelta +
+              res.scan.filesSkippedMime +
+              res.scan.filesSkippedSize +
+              res.scan.filesEmpty,
+            filesErrored: res.scan.errors,
+            proposalsCreated: res.proposalsCreated,
+            notesWritten: res.notesWritten,
+            ambiguousWritten: res.ambiguousWritten,
+            durationMs: Date.now() - entityStartedAt,
+          });
         } catch (err) {
           totals.errors++;
-          logger.error({ err, campaignId: campaign.id }, '[drive.runner] scanEntity(campaign) failed');
+          logger.debug({ err, campaignId: campaign.id }, '[drive.runner] scanEntity(campaign) failed');
+          progress.entityError(`campaign: ${campaign.name}`, summarizeError(err));
         }
         await pace(config.DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS);
       }
@@ -328,11 +386,13 @@ async function executeFullSync(
     // ── Phase 4: Notify reviewers ────────────────────────────────────────
     // Notify is one-shot; if we got here we're past all chunked phases.
     if (startPhase <= PHASE_NOTIFY) {
+      progress.phase('Phase 4: Notify');
       try {
         const notify = await notifyReviewers({ syncRunId });
         totals.ownersEmailed = notify.ownersEmailed;
         totals.proposalsNotified = notify.proposalsNotified;
         totals.orphansLogged = notify.orphansLogged;
+        progress.notify(notify.ownersEmailed, notify.orphansLogged, notify.emailDriver);
       } catch (err) {
         totals.errors++;
         logger.error({ err, syncRunId }, '[drive.runner] notifyReviewers failed');
@@ -363,6 +423,15 @@ async function executeFullSync(
     await captureStartPageTokenAfterFullSync(syncRunId);
 
     logger.info({ syncRunId, ...summary }, '[drive.runner] full sync complete');
+    progress.summary({
+      syncRunId,
+      accountsScanned: totals.accountsScanned,
+      campaignsScanned: totals.campaignsScanned,
+      proposalsCreated: totals.proposalsCreated,
+      errors: totals.errors,
+      durationMs,
+      paused: false,
+    });
     return finalizeResult(syncRunId, totals, durationMs, /* paused */ false);
   } catch (err) {
     if (paused) {

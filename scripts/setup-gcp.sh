@@ -182,23 +182,25 @@ for ROLE in \
 done
 
 # ── Cloud Build trigger ──────────────────────────────────────────────────────
-# Single trigger on `main` → cloudbuild/dev.yaml, matching the established
-# convention in this org (gub-admin-trigger, gub-trigger, gub-research-
-# worker-trigger). Staging/prod yamls are committed for when prod exists;
-# their triggers are added then.
+# Single GLOBAL trigger on `main` → cloudbuild/dev.yaml. Matches this org's
+# convention — gub-admin-trigger, gub-trigger, etc. are all global triggers
+# (no --region flag). Cloud Build supports regional triggers for residency
+# requirements, but this project uses global because they show up in the
+# default `gcloud builds triggers list` view without --region plumbing and
+# don't pin builds to one region's quota. Staging/prod yamls are committed
+# for when prod exists; their triggers are added then.
 echo ""
 echo "── Creating Cloud Build trigger ─────────────────────────────────────────"
 TRIGGER_FAILED=0
 TRIGGER_NAME="gub-drive-sync-trigger"
-echo "→ Creating trigger: $TRIGGER_NAME (branch: ^main$, config: cloudbuild/dev.yaml)..."
+echo "→ Creating global trigger: $TRIGGER_NAME (branch: ^main$, config: cloudbuild/dev.yaml)..."
 if out=$(gcloud builds triggers create github \
             --name="$TRIGGER_NAME" \
             --repo-name="$REPO_NAME" \
             --repo-owner="$REPO_OWNER" \
             --branch-pattern='^main$' \
-            --build-config="cloudbuild/dev.yaml" \
-            --region="$REGION" 2>&1); then
-  echo "   created."
+            --build-config="cloudbuild/dev.yaml" 2>&1); then
+  echo "   created (global)."
 elif echo "$out" | grep -qi "already exists"; then
   echo "   (already exists, skipping)"
 else

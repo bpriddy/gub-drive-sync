@@ -32,13 +32,16 @@ import { logger } from '../logger';
 import { parseLlmJson, runPreset } from '../ai';
 import { listFolderChildren } from './client';
 import { extractText } from './extract';
+import { interpretFile } from './interpret';
 import { writeScanLog } from './logs';
 import {
   ACCOUNT_WRITABLE_FIELDS,
   CAMPAIGN_WRITABLE_FIELDS,
   buildAccountCurrentState,
   validateProposedValue,
+  type AccountCurrentState,
   type AccountWritableField,
+  type CampaignCurrentState,
   type CampaignWritableField,
 } from './schema';
 import { newEntityResponseSchema } from './structured-output';
@@ -46,8 +49,40 @@ import type { TraversedFile } from './types';
 
 const GOOGLE_FOLDER_MIME = 'application/vnd.google-apps.folder';
 
-/** How many files we'll open inside a candidate folder to build LLM context. */
-const DISCOVERY_FILE_BUDGET = 5;
+/**
+ * How many files we'll open inside a candidate folder to build LLM context.
+ *
+ * Lowered from 5 → 2 per D13: folders existing for hours/days with one or
+ * two files (typical: brief + transcript) should trigger detection. The
+ * cap also bounds per-file interpretation cost during discovery — for
+ * every candidate folder that *is* an entity we make this many extra
+ * interpretation calls, so keeping it tight matters.
+ */
+const DISCOVERY_FILE_BUDGET = 2;
+
+/**
+ * Empty current-state shape passed to interpretFile during discovery. The
+ * per-file extractor ignores current state in the prompt (it's a pure
+ * content extractor — see drive.interpret.ts header), so we satisfy the
+ * type with null-valued fields without faking data the entity doesn't
+ * have yet.
+ */
+const EMPTY_ACCOUNT_STATE: AccountCurrentState = {
+  status: null,
+  account_exec_staff_id: null,
+  industry: null,
+  primary_contact_name: null,
+  primary_contact_email: null,
+  notes: null,
+};
+
+const EMPTY_CAMPAIGN_STATE: CampaignCurrentState = {
+  status: null,
+  budget: null,
+  awarded_at: null,
+  live_at: null,
+  ends_at: null,
+};
 
 // ── LLM response validation ────────────────────────────────────────────────
 
@@ -119,6 +154,7 @@ export async function discoverNewEntities(input: DiscoverInput): Promise<Discove
       folder,
       accountId: null,
       parentAccountState: null,
+      parentAccountName: null,
       syncRunId: input.syncRunId,
       reviewerEmail: input.defaultReviewerEmail ?? null,
       reviewerStaffId: input.defaultReviewerStaffId ?? null,
@@ -176,6 +212,7 @@ export async function discoverNewEntities(input: DiscoverInput): Promise<Discove
         folder,
         accountId: account.id,
         parentAccountState: parentState,
+        parentAccountName: account.name,
         syncRunId: input.syncRunId,
         reviewerEmail: reviewer.email,
         reviewerStaffId: reviewer.staffId,
@@ -197,6 +234,12 @@ interface ProposeInput {
   /** For campaign proposals: the parent account. For account proposals: null. */
   accountId: string | null;
   parentAccountState: Record<string, unknown> | null;
+  /**
+   * For campaign proposals: the parent account's display name (passed to
+   * per-file interpretation so observations frame the campaign correctly).
+   * Null for top-level account proposals.
+   */
+  parentAccountName: string | null;
   syncRunId: string | null;
   reviewerEmail: string | null;
   reviewerStaffId: string | null;
@@ -307,9 +350,42 @@ async function proposeNewEntity(input: ProposeInput): Promise<ProposeOutcome> {
     });
   }
 
-  // Write all rows under one proposal_group_id.
-  await prisma.$transaction(
-    rows.map((row) =>
+  // Phase 7: collect per-file observations for the matching entity type.
+  // Synchronous w.r.t. the proposal write — we want the additional_update
+  // row landing in the same logical batch so the reviewer sees one card
+  // (group + attached observations) and so applyGroupDecision can apply
+  // both atomically. Failures here are non-fatal: a discovery without
+  // observations still proposes the entity; v1 status_markdown will just
+  // be sparser.
+  let observationItems: Array<{ text: string; source_file_ids: string[] }> = [];
+  if (sample.sampledFiles.length > 0) {
+    const accountNameForInterp =
+      input.entityType === 'account'
+        ? parsed.proposal.name
+        : input.parentAccountName ?? '(unknown account)';
+    const campaignNameForInterp =
+      input.entityType === 'campaign' ? parsed.proposal.name : null;
+    try {
+      observationItems = await collectDiscoveryObservations({
+        entityType: input.entityType,
+        accountName: accountNameForInterp,
+        campaignName: campaignNameForInterp,
+        sampledFiles: sample.sampledFiles,
+      });
+    } catch (err) {
+      logger.warn(
+        { err, folderId: input.folder.id, entityType: input.entityType },
+        '[drive.discover] discovery observation pass failed — proposing entity without attached observations',
+      );
+    }
+  }
+
+  // Write all rows under one proposal_group_id. If observations exist,
+  // append a single additional_update row sharing the group id so the
+  // reviewer UI can render both in one card and applyGroupDecision can
+  // apply both atomically (Phase 7b).
+  await prisma.$transaction([
+    ...rows.map((row) =>
       prisma.driveChangeProposal.create({
         data: {
           kind: 'new_entity',
@@ -336,7 +412,36 @@ async function proposeNewEntity(input: ProposeInput): Promise<ProposeOutcome> {
         },
       }),
     ),
-  );
+    ...(observationItems.length > 0
+      ? [
+          prisma.driveChangeProposal.create({
+            data: {
+              kind: 'additional_update',
+              proposalGroupId: groupId,
+              sourceDriveFolderId: input.folder.id,
+              syncRunId: input.syncRunId,
+              entityType: input.entityType,
+              accountId: input.accountId,
+              campaignId: null,
+              // Sentinel — additional_update rows don't target a column.
+              property: '__note__',
+              currentValue: Prisma.JsonNull,
+              proposedValue: { items: observationItems } as Prisma.InputJsonValue,
+              reasoning: null,
+              sourceFileIds: Array.from(
+                new Set(observationItems.flatMap((it) => it.source_file_ids)),
+              ),
+              confidence: null,
+              state: 'pending',
+              reviewToken: crypto.randomBytes(32).toString('hex'),
+              reviewerEmail: input.reviewerEmail,
+              reviewerStaffId: input.reviewerStaffId,
+              expiresAt,
+            },
+          }),
+        ]
+      : []),
+  ]);
 
   logger.info(
     {
@@ -344,6 +449,7 @@ async function proposeNewEntity(input: ProposeInput): Promise<ProposeOutcome> {
       entityType: input.entityType,
       groupId,
       rows: rows.length,
+      observations: observationItems.length,
       confidence: parsed.confidence,
     },
     '[drive.discover] emitted new-entity proposal',
@@ -366,20 +472,36 @@ async function listChildFolders(folderId: string): Promise<TraversedFile[]> {
       path: c.name as string,
       modifiedTime: c.modifiedTime ?? null,
       modifiedByEmail: c.lastModifyingUser?.emailAddress ?? null,
+      createdTime: c.createdTime ?? null,
       size: null,
       isFolder: true,
     }));
 }
 
+interface SampledFile {
+  file: TraversedFile;
+  /** Full extracted text — fed to per-file interpretation. */
+  fullText: string;
+  /** Truncated copy of the same text — fed to the new-entity LLM prompt. */
+  textPreview: string;
+}
+
 interface FolderSample {
   snippets: Array<{ name: string; path: string; textPreview: string }>;
   fileIds: string[];
+  /**
+   * Full per-file extraction results — used by Phase 7 to run per-file
+   * interpretation AFTER the new-entity LLM call confirms this is an
+   * entity. Keeps the (small) full-text payloads around so we don't have
+   * to re-extract.
+   */
+  sampledFiles: SampledFile[];
 }
 
 /**
  * Pull up to DISCOVERY_FILE_BUDGET files from this folder (one level deep)
- * and return short text snippets. Used to give the LLM enough context to
- * guess the entity's initial field values.
+ * and return short text snippets for the new-entity LLM call PLUS the full
+ * extracted text per file for downstream interpretation (Phase 7).
  */
 async function sampleFolderFiles(folderId: string, folderPath: string): Promise<FolderSample> {
   const children = await listFolderChildren(folderId);
@@ -387,6 +509,7 @@ async function sampleFolderFiles(folderId: string, folderPath: string): Promise<
 
   const snippets: FolderSample['snippets'] = [];
   const fileIds: string[] = [];
+  const sampledFiles: SampledFile[] = [];
 
   for (const f of files) {
     if (snippets.length >= DISCOVERY_FILE_BUDGET) break;
@@ -398,18 +521,25 @@ async function sampleFolderFiles(folderId: string, folderPath: string): Promise<
       path: `${folderPath} / ${f.name}`,
       modifiedTime: f.modifiedTime ?? null,
       modifiedByEmail: f.lastModifyingUser?.emailAddress ?? null,
+      createdTime: f.createdTime ?? null,
       size: f.size ? Number(f.size) : null,
       isFolder: false,
     };
     try {
       const outcome = await extractText(traversed);
       if (outcome.kind === 'ok' && outcome.text.trim().length > 0) {
+        const textPreview = outcome.text.slice(0, 2000);
         snippets.push({
           name: traversed.name,
           path: traversed.path,
-          textPreview: outcome.text.slice(0, 2000),
+          textPreview,
         });
         fileIds.push(traversed.id);
+        sampledFiles.push({
+          file: traversed,
+          fullText: outcome.text,
+          textPreview,
+        });
       }
     } catch (err) {
       logger.warn(
@@ -419,7 +549,62 @@ async function sampleFolderFiles(folderId: string, folderPath: string): Promise<
     }
   }
 
-  return { snippets, fileIds };
+  return { snippets, fileIds, sampledFiles };
+}
+
+/**
+ * Phase 7: after confirming this folder represents a new entity, run
+ * per-file interpretation on the sampled files and collect observations
+ * of the matching entity type. Each observation becomes an item in the
+ * additional_update row attached to the new-entity proposal group.
+ *
+ * Per-file interpretation runs in parallel (up to DISCOVERY_FILE_BUDGET
+ * concurrent calls — currently 2, so no rate-limit concern). Errors on
+ * one file don't abort the others; we just skip that file's observations.
+ *
+ * The per-file extractor produces BOTH account and campaign observations
+ * for every file. For a new-account proposal we keep only account obs
+ * (campaign obs are speculative — no specific campaign exists yet). For
+ * a new-campaign proposal we keep only campaign obs. The discarded set
+ * is fine to drop: those observations would have no home in a single-
+ * entity creation transaction.
+ */
+async function collectDiscoveryObservations(args: {
+  entityType: 'account' | 'campaign';
+  accountName: string;
+  campaignName: string | null;
+  sampledFiles: SampledFile[];
+}): Promise<Array<{ text: string; source_file_ids: string[] }>> {
+  const results = await Promise.all(
+    args.sampledFiles.map(async (sf) => {
+      try {
+        const out = await interpretFile({
+          file: sf.file,
+          text: sf.fullText,
+          accountName: args.accountName,
+          accountCurrentState: EMPTY_ACCOUNT_STATE,
+          campaignName: args.campaignName,
+          campaignCurrentState: args.entityType === 'campaign' ? EMPTY_CAMPAIGN_STATE : null,
+          // Discovery is a single-entity sample pass — no multi-campaign
+          // attribution. Pass the candidate's own name (when known) so
+          // the LLM has consistent tagging vocabulary.
+          knownCampaigns: args.campaignName ? [args.campaignName] : [],
+        });
+        const picked = args.entityType === 'account' ? out.account : out.campaign;
+        return picked.map((obs) => ({
+          text: obs.text,
+          source_file_ids: [sf.file.id],
+        }));
+      } catch (err) {
+        logger.warn(
+          { err, fileId: sf.file.id },
+          '[drive.discover] interpretFile failed during discovery observation pass — skipping',
+        );
+        return [];
+      }
+    }),
+  );
+  return results.flat();
 }
 
 // Re-export types that callers might want.

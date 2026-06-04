@@ -20,9 +20,24 @@ export interface TraversedFile {
   path: string;
   modifiedTime: string | null;
   modifiedByEmail: string | null;
+  /**
+   * When the file was first created in Drive. Used by backfill to sort
+   * files oldest-first so we can sample the earliest activity without
+   * walking every revision. Nullable for back-compat with code paths
+   * that don't request the field.
+   */
+  createdTime: string | null;
   size: number | null;
   /** True when this file is itself a folder (children were walked). */
   isFolder: boolean;
+  /**
+   * For files with mimeType='application/vnd.google-apps.shortcut':
+   * the target the shortcut points to. The extractor follows this
+   * (single-level) to extract from the actual file. Null for non-
+   * shortcut files. Cross-drive targets are followed too — we want
+   * greedy coverage of content that's only reachable via shortcut.
+   */
+  shortcutTarget?: { id: string; mimeType: string };
 }
 
 export interface ExtractionResult {

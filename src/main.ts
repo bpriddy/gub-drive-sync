@@ -12,6 +12,10 @@
  *   cron                     → alias for run-full-sync
  *   notify                   → notifyReviewers   (on-demand email fan-out)
  *   sweep-expired            → sweepExpiredProposals (cron target)
+ *   backfill-pending         → processBackfillQueue (drains the
+ *                                                    drive_backfill_requests
+ *                                                    queue; Cloud Scheduler
+ *                                                    target)
  *
  * Every work mode runs the reaper first — same self-heal as the original
  * router. Exit code: 0 success / 1 fatal. Cloud Run Jobs marks the
@@ -31,8 +35,16 @@ import {
   continuePausedSync,
   startFullSync,
 } from './drive/runner';
+import { processBackfillQueue } from './drive/backfill-queue';
 
-type Mode = 'poll' | 'run-full-sync' | 'continue' | 'cron' | 'notify' | 'sweep-expired';
+type Mode =
+  | 'poll'
+  | 'run-full-sync'
+  | 'continue'
+  | 'cron'
+  | 'notify'
+  | 'sweep-expired'
+  | 'backfill-pending';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -41,6 +53,7 @@ const ALL_MODES: readonly Mode[] = [
   'cron',
   'notify',
   'sweep-expired',
+  'backfill-pending',
 ];
 
 interface ParsedArgs {
@@ -149,6 +162,14 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
 
     case 'sweep-expired': {
       const result = await sweepExpiredProposals();
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'backfill-pending': {
+      // No reapStaleSyncs() here — that's for the legacy poll/runner
+      // sync-runs. The backfill queue does its own stale-recovery on
+      // entry (rows stuck in 'running' for >60min).
+      const result = await processBackfillQueue();
       return result as unknown as Record<string, unknown>;
     }
   }

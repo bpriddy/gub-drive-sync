@@ -16,6 +16,12 @@ RUN npx prisma generate
 
 COPY tsconfig.json ./
 COPY src ./src
+# scripts/ contains the backfill engine (runBackfill) imported by
+# src/drive/backfill-queue.ts for the `backfill-pending` Job mode. The
+# tsconfig.json's `include` covers both src/ and scripts/, so tsc emits
+# both into dist/. The runtime image needs dist/scripts/backfill.js to
+# resolve that import.
+COPY scripts ./scripts
 RUN npm run build
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
@@ -36,6 +42,7 @@ COPY --from=builder /app/dist ./dist
 
 USER node
 # Cloud Run Job entrypoint: main.ts dispatches on argv[2] (poll | run-full-sync
-# | continue | cron | notify | sweep-expired). The mode is passed as a Job
-# argument (Cloud Scheduler / gub-admin / self-trigger override `args`).
+# | continue | cron | notify | sweep-expired | backfill-pending). The mode
+# is passed as a Job argument (Cloud Scheduler / gub-admin / self-trigger
+# override `args`).
 CMD ["node", "dist/src/main.js"]

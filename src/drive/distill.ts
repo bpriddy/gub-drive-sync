@@ -153,23 +153,41 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
   let proposalsDroppedNoOp = 0;
   let proposalsDroppedInvalid = 0;
 
+  // Rescue-to-note: when a field_change fails validation (unknown field
+  // or value can't be coerced), we DEMOTE the observation into the notes
+  // batch instead of throwing it into drive_scan_logs where nobody sees it.
+  // Principle: the LLM's signal is preserved; structural failure becomes
+  // graceful content preservation. Reviewer judges the text as content,
+  // not schema. See docs/status-markdown-plan.md "structured vs note"
+  // discussion for the full architectural rationale.
+  const rescuedNotes: Array<{ text: string; source_file_ids: string[] }> = [];
+
   for (const change of distilled.field_changes) {
     // Validate proposed_value against the field's Zod validator.
     const validation = validateProposedValue(input.entityType, change.field, change.proposed_value ?? null);
     if (!validation.ok) {
       proposalsDroppedInvalid++;
+      // Rescue the LLM's text into the additional_update bucket so the
+      // reviewer still sees it (and the synthesis prompt still uses it).
+      rescuedNotes.push({
+        text: `${change.field}: ${change.proposed_value ?? '(none)'} — ${change.reasoning}`,
+        source_file_ids: change.source_file_ids,
+      });
+      // Separately log a 'structural_demote' diagnostic for dev observability —
+      // not reviewer-visible. Helps the team see "we keep failing on field X"
+      // as a signal to consider adding it to the allowlist.
       await writeScanLog({
         syncRunId: input.syncRunId,
         accountId: input.accountId,
         campaignId: input.campaignId,
         level: 'warn',
-        category: 'ambiguous',
-        message: `Invalid proposed value for ${input.entityType}.${change.field}: ${validation.reason}`,
+        category: 'diagnostic',
+        message: `Structural demote: ${input.entityType}.${change.field} (${validation.reason})`,
         payload: {
-          field: change.field,
+          attempted_field: change.field,
           rawProposed: change.proposed_value ?? null,
+          reason: validation.reason,
           sourceFileIds: change.source_file_ids,
-          reasoning: change.reasoning,
         },
       });
       continue;
@@ -210,18 +228,60 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
     proposalsCreated++;
   }
 
+  // Notes are promoted to ONE additional_update proposal row per scan
+  // per entity (instead of N scan log rows). The reviewer sees a single
+  // card with the batched items and approves/rejects the batch — what
+  // they approve gets fed into the post-approval status_markdown
+  // synthesis. See docs/status-markdown-plan.md.
+  //
+  // Items shape stays close to what distillation produced — each note
+  // carries (text, source_file_ids[]) — so we don't lose information.
+  // The row-level `sourceFileIds` carries the union of all items'
+  // sources for indexed lookup.
+  // Merge rescued field_change demotions into the notes batch — these
+  // are the LLM observations whose proposed field/value didn't fit our
+  // allowlist but whose content is still worth preserving for the
+  // reviewer + synthesis pipeline.
+  const allNoteItems = [
+    ...distilled.notes.map((n) => ({ text: n.text, source_file_ids: n.source_file_ids })),
+    ...rescuedNotes,
+  ];
+
   let notesWritten = 0;
-  for (const note of distilled.notes) {
-    await writeScanLog({
-      syncRunId: input.syncRunId,
-      accountId: input.accountId,
-      campaignId: input.campaignId,
-      level: 'note',
-      category: 'uncategorized_insight',
-      message: note.text,
-      payload: { sourceFileIds: note.source_file_ids },
+  if (allNoteItems.length > 0) {
+    const items = allNoteItems;
+    const unionSources = Array.from(
+      new Set(items.flatMap((n) => n.source_file_ids)),
+    );
+
+    await prisma.driveChangeProposal.create({
+      data: {
+        kind: 'additional_update',
+        // Sentinel — `property` is NOT NULL on the table but doesn't
+        // name a column for this kind. Reviewer UI keys off `kind`,
+        // not `property`. Keep stable so anyone querying by
+        // (kind='additional_update', property='__note__') gets a clean
+        // result.
+        property: '__note__',
+        syncRunId: input.syncRunId,
+        entityType: input.entityType,
+        accountId: input.accountId,
+        campaignId: input.campaignId,
+        currentValue: Prisma.JsonNull,
+        proposedValue: { items } as Prisma.InputJsonValue,
+        // Batch-level reasoning/confidence don't carry meaningful
+        // per-item signal — left null. Items array is the contract.
+        reasoning: null,
+        sourceFileIds: unionSources,
+        confidence: null,
+        state: 'pending',
+        reviewToken: crypto.randomBytes(32).toString('hex'),
+        reviewerEmail: input.reviewerEmail ?? null,
+        reviewerStaffId: input.reviewerStaffId ?? null,
+        expiresAt,
+      },
     });
-    notesWritten++;
+    notesWritten = items.length;
   }
 
   let ambiguousWritten = 0;

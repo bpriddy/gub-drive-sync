@@ -58,7 +58,7 @@ export async function driveClient(): Promise<drive_v3.Drive> {
 
 /** Fields we always request on a file. */
 export const FILE_FIELDS =
-  'id,name,mimeType,parents,modifiedTime,size,lastModifyingUser(emailAddress,displayName)';
+  'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType)';
 
 /**
  * List immediate children of a folder, following pagination.
@@ -78,6 +78,241 @@ export async function listFolderChildren(folderId: string): Promise<drive_v3.Sch
       ...(pageToken ? { pageToken } : {}),
     });
     out.push(...(res.data.files ?? []));
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+/**
+ * List the immediate SUBFOLDERS of a folder (folders only, no files),
+ * following pagination. Cheaper than listFolderChildren when you only
+ * need the folder skeleton — the structure-resolution walk uses this to
+ * map an account's campaign topology without pulling file metadata.
+ */
+export interface SubfolderNode {
+  id: string;
+  name: string;
+}
+
+export async function listSubfolders(folderId: string): Promise<SubfolderNode[]> {
+  const client = await driveClient();
+  const out: SubfolderNode[] = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await client.files.list({
+      q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+      fields: 'nextPageToken, files(id,name)',
+      pageSize: 200,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      ...(pageToken ? { pageToken } : {}),
+    });
+    for (const f of res.data.files ?? []) {
+      if (f.id && f.name) out.push({ id: f.id, name: f.name });
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+/**
+ * Flat-list EVERY folder in a shared drive in one paginated sweep
+ * (`corpora=drive`, mimeType=folder). ONLY valid for shared-drive ids.
+ *
+ * The recursive folders-only walk (listSubfolders per folder) is O(folders)
+ * sequential round-trips — minutes on a big drive. This is O(folders/200)
+ * paginated calls. The caller reconstructs the tree in memory from the
+ * `parentId` pointers. Mirrors listSharedDriveFiles for the folder skeleton.
+ */
+export interface DriveFolderRec {
+  id: string;
+  name: string;
+  /** Immediate parent id (shared-drive folders have at most one parent). */
+  parentId: string | null;
+}
+
+export async function listAllFoldersInDrive(
+  driveId: string,
+  opts: { onPage?: (totalSoFar: number) => void } = {},
+): Promise<DriveFolderRec[]> {
+  const client = await driveClient();
+  const out: DriveFolderRec[] = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await client.files.list({
+      corpora: 'drive',
+      driveId,
+      q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
+      fields: 'nextPageToken, files(id,name,parents)',
+      pageSize: 200,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      ...(pageToken ? { pageToken } : {}),
+    });
+    for (const f of res.data.files ?? []) {
+      if (!f.id || !f.name) continue;
+      out.push({ id: f.id, name: f.name, parentId: f.parents?.[0] ?? null });
+    }
+    if (opts.onPage) opts.onPage(out.length);
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+/**
+ * Detect whether a folderId refers to a SHARED DRIVE ROOT vs a folder
+ * inside one (or a folder in personal My Drive).
+ *
+ * Drive's data model: a shared drive has the same id as its root folder.
+ * For `files.get(folderId, fields='id,driveId')`:
+ *   - shared-drive root  → driveId === id
+ *   - folder in shared drive → driveId !== id (and is present)
+ *   - folder in My Drive → driveId is absent
+ *
+ * Knowing this matters for performance: a shared-drive root supports
+ * `files.list(corpora='drive', driveId=X, orderBy=...)` returning the
+ * entire drive's contents in one paginated query. Folders (in either
+ * kind of drive) only support `'X' in parents` — direct children only —
+ * forcing recursive traversal.
+ */
+export interface SharedDriveProbe {
+  isSharedDriveRoot: boolean;
+  /** When the folder lives inside a shared drive: the shared drive's id. */
+  driveId: string | null;
+  /** The mimeType reported by Drive. Should be folder; surfaced for sanity. */
+  mimeType: string | null;
+}
+
+export async function probeFolder(folderId: string): Promise<SharedDriveProbe> {
+  const client = await driveClient();
+  const res = await client.files.get({
+    fileId: folderId,
+    fields: 'id,driveId,mimeType',
+    supportsAllDrives: true,
+  });
+  const id = res.data.id ?? null;
+  const driveId = res.data.driveId ?? null;
+  const mimeType = res.data.mimeType ?? null;
+  return {
+    isSharedDriveRoot: !!id && !!driveId && id === driveId,
+    driveId,
+    mimeType,
+  };
+}
+
+/**
+ * Flat-list every non-folder file in a shared drive, paginated and
+ * (optionally) ordered. ONLY valid for shared-drive-root ids — for
+ * folders inside drives, you must walk recursively (`traverseFolder`).
+ *
+ * Used by backfill to skip the recursive walk for shared-drive entities.
+ * Returns TraversedFile shape with `path = name` (no breadcrumb; the flat
+ * query gives parent ids, not paths, and reconstructing paths costs
+ * more API calls than it's usually worth at this layer).
+ */
+export interface FlatListOptions {
+  /** Stop after this many files. Use for capped iteration. */
+  maxFiles?: number;
+  /** `orderBy` value. Default 'createdTime asc' for "oldest first." */
+  orderBy?: string;
+}
+
+export async function listSharedDriveFiles(
+  driveId: string,
+  options: FlatListOptions = {},
+): Promise<import('./types').TraversedFile[]> {
+  const client = await driveClient();
+  const out: import('./types').TraversedFile[] = [];
+  const maxFiles = options.maxFiles ?? null;
+  const orderBy = options.orderBy ?? 'createdTime asc';
+  let pageToken: string | undefined;
+  do {
+    const res = await client.files.list({
+      corpora: 'drive',
+      driveId,
+      q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
+      orderBy,
+      fields: `nextPageToken, files(${FILE_FIELDS})`,
+      pageSize: 200,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      ...(pageToken ? { pageToken } : {}),
+    });
+    for (const f of res.data.files ?? []) {
+      if (!f.id || !f.name || !f.mimeType) continue;
+      out.push({
+        id: f.id,
+        name: f.name,
+        mimeType: f.mimeType,
+        ...(f.parents ? { parents: f.parents } : {}),
+        path: f.name, // flat list has no breadcrumb; degraded vs traversal
+        modifiedTime: f.modifiedTime ?? null,
+        modifiedByEmail: f.lastModifyingUser?.emailAddress ?? null,
+        createdTime: f.createdTime ?? null,
+        size: f.size ? Number(f.size) : null,
+        isFolder: false,
+        ...(f.shortcutDetails?.targetId && f.shortcutDetails?.targetMimeType
+          ? {
+              shortcutTarget: {
+                id: f.shortcutDetails.targetId,
+                mimeType: f.shortcutDetails.targetMimeType,
+              },
+            }
+          : {}),
+      });
+      if (maxFiles !== null && out.length >= maxFiles) return out;
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+/**
+ * List the revision metadata for a file.
+ *
+ * Returns one entry per revision: id, modifiedTime, lastModifyingUser
+ * (email + displayName), and size. NO content fetching — purely
+ * attribution-and-timestamps for the editor-telemetry use case.
+ *
+ * Notes:
+ * - For Google-native files (Docs/Sheets/Slides), full revision history
+ *   is preserved by Drive — every saved edit shows up.
+ * - For binary files (PDF/DOCX/text), Drive prunes revisions after ~30
+ *   days unless `keepForever=true` was explicitly set per-revision
+ *   (almost never in practice). So binary files only show recent
+ *   revisions; older history is gone from Drive's side.
+ * - Paginates internally; revisions.list returns up to pageSize per call.
+ */
+export interface DriveRevisionMeta {
+  revisionId: string;
+  modifiedTime: string;
+  editorEmail: string | null;
+  editorName: string | null;
+  sizeBytes: number | null;
+}
+
+export async function listRevisions(fileId: string): Promise<DriveRevisionMeta[]> {
+  const client = await driveClient();
+  const out: DriveRevisionMeta[] = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await client.revisions.list({
+      fileId,
+      fields:
+        'nextPageToken, revisions(id, modifiedTime, lastModifyingUser(emailAddress,displayName), size)',
+      pageSize: 1000,
+      ...(pageToken ? { pageToken } : {}),
+    });
+    for (const r of res.data.revisions ?? []) {
+      if (!r.id || !r.modifiedTime) continue;
+      out.push({
+        revisionId: r.id,
+        modifiedTime: r.modifiedTime,
+        editorEmail: r.lastModifyingUser?.emailAddress ?? null,
+        editorName: r.lastModifyingUser?.displayName ?? null,
+        sizeBytes: r.size ? Number(r.size) : null,
+      });
+    }
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);
   return out;

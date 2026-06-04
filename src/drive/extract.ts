@@ -50,8 +50,11 @@ const MIME = {
   GOOGLE_DOC: 'application/vnd.google-apps.document',
   GOOGLE_SHEET: 'application/vnd.google-apps.spreadsheet',
   GOOGLE_SLIDES: 'application/vnd.google-apps.presentation',
+  GOOGLE_FOLDER: 'application/vnd.google-apps.folder',
+  SHORTCUT: 'application/vnd.google-apps.shortcut',
   PDF: 'application/pdf',
   DOCX: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  PPTX: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 } as const;
 
 // All scopes the extractor needs. The 'drive' bot must have consented to
@@ -109,9 +112,15 @@ function ok(text: string, extractor: string): ExtractionOutcome {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-export async function extractText(file: TraversedFile): Promise<ExtractionOutcome> {
-  if (file.isFolder) return { kind: 'skip', reason: 'folder' };
-
+/**
+ * The size cap only applies to BINARY-DOWNLOAD paths (PDF, DOCX, PPTX,
+ * text/*). Google-native files (Docs, Sheets, Slides) are fetched via
+ * dedicated APIs that return structured content — no full-file byte
+ * transfer happens, so the cost is content-window-truncation (handled
+ * downstream in interpret.ts) rather than transfer/memory. A 300 MB
+ * Google Slides deck is API-traversed, not downloaded.
+ */
+function tooLargeForBinaryDownload(file: TraversedFile): ExtractionOutcome | null {
   if (file.size && file.size > config.DRIVE_MAX_FILE_SIZE_BYTES) {
     return {
       kind: 'skip',
@@ -119,39 +128,130 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
       detail: `size=${file.size} limit=${config.DRIVE_MAX_FILE_SIZE_BYTES}`,
     };
   }
+  return null;
+}
+
+export async function extractText(file: TraversedFile): Promise<ExtractionOutcome> {
+  if (file.isFolder) return { kind: 'skip', reason: 'folder' };
+
+  // ── Shortcut follow (single-level, greedy across drives) ──────────────
+  // Drive shortcuts (mimeType=application/vnd.google-apps.shortcut) are
+  // pointers to another file or folder. The shortcut row has no content
+  // of its own; the real content lives at shortcutTarget.id. We follow
+  // greedily — including cross-drive targets — because shortcuts often
+  // surface shared assets (brand libraries, briefs in other folders)
+  // that are otherwise invisible to the per-entity scan.
+  //
+  // Limit: single-level follow only. Shortcut-to-shortcut chains are
+  // impossible to create in Drive's UI but we guard defensively. Folder
+  // shortcuts get skipped (logged) — traversing the target folder
+  // through a shortcut is a v2 feature (changes the gather phase, not
+  // just the extractor). File shortcuts dispatch into the normal switch
+  // below with the target's mimeType.
+  let effectiveFile = file;
+  if (file.mimeType === MIME.SHORTCUT) {
+    if (!file.shortcutTarget) {
+      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut without resolved target' };
+    }
+    if (file.shortcutTarget.mimeType === MIME.GOOGLE_FOLDER) {
+      return {
+        kind: 'skip',
+        reason: 'unsupported_mime',
+        detail: `shortcut→folder ${file.shortcutTarget.id} (folder-shortcut traversal not yet supported)`,
+      };
+    }
+    if (file.shortcutTarget.mimeType === MIME.SHORTCUT) {
+      // Defensive: shortcut chains aren't really constructible but guard anyway.
+      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut chain (single-level follow only)' };
+    }
+    // Rebuild a virtual file pointing at the target. Keep the shortcut's
+    // name/path so traversal breadcrumbs and progress lines still
+    // identify WHERE the content was reached from. Clear size — the
+    // shortcut's size attribute reflects the pointer, not the target.
+    effectiveFile = {
+      ...file,
+      id: file.shortcutTarget.id,
+      mimeType: file.shortcutTarget.mimeType,
+      size: null,
+    };
+    delete (effectiveFile as { shortcutTarget?: unknown }).shortcutTarget;
+  }
 
   try {
-    switch (file.mimeType) {
+    switch (effectiveFile.mimeType) {
+      // ── Google-native: API-traversed, NO size cap. Content-window
+      //    truncation handled downstream by GEMINI_MAX_INPUT_CHARS.
       case MIME.GOOGLE_DOC:
-        return ok(await extractGoogleDoc(file.id), 'gdoc');
+        return ok(await extractGoogleDoc(effectiveFile.id), 'gdoc');
       case MIME.GOOGLE_SLIDES:
-        return ok(await extractGoogleSlides(file.id), 'gslides');
+        return ok(await extractGoogleSlides(effectiveFile.id), 'gslides');
       case MIME.GOOGLE_SHEET:
-        return ok(await extractGoogleSheets(file.id), 'gsheet');
+        return ok(await extractGoogleSheets(effectiveFile.id), 'gsheet');
+
+      // ── Binary downloads: size cap applies; we pull bytes into memory.
       case MIME.PDF: {
-        const buf = await downloadFileBuffer(file.id);
-        // Import lazily to keep pdfjs-dist off the module init path.
-        const { PDFParse } = await import('pdf-parse');
-        const parser = new PDFParse({ data: new Uint8Array(buf) });
-        const parsed = await parser.getText();
-        return ok(parsed.text, 'pdf');
+        const tooLarge = tooLargeForBinaryDownload(effectiveFile);
+        if (tooLarge) return tooLarge;
+        const buf = await downloadFileBuffer(effectiveFile.id);
+        // Import lazily to keep the parser off the module init path.
+        //
+        // `unpdf` is a thin modern wrapper over `pdfjs-dist`'s legacy
+        // build — the build Mozilla maintains specifically for Node /
+        // serverless environments without DOM globals. We deliberately
+        // do NOT use pdf-parse: v1.x is unmaintained (last release
+        // 2019), and v2.x is a rewrite on top of the non-legacy
+        // pdfjs-dist build that expects browser globals (DOMMatrix,
+        // Path2D, ImageData) and throws in Node without `canvas`
+        // native-dep polyfills. unpdf is the actively-maintained
+        // primitive that exists precisely because of v2's breakage.
+        //
+        // We construct the PDFDocumentProxy explicitly (rather than
+        // passing raw bytes to extractText) so we can set pdfjs's
+        // `verbosity` level. Default is WARNINGS, which spams the log
+        // with harmless TrueType-font notes like "TT: undefined
+        // function: 32" — those don't affect text extraction but
+        // drown out real signal. verbosity: 0 = ERRORS only.
+        const { getDocumentProxy, extractText } = await import('unpdf');
+        const pdf = await getDocumentProxy(new Uint8Array(buf), { verbosity: 0 });
+        const { text } = await extractText(pdf, { mergePages: true });
+        return ok(text, 'pdf');
       }
       case MIME.DOCX: {
-        const buf = await downloadFileBuffer(file.id);
+        const tooLarge = tooLargeForBinaryDownload(effectiveFile);
+        if (tooLarge) return tooLarge;
+        const buf = await downloadFileBuffer(effectiveFile.id);
         const { value } = await mammoth.extractRawText({ buffer: buf });
         return ok(value, 'docx');
       }
+      case MIME.PPTX: {
+        const tooLarge = tooLargeForBinaryDownload(effectiveFile);
+        if (tooLarge) return tooLarge;
+        const buf = await downloadFileBuffer(effectiveFile.id);
+        // Import lazily to keep officeparser off the module init path —
+        // it has a heavy zlib/xml unpack chain we'd rather defer.
+        // officeparser flattens to plain text; slide boundaries and
+        // speaker notes are mostly preserved as runs of lines. For
+        // richer visual understanding (charts/photos/layout), see the
+        // future "rich pipeline" plan in docs/status-markdown-plan.md.
+        const { parseOfficeAsync } = await import('officeparser');
+        const text = await parseOfficeAsync(buf);
+        return ok(text, 'pptx');
+      }
       default: {
-        if (file.mimeType.startsWith('text/')) {
-          const buf = await downloadFileBuffer(file.id);
+        if (effectiveFile.mimeType.startsWith('text/')) {
+          const tooLarge = tooLargeForBinaryDownload(effectiveFile);
+          if (tooLarge) return tooLarge;
+          const buf = await downloadFileBuffer(effectiveFile.id);
           return ok(buf.toString('utf-8'), 'plaintext');
         }
-        return { kind: 'skip', reason: 'unsupported_mime', detail: file.mimeType };
+        return { kind: 'skip', reason: 'unsupported_mime', detail: effectiveFile.mimeType };
       }
     }
   } catch (err) {
-    logger.error(
-      { err, fileId: file.id, name: file.name, mimeType: file.mimeType },
+    // Demoted to debug: drive.sync.ts catches this throw and routes the
+    // full payload to drive_scan_logs + a one-line summary to progress.
+    logger.debug(
+      { err, fileId: effectiveFile.id, name: file.name, mimeType: effectiveFile.mimeType },
       '[drive] extraction failed',
     );
     throw err;

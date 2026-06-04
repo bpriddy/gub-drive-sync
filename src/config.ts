@@ -26,7 +26,13 @@ const EnvSchema = z.object({
   DRIVE_DELAY_BETWEEN_ACCOUNTS_MS: z.string().default('5000').transform(Number),
   DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS: z.string().default('2000').transform(Number),
   DRIVE_DELAY_BETWEEN_FILES_MS: z.string().default('500').transform(Number),
-  DRIVE_MAX_FILE_SIZE_BYTES: z.string().default('26214400').transform(Number),
+  // 300 MB default. Only enforced for BINARY downloads (PDF, DOCX, PPTX,
+  // text/*) where we pull bytes into memory. Google-native files
+  // (Docs/Sheets/Slides) are API-traversed and skip this cap entirely.
+  // Note: a 300 MB binary requires meaningful runtime memory — the
+  // Cloud Run Job's --memory should be >=1Gi (currently 1Gi; bump to
+  // 2Gi if you start seeing OOM on the largest PDFs).
+  DRIVE_MAX_FILE_SIZE_BYTES: z.string().default('314572800').transform(Number),
   DRIVE_PROPOSAL_TTL_DAYS: z.string().default('14').transform(Number),
 
   // ── AI / Gemini ──────────────────────────────────────────────────────────

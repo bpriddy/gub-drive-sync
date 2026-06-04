@@ -9,7 +9,12 @@
     "start": "node dist/src/main.js",
     "dev": "tsx -r dotenv/config src/main.ts",
     "typecheck": "prisma generate && tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "seed:status": "tsx -r dotenv/config scripts/seed-status-proposal.ts",
+    "seed:new-entity": "tsx -r dotenv/config scripts/seed-new-entity-proposal.ts",
+    "backfill": "tsx -r dotenv/config scripts/backfill.ts",
+    "clear": "tsx -r dotenv/config scripts/clear.ts",
+    "backfill-pending": "tsx -r dotenv/config src/main.ts backfill-pending"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
@@ -18,9 +23,10 @@
     "google-auth-library": "^9.15.0",
     "googleapis": "^144.0.0",
     "mammoth": "^1.9.0",
-    "pdf-parse": "^2.1.0",
+    "officeparser": "^5.1.1",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",
+    "unpdf": "^1.6.2",
     "zod": "^3.24.1"
   },
   "devDependencies": {
