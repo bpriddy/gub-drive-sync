@@ -325,6 +325,8 @@ model DriveBackfillRequest {
   attempts      Int       @default(0)
   /// Earliest re-claim time after transient failure (exponential backoff).
   nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz
+  /// When true, the engine processes until cursor reaches today instead of `scans` days.
+  allRemaining  Boolean   @default(false) @map("all_remaining")
 
   account     Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
   requestedByStaff Staff @relation("DriveBackfillRequestedBy", fields: [requestedBy], references: [id])

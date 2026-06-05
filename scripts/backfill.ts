@@ -170,6 +170,17 @@ export interface Args {
    * Not set from argv — populated by the caller.
    */
   captureLog?: string[];
+  /**
+   * Soft wall-clock budget. When the elapsed time across the scan loop
+   * exceeds this, the engine stops between scans and returns with
+   * `truncatedByBudget: true` instead of running to completion. The
+   * caller decides whether to self-trigger a continuation. Null = no
+   * budget (CLI/local runs are uncapped). Set by the queue drain
+   * (backfill-queue.ts) to ~45 min so a single Cloud Run Job execution
+   * doesn't hit the task timeout. Checked at scan boundaries only — a
+   * scan in progress is allowed to finish.
+   */
+  wallClockBudgetMs?: number;
 }
 
 export interface BackfillRunResult {
@@ -183,6 +194,14 @@ export interface BackfillRunResult {
   activeDaysCount: number;
   /** True if the run took the structureOnly early-exit path. */
   structureOnlyMode: boolean;
+  /**
+   * True when wallClockBudgetMs was set AND the scan loop exited early
+   * because budget was exhausted. Implies there's more work past the
+   * final cursor — the caller should self-trigger a continuation.
+   * False when the run completed naturally (cursor reached end OR
+   * scans/all limit hit).
+   */
+  truncatedByBudget: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -1877,6 +1896,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     activeDaysLast: null,
     activeDaysCount: 0,
     structureOnlyMode: false,
+    truncatedByBudget: false,
   });
 
   log('');
@@ -2003,9 +2023,32 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   let effectiveCursor: string | null = currentCtx.driveBackfillCursor;
   const initialCursor = effectiveCursor;
   log(`  Cursor (accounts.drive_backfill_cursor): ${effectiveCursor ?? 'none — starting from earliest active day'}`);
+  if (args.wallClockBudgetMs) {
+    log(`  Wall-clock budget: ${Math.round(args.wallClockBudgetMs / 60000)} min (caller may self-trigger continuation if exhausted)`);
+  }
   log('');
 
+  /**
+   * Set to true when the scan loop exits early because wallClockBudgetMs
+   * was exceeded. The caller uses this to decide whether to self-trigger
+   * a continuation Job execution.
+   */
+  let truncatedByBudget = false;
+
   while (scansDone < maxScans) {
+    // Budget check BEFORE starting a new scan. A scan in flight is
+    // allowed to finish — we never abort mid-scan, because cursor
+    // advancement only happens after a full scan persists.
+    if (args.wallClockBudgetMs && Date.now() - overallStart > args.wallClockBudgetMs) {
+      truncatedByBudget = true;
+      log(
+        rule(
+          `Wall-clock budget exhausted (${Math.round(args.wallClockBudgetMs / 60000)} min) — pausing for continuation`,
+        ),
+      );
+      break;
+    }
+
     const nextDay = activeDates.find((d) => !effectiveCursor || d.date > effectiveCursor);
     if (!nextDay) {
       log(rule(`No more pending active days past ${effectiveCursor ?? '(start)'} — backfill complete`));
@@ -2135,6 +2178,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     activeDaysLast: activeDates[activeDates.length - 1]!.date,
     activeDaysCount: activeDates.length,
     structureOnlyMode: false,
+    truncatedByBudget,
   };
 }
 
