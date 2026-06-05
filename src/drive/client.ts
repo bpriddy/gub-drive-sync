@@ -32,6 +32,71 @@ import { buildBotOAuthClient } from '../workspace';
 
 const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 
+// ── Proactive rate limiting ──────────────────────────────────────────────────
+//
+// Drive API enforces a per-user request rate (default ~1000 / 100s, i.e.
+// ~10 sustained / second). The backfill engine bursts paginated
+// `files.list` calls back-to-back at the start of every Job execution —
+// structure scan (~32 calls for a 6320-folder shared drive) plus file
+// discovery (~127 calls for 25K files). At full unconstrained burst the
+// googleapis library will issue these as fast as Drive can respond
+// (50-200ms per call), which can momentarily exceed the per-100s window
+// and trip a 403 `userRateLimitExceeded`.
+//
+// Proactive throttle (this) is the right pattern, not reactive retry:
+// we space calls so the limit is never approached. Every Drive API call
+// site funnels through `driveLimiter.run(...)` which guarantees a
+// minimum interval between consecutive calls. Sequential by design —
+// concurrent callers queue up behind whoever's currently waiting.
+//
+// Cost: ~125ms added per call (8 calls/sec). For Chevy's ~159 startup
+// calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
+// burst. Acceptable, and we never get a 403 in steady state.
+
+class DriveRateLimiter {
+  private chainTail: Promise<void> = Promise.resolve();
+  private lastCallEndAt = 0;
+  private readonly minIntervalMs: number;
+
+  constructor(callsPerSec: number) {
+    this.minIntervalMs = Math.ceil(1000 / callsPerSec);
+  }
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    // Chain ourselves after the previous call's completion so multiple
+    // concurrent .run() invocations get serialized (no thundering herd
+    // racing on lastCallEndAt).
+    const myTurn = this.chainTail;
+    let resolveMine!: () => void;
+    this.chainTail = new Promise<void>((resolve) => {
+      resolveMine = resolve;
+    });
+
+    await myTurn;
+
+    // Sleep until enough time has elapsed since the last call's end.
+    const now = Date.now();
+    const earliestStart = this.lastCallEndAt + this.minIntervalMs;
+    if (now < earliestStart) {
+      await new Promise((resolve) => setTimeout(resolve, earliestStart - now));
+    }
+
+    try {
+      return await fn();
+    } finally {
+      this.lastCallEndAt = Date.now();
+      resolveMine();
+    }
+  }
+}
+
+/**
+ * Single shared rate limiter for ALL Drive API calls in this process.
+ * 8 calls/sec gives ~125ms spacing — well below Drive's default per-user
+ * limit (~10/sec sustained) with buffer for backend latency variance.
+ */
+const driveLimiter = new DriveRateLimiter(8);
+
 // ── Drive API client (lazy singleton, OAuth-backed) ──────────────────────────
 
 let cachedClient: drive_v3.Drive | null = null;
@@ -69,14 +134,16 @@ export async function listFolderChildren(folderId: string): Promise<drive_v3.Sch
   const out: drive_v3.Schema$File[] = [];
   let pageToken: string | undefined;
   do {
-    const res = await client.files.list({
-      q: `'${folderId}' in parents and trashed = false`,
-      fields: `nextPageToken, files(${FILE_FIELDS})`,
-      pageSize: 200,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      ...(pageToken ? { pageToken } : {}),
-    });
+    const res = await driveLimiter.run(() =>
+      client.files.list({
+        q: `'${folderId}' in parents and trashed = false`,
+        fields: `nextPageToken, files(${FILE_FIELDS})`,
+        pageSize: 200,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        ...(pageToken ? { pageToken } : {}),
+      }),
+    );
     out.push(...(res.data.files ?? []));
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);
@@ -99,14 +166,16 @@ export async function listSubfolders(folderId: string): Promise<SubfolderNode[]>
   const out: SubfolderNode[] = [];
   let pageToken: string | undefined;
   do {
-    const res = await client.files.list({
-      q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-      fields: 'nextPageToken, files(id,name)',
-      pageSize: 200,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      ...(pageToken ? { pageToken } : {}),
-    });
+    const res = await driveLimiter.run(() =>
+      client.files.list({
+        q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+        fields: 'nextPageToken, files(id,name)',
+        pageSize: 200,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        ...(pageToken ? { pageToken } : {}),
+      }),
+    );
     for (const f of res.data.files ?? []) {
       if (f.id && f.name) out.push({ id: f.id, name: f.name });
     }
@@ -139,16 +208,18 @@ export async function listAllFoldersInDrive(
   const out: DriveFolderRec[] = [];
   let pageToken: string | undefined;
   do {
-    const res = await client.files.list({
-      corpora: 'drive',
-      driveId,
-      q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
-      fields: 'nextPageToken, files(id,name,parents)',
-      pageSize: 200,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      ...(pageToken ? { pageToken } : {}),
-    });
+    const res = await driveLimiter.run(() =>
+      client.files.list({
+        corpora: 'drive',
+        driveId,
+        q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
+        fields: 'nextPageToken, files(id,name,parents)',
+        pageSize: 200,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        ...(pageToken ? { pageToken } : {}),
+      }),
+    );
     for (const f of res.data.files ?? []) {
       if (!f.id || !f.name) continue;
       out.push({ id: f.id, name: f.name, parentId: f.parents?.[0] ?? null });
@@ -185,11 +256,13 @@ export interface SharedDriveProbe {
 
 export async function probeFolder(folderId: string): Promise<SharedDriveProbe> {
   const client = await driveClient();
-  const res = await client.files.get({
-    fileId: folderId,
-    fields: 'id,driveId,mimeType',
-    supportsAllDrives: true,
-  });
+  const res = await driveLimiter.run(() =>
+    client.files.get({
+      fileId: folderId,
+      fields: 'id,driveId,mimeType',
+      supportsAllDrives: true,
+    }),
+  );
   const id = res.data.id ?? null;
   const driveId = res.data.driveId ?? null;
   const mimeType = res.data.mimeType ?? null;
@@ -227,17 +300,19 @@ export async function listSharedDriveFiles(
   const orderBy = options.orderBy ?? 'createdTime asc';
   let pageToken: string | undefined;
   do {
-    const res = await client.files.list({
-      corpora: 'drive',
-      driveId,
-      q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
-      orderBy,
-      fields: `nextPageToken, files(${FILE_FIELDS})`,
-      pageSize: 200,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      ...(pageToken ? { pageToken } : {}),
-    });
+    const res = await driveLimiter.run(() =>
+      client.files.list({
+        corpora: 'drive',
+        driveId,
+        q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
+        orderBy,
+        fields: `nextPageToken, files(${FILE_FIELDS})`,
+        pageSize: 200,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        ...(pageToken ? { pageToken } : {}),
+      }),
+    );
     for (const f of res.data.files ?? []) {
       if (!f.id || !f.name || !f.mimeType) continue;
       out.push({
@@ -324,9 +399,11 @@ export async function listRevisions(fileId: string): Promise<DriveRevisionMeta[]
  */
 export async function downloadFileBuffer(fileId: string): Promise<Buffer> {
   const client = await driveClient();
-  const res = await client.files.get(
-    { fileId, alt: 'media', supportsAllDrives: true },
-    { responseType: 'stream' },
+  const res = await driveLimiter.run(() =>
+    client.files.get(
+      { fileId, alt: 'media', supportsAllDrives: true },
+      { responseType: 'stream' },
+    ),
   );
   return streamToBuffer(res.data as Readable);
 }
@@ -336,9 +413,11 @@ export async function downloadFileBuffer(fileId: string): Promise<Buffer> {
  */
 export async function exportFileBuffer(fileId: string, mimeType: string): Promise<Buffer> {
   const client = await driveClient();
-  const res = await client.files.export(
-    { fileId, mimeType },
-    { responseType: 'stream' },
+  const res = await driveLimiter.run(() =>
+    client.files.export(
+      { fileId, mimeType },
+      { responseType: 'stream' },
+    ),
   );
   return streamToBuffer(res.data as Readable);
 }
@@ -487,11 +566,13 @@ export async function isInsideFolder(
     visited.add(current);
     let res;
     try {
-      res = await client.files.get({
-        fileId: current,
-        fields: 'id,parents',
-        supportsAllDrives: true,
-      });
+      res = await driveLimiter.run(() =>
+        client.files.get({
+          fileId: current,
+          fields: 'id,parents',
+          supportsAllDrives: true,
+        }),
+      );
     } catch (err) {
       const e = err as { code?: number };
       if (e?.code === 404) return false; // file/parent gone — not inside
