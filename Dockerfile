@@ -45,4 +45,17 @@ USER node
 # | continue | cron | notify | sweep-expired | backfill-pending). The mode
 # is passed as a Job argument (Cloud Scheduler / gub-admin / self-trigger
 # override `args`).
-CMD ["node", "dist/src/main.js"]
+#
+# Why ENTRYPOINT + empty CMD instead of single CMD: Cloud Run Jobs
+# `containerOverrides.args` REPLACES the CMD entirely. With a single
+# CMD ["node", "dist/src/main.js"], an args-override like ["backfill-
+# pending"] becomes `node backfill-pending` (the dist/src/main.js path
+# is lost) — Node then can't find the module and the Job fails with
+# `Cannot find module '/app/backfill-pending'`. Splitting into
+# ENTRYPOINT (fixed) + CMD (overridable args) makes overrides only
+# replace the mode arg, keeping the script path intact:
+#   ENTRYPOINT ["node", "dist/src/main.js"]
+#   CMD []                  # default = no mode (errors with usage)
+#   override args=["backfill-pending"] → `node dist/src/main.js backfill-pending`
+ENTRYPOINT ["node", "dist/src/main.js"]
+CMD []
