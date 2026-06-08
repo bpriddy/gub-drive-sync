@@ -261,7 +261,17 @@ async function scheduleContinuation(parentRequestId: string, accountId: string):
 }
 
 type ProcessOutcome =
-  | { kind: 'completed' }
+  | {
+      kind: 'completed';
+      /**
+       * True when processOne fired scheduleContinuation (the chunk hit
+       * its wall-clock budget and a new Job execution was triggered).
+       * The drain loop checks this and exits — continuing to claim
+       * rows in the current Job after triggering a successor races us
+       * to grab the continuation row we just wrote.
+       */
+      continuationFired: boolean;
+    }
   | { kind: 'retried' }
   | { kind: 'failed' };
 
@@ -326,11 +336,21 @@ async function processOne(req: {
     // same accountId + allRemaining=true and the new Job execution
     // picks up at cursor+1. See scheduleContinuation for the Admin API
     // mechanics (mirrors drive.runner.ts:scheduleContinuation).
+    //
+    // Return continuationFired=true so the drain loop in
+    // processBackfillQueue exits. If we kept draining, this same Job
+    // would race the new Job for the continuation row we just wrote —
+    // and being already-warm, it would usually win the claim, then
+    // process the continuation in a Job whose wall-clock budget is
+    // already exhausted, blowing through Cloud Run's task timeout and
+    // leaving the row stuck in 'running' on SIGKILL.
+    let continuationFired = false;
     if (result.truncatedByBudget && req.allRemaining) {
       await scheduleContinuation(req.id, req.accountId);
+      continuationFired = true;
     }
 
-    return { kind: 'completed' };
+    return { kind: 'completed', continuationFired };
   } catch (err) {
     const message = summarizeError(err);
     captureLog.push('', `[engine error attempt ${req.attempts}/${MAX_ATTEMPTS}] ${message}`);
@@ -432,6 +452,25 @@ export async function processBackfillQueue(): Promise<ProcessBackfillQueueResult
     if (outcome.kind === 'completed') summary.completed += 1;
     else if (outcome.kind === 'retried') summary.retriedLater += 1;
     else summary.failed += 1;
+
+    // If this iteration triggered a continuation (all_remaining +
+    // budget exhausted), STOP draining in this Job. A new Job was
+    // just fired via Admin API and is supposed to own the next chunk.
+    // Continuing the loop here would race the new Job: we'd usually
+    // win because we're already warm, then process the continuation
+    // chunk in a Job whose wall-clock budget is already gone, getting
+    // SIGKILL'd at Cloud Run's task timeout with the row stuck in
+    // 'running'. Exit cleanly here and let the new Job do its job.
+    if (outcome.kind === 'completed' && outcome.continuationFired) {
+      console.log(
+        JSON.stringify({
+          msg: 'backfill-queue.continuation-fired-exiting',
+          parentRequestId: claimed.id,
+          processedThisInvocation: summary.processed,
+        }),
+      );
+      break;
+    }
   }
 
   if (summary.processed === MAX_REQUESTS_PER_INVOCATION) {
