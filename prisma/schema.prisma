@@ -325,7 +325,11 @@ model DriveBackfillRequest {
   attempts      Int       @default(0)
   /// Earliest re-claim time after transient failure (exponential backoff).
   nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz
-  /// When true, the engine processes until cursor reaches today instead of `scans` days.
+  /// When true AND this row's scan advances the cursor AND the cursor is
+  /// still before today, the queue auto-creates a successor row for the
+  /// next active day (also allRemaining=true) and self-triggers the Job
+  /// via Cloud Run Admin API. Chain of 1-day rows, not 1 row of N days.
+  /// Chain terminates when cursor catches today or no more active days.
   allRemaining  Boolean   @default(false) @map("all_remaining")
   /// Total files examined across all scan days in this chunk.
   filesProcessed Int      @default(0) @map("files_processed")

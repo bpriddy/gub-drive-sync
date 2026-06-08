@@ -1,5 +1,13 @@
 /**
- * backfill.ts — single-batch backfill runner.
+ * backfill.ts — single-day backfill runner.
+ *
+ * **One scan = one day of file CRUD.** Each invocation processes the
+ * first activeDate strictly greater than the account's cursor and exits.
+ * Walking multiple days = invoking N times (queue chains continuations
+ * via gub-drive-sync/src/drive/backfill-queue.ts; CLI users loop
+ * manually). Locked by design — see "Drive Sync: One Day Per Scan"
+ * decision. The old `--all` / `--scans N` / wall-clock-budget knobs
+ * were removed; the engine no longer loops across active days.
  *
  * Picks a paginated batch of files from an account's Drive folder, resolves
  * the folder→entity map, attributes each file to its owning entity,
@@ -43,10 +51,8 @@
  *     → Files 31–60 (second batch of 30)
  *
  *   npm run backfill -- --account-id <uuid> --newest-first
- *     → Sort by createdTime DESC (most recent activity first)
- *
- *   npm run backfill -- --account-id <uuid> --all
- *     → Process every file in the folder in one batch
+ *     → Pick the LATEST active day past the cursor instead of the
+ *       earliest. Same one-day semantics.
  *
  *   npm run backfill -- --account-id <uuid> --structure
  *     → Resolve + print the folder→entity map only. No extraction, no
@@ -54,10 +60,8 @@
  *
  * Flags:
  *   --account-id <uuid>  OR --campaign-id <uuid>  (exactly one)
- *   --batch-size <N>     Files per batch (default 30)
- *   --batch <K>          Which batch (zero-indexed, default 0)
- *   --all                Process every file at once; ignores --batch
- *   --newest-first       Sort by createdTime DESC; default is ASC
+ *   --newest-first       Pick the NEWEST active day past cursor; default
+ *                        is OLDEST (which is what catchup wants).
  *   --output <path>      Tee all output to a file
  *   --structure          Account-only. Print the entity map and exit.
  *   --dryrun             Skip DB writes — preview only. Default is to
@@ -143,10 +147,6 @@ const EMPTY_CAMPAIGN_STATE: CampaignCurrentState = {
 export interface Args {
   accountId?: string;
   campaignId?: string;
-  /** Number of active days to process this invocation. Default 1. */
-  scans: number;
-  /** Process every remaining active day (overrides --scans). */
-  all: boolean;
   newestFirst: boolean;
   outputPath: string | null;
   /** Stage 1: resolve + print the structure entity map, then exit. */
@@ -170,22 +170,16 @@ export interface Args {
    * Not set from argv — populated by the caller.
    */
   captureLog?: string[];
-  /**
-   * Soft wall-clock budget. When the elapsed time across the scan loop
-   * exceeds this, the engine stops between scans and returns with
-   * `truncatedByBudget: true` instead of running to completion. The
-   * caller decides whether to self-trigger a continuation. Null = no
-   * budget (CLI/local runs are uncapped). Set by the queue drain
-   * (backfill-queue.ts) to ~45 min so a single Cloud Run Job execution
-   * doesn't hit the task timeout. Checked at scan boundaries only — a
-   * scan in progress is allowed to finish.
-   */
-  wallClockBudgetMs?: number;
 }
 
 export interface BackfillRunResult {
+  /**
+   * 0 or 1. Each invocation processes at most one active day (the first
+   * activeDate strictly greater than the account's cursor). Locked by
+   * design — see Drive Sync: One Day Per Scan decision.
+   */
   scansProcessed: number;
-  /** Total files examined across every scan day processed this chunk. */
+  /** Files in this scan's day-bucket. Zero when scansProcessed=0. */
   filesProcessed: number;
   durationMs: number;
   /** Cursor at the end of the run, YYYY-MM-DD. Null if it stayed unchanged. */
@@ -196,14 +190,6 @@ export interface BackfillRunResult {
   activeDaysCount: number;
   /** True if the run took the structureOnly early-exit path. */
   structureOnlyMode: boolean;
-  /**
-   * True when wallClockBudgetMs was set AND the scan loop exited early
-   * because budget was exhausted. Implies there's more work past the
-   * final cursor — the caller should self-trigger a continuation.
-   * False when the run completed naturally (cursor reached end OR
-   * scans/all limit hit).
-   */
-  truncatedByBudget: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -219,15 +205,7 @@ function parseArgs(argv: string[]): Args {
     throw new Error('Pass exactly one of --account-id or --campaign-id');
   }
 
-  const scansStr = get('--scans');
-  const scans = scansStr ? Number(scansStr) : 1;
-  if (!Number.isInteger(scans) || scans < 1) {
-    throw new Error('--scans must be a positive integer');
-  }
-
   const out: Args = {
-    scans,
-    all: has('--all'),
     newestFirst: has('--newest-first'),
     outputPath: get('--output') ?? null,
     structureOnly: has('--structure'),
@@ -1899,7 +1877,6 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     activeDaysLast: null,
     activeDaysCount: 0,
     structureOnlyMode: false,
-    truncatedByBudget: false,
   });
 
   log('');
@@ -2007,60 +1984,39 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   }
   log('');
 
-  // ── Scan loop: one active day per scan ───────────────────────────────────
+  // ── One-day scan ─────────────────────────────────────────────────────────
   //
-  // Cursor = max edited_at across the account + its campaigns. Next pending
-  // day = first activeDate strictly greater than cursor. We walk forward
-  // through history one active day at a time, persisting after each scan
-  // (when not --dryrun). The cursor advances naturally through edited_at
-  // because every persisted synthesis stamps the day being processed.
+  // Locked invariant: **one scan = one active day of file CRUD**. Each
+  // invocation picks the first activeDate strictly greater than the
+  // account's cursor, processes its files, persists the cursor, and
+  // returns. Walking N days = N invocations — the queue chains
+  // continuations one row at a time via backfill-queue.ts; CLI users
+  // loop manually. The old --scans / --all / wall-clock-budget knobs
+  // were removed; the engine no longer loops across active days.
+  //
+  // Why one-day-per-scan:
+  //   - cursor advancement is unambiguous (scansProcessed ∈ {0,1})
+  //   - persist failure can throw without losing other days' work
+  //     (there are no other days in this run)
+  //   - the structure walk's cost is amortized across the chain at
+  //     the queue level, not the engine level
+  //   - re-scan overlap on continuation chunks becomes impossible by
+  //     construction
 
-  const maxScans = args.all ? Infinity : args.scans;
   let scansDone = 0;
   let filesProcessed = 0;
-  let currentCtx = ctx;
-
-  // In-memory cursor — seeded from accounts.drive_backfill_cursor on the
-  // first iteration, advanced to the just-processed day on each iteration.
-  // Lets --dryrun multi-scan walk forward without persisting (the DB
-  // cursor wouldn't move).
-  let effectiveCursor: string | null = currentCtx.driveBackfillCursor;
+  const effectiveCursor: string | null = ctx.driveBackfillCursor;
   const initialCursor = effectiveCursor;
   log(`  Cursor (accounts.drive_backfill_cursor): ${effectiveCursor ?? 'none — starting from earliest active day'}`);
-  if (args.wallClockBudgetMs) {
-    log(`  Wall-clock budget: ${Math.round(args.wallClockBudgetMs / 60000)} min (caller may self-trigger continuation if exhausted)`);
-  }
   log('');
 
-  /**
-   * Set to true when the scan loop exits early because wallClockBudgetMs
-   * was exceeded. The caller uses this to decide whether to self-trigger
-   * a continuation Job execution.
-   */
-  let truncatedByBudget = false;
-
-  while (scansDone < maxScans) {
-    // Budget check BEFORE starting a new scan. A scan in flight is
-    // allowed to finish — we never abort mid-scan, because cursor
-    // advancement only happens after a full scan persists.
-    if (args.wallClockBudgetMs && Date.now() - overallStart > args.wallClockBudgetMs) {
-      truncatedByBudget = true;
-      log(
-        rule(
-          `Wall-clock budget exhausted (${Math.round(args.wallClockBudgetMs / 60000)} min) — pausing for continuation`,
-        ),
-      );
-      break;
-    }
-
-    const nextDay = activeDates.find((d) => !effectiveCursor || d.date > effectiveCursor);
-    if (!nextDay) {
-      log(rule(`No more pending active days past ${effectiveCursor ?? '(start)'} — backfill complete`));
-      break;
-    }
-
-    log(rule(`Scan ${scansDone + 1}: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`));
-    filesProcessed += nextDay.files.length;
+  let finalCursor: string | null = effectiveCursor;
+  const nextDay = activeDates.find((d) => !effectiveCursor || d.date > effectiveCursor);
+  if (!nextDay) {
+    log(rule(`No active days past ${effectiveCursor ?? '(start)'} — already caught up`));
+  } else {
+    log(rule(`Scan: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`));
+    filesProcessed = nextDay.files.length;
 
     // Fetch revisions for this day's files (metadata only).
     log('  Fetching revision metadata…');
@@ -2090,7 +2046,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     const scanStart = Date.now();
     const outcome = await processBatch(
       withRevisions,
-      currentCtx,
+      ctx,
       attributor,
       nameDirectory,
       !args.dryrun,
@@ -2136,41 +2092,29 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     }
 
     log('');
-    log(`  ✓ Scan ${scansDone + 1} done in ${fmtMs(scanMs)}  (${nextDay.date})`);
+    log(`  ✓ Scan done in ${fmtMs(scanMs)}  (${nextDay.date})`);
     log('');
 
-    scansDone++;
-    effectiveCursor = nextDay.date;
+    scansDone = 1;
+    finalCursor = nextDay.date;
 
-    // Persist the cursor regardless of synthesis output. This is the
-    // whole point of the dedicated column — zero-obs days (early
-    // sparse history, training-material files with no observations)
-    // need to advance the walker even though nothing was synthesized
-    // or written to status_markdown.
+    // Persist the cursor. NO try/catch — failure must propagate. With
+    // only one scan per chunk, swallowing here would leave the row
+    // reporting `completed` while the DB cursor stays stale, exactly
+    // the symptom we just engineered away. Synthesis writes are
+    // already committed above (processBatch with persist=true), so
+    // letting this throw doesn't lose observation data — only the
+    // cursor stamp, which the next chunk will redo from the same
+    // starting point.
     if (!args.dryrun) {
-      try {
-        await persistCursor(currentCtx.accountId, nextDay.date);
-      } catch (err) {
-        log(`  ⚠ failed to persist cursor for ${nextDay.date}: ${summarizeError(err)}`);
-      }
-    }
-
-    // Reload ctx for the next scan in persist mode so its prior
-    // status_markdown reflects what we just wrote. In --dryrun mode the
-    // DB didn't change — each scan in a multi-scan dryrun is an
-    // independent preview against the same starting state (the cursor
-    // advances in memory so we walk forward through days, but the
-    // synthesis merge base for each scan is the original DB state, not
-    // the previous in-memory scan's output).
-    if (!args.dryrun) {
-      currentCtx = await loadEntity(args);
+      await persistCursor(ctx.accountId, nextDay.date);
     }
   }
 
   const overallMs = Date.now() - overallStart;
   log(
     rule(
-      `Backfill done — ${scansDone} scan${scansDone === 1 ? '' : 's'} / ${filesProcessed} file${filesProcessed === 1 ? '' : 's'} processed in ${fmtMs(overallMs)}`,
+      `Backfill done — ${scansDone} scan / ${filesProcessed} file${filesProcessed === 1 ? '' : 's'} processed in ${fmtMs(overallMs)}`,
     ),
   );
   log('');
@@ -2179,12 +2123,11 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     scansProcessed: scansDone,
     filesProcessed,
     durationMs: overallMs,
-    finalCursorYmd: effectiveCursor !== initialCursor ? effectiveCursor : null,
+    finalCursorYmd: finalCursor !== initialCursor ? finalCursor : null,
     activeDaysFirst: activeDates[0]!.date,
     activeDaysLast: activeDates[activeDates.length - 1]!.date,
     activeDaysCount: activeDates.length,
     structureOnlyMode: false,
-    truncatedByBudget,
   };
 }
 
