@@ -327,6 +327,8 @@ model DriveBackfillRequest {
   nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz
   /// When true, the engine processes until cursor reaches today instead of `scans` days.
   allRemaining  Boolean   @default(false) @map("all_remaining")
+  /// Total files examined across all scan days in this chunk.
+  filesProcessed Int      @default(0) @map("files_processed")
 
   account     Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
   requestedByStaff Staff @relation("DriveBackfillRequestedBy", fields: [requestedBy], references: [id])

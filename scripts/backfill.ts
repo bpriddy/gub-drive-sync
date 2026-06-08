@@ -185,6 +185,8 @@ export interface Args {
 
 export interface BackfillRunResult {
   scansProcessed: number;
+  /** Total files examined across every scan day processed this chunk. */
+  filesProcessed: number;
   durationMs: number;
   /** Cursor at the end of the run, YYYY-MM-DD. Null if it stayed unchanged. */
   finalCursorYmd: string | null;
@@ -1890,6 +1892,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   const overallStart = Date.now();
   const emptyResult = (): BackfillRunResult => ({
     scansProcessed: 0,
+    filesProcessed: 0,
     durationMs: Date.now() - overallStart,
     finalCursorYmd: null,
     activeDaysFirst: null,
@@ -2014,6 +2017,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
 
   const maxScans = args.all ? Infinity : args.scans;
   let scansDone = 0;
+  let filesProcessed = 0;
   let currentCtx = ctx;
 
   // In-memory cursor — seeded from accounts.drive_backfill_cursor on the
@@ -2056,6 +2060,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     }
 
     log(rule(`Scan ${scansDone + 1}: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`));
+    filesProcessed += nextDay.files.length;
 
     // Fetch revisions for this day's files (metadata only).
     log('  Fetching revision metadata…');
@@ -2165,13 +2170,14 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   const overallMs = Date.now() - overallStart;
   log(
     rule(
-      `Backfill done — ${scansDone} scan${scansDone === 1 ? '' : 's'} processed in ${fmtMs(overallMs)}`,
+      `Backfill done — ${scansDone} scan${scansDone === 1 ? '' : 's'} / ${filesProcessed} file${filesProcessed === 1 ? '' : 's'} processed in ${fmtMs(overallMs)}`,
     ),
   );
   log('');
 
   return {
     scansProcessed: scansDone,
+    filesProcessed,
     durationMs: overallMs,
     finalCursorYmd: effectiveCursor !== initialCursor ? effectiveCursor : null,
     activeDaysFirst: activeDates[0]!.date,
