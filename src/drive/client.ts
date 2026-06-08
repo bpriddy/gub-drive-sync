@@ -53,6 +53,30 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 // calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
 // burst. Acceptable, and we never get a 403 in steady state.
 
+function isRateLimitError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    code?: number;
+    status?: number;
+    errors?: Array<{ reason?: string }>;
+    response?: { status?: number; data?: { error?: { errors?: Array<{ reason?: string }> } } };
+  };
+  const status = e.code ?? e.status ?? e.response?.status;
+  if (status !== 403 && status !== 429) return false;
+  const reasons: string[] = [
+    ...(e.errors ?? []).map((x) => x.reason ?? ''),
+    ...(e.response?.data?.error?.errors ?? []).map((x) => x.reason ?? ''),
+  ];
+  // Reasons that mean "rate-limited, try again." Other 403s (auth, perms)
+  // are NOT retryable and should propagate immediately.
+  return reasons.some(
+    (r) =>
+      r === 'userRateLimitExceeded' ||
+      r === 'rateLimitExceeded' ||
+      r === 'quotaExceeded',
+  );
+}
+
 class DriveRateLimiter {
   private chainTail: Promise<void> = Promise.resolve();
   private lastCallEndAt = 0;
@@ -81,8 +105,29 @@ class DriveRateLimiter {
       await new Promise((resolve) => setTimeout(resolve, earliestStart - now));
     }
 
+    // Defense in depth: even with pacing, transient quota throttles can
+    // slip through (bot user has tighter-than-documented quota,
+    // cumulative effects, concurrent processes sharing the bot user).
+    // Retry rate-limit errors with exponential backoff: 2s → 4s → 8s →
+    // 16s → 30s. Non-rate-limit errors propagate immediately.
+    const MAX_ATTEMPTS = 5;
+    let lastErr: unknown;
     try {
-      return await fn();
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          return await fn();
+        } catch (err) {
+          lastErr = err;
+          if (!isRateLimitError(err) || attempt === MAX_ATTEMPTS) throw err;
+          const backoffMs = Math.min(2000 * Math.pow(2, attempt - 1), 30_000);
+          logger.warn(
+            { attempt, MAX_ATTEMPTS, backoffMs },
+            '[drive.client] rate-limited despite pacing — backing off and retrying',
+          );
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        }
+      }
+      throw lastErr;
     } finally {
       this.lastCallEndAt = Date.now();
       resolveMine();
@@ -92,10 +137,18 @@ class DriveRateLimiter {
 
 /**
  * Single shared rate limiter for ALL Drive API calls in this process.
- * 8 calls/sec gives ~125ms spacing — well below Drive's default per-user
- * limit (~10/sec sustained) with buffer for backend latency variance.
+ *
+ * 4 calls/sec gives 250ms spacing. Conservative vs Drive's documented
+ * 10/sec per-user limit, but real-world enforcement is often tighter
+ * (bot user quotas, sliding-window edges, concurrent process effects).
+ * The cost is ~40s of upfront throttled wall-clock for Chevy's ~159
+ * startup calls — acceptable.
+ *
+ * If 4/sec STILL hits the limit, the retry-with-backoff inside .run()
+ * absorbs it: we wait up to 30s and try again, up to 5 attempts. The
+ * chunk continues seamlessly instead of failing with HTTP 403.
  */
-const driveLimiter = new DriveRateLimiter(8);
+const driveLimiter = new DriveRateLimiter(4);
 
 // ── Drive API client (lazy singleton, OAuth-backed) ──────────────────────────
 
