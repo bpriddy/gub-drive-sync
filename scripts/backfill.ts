@@ -257,6 +257,85 @@ function fmtMs(ms: number): string {
   return `${mins}m ${secs}s`;
 }
 
+// ── Phase timing ─────────────────────────────────────────────────────────────
+//
+// Each invocation builds a flat map of {phase → cumulative ms}. The hot
+// paths wrap their work with `await timed('phase', () => ...)`; the
+// summary is printed as the LAST log block at end of runBackfill so it
+// survives the 40-line `tailLogSummary` clip and lands in the gub-admin
+// log_summary column. Reset at the top of every runBackfillInner.
+//
+// Used to answer "where is the 85 minutes going on a single 1-day scan."
+
+class PhaseTimer {
+  private totals = new Map<string, number>();
+  add(phase: string, ms: number): void {
+    this.totals.set(phase, (this.totals.get(phase) ?? 0) + ms);
+  }
+  summary(): { rows: Array<{ phase: string; ms: number; pct: number }>; totalMs: number } {
+    const total = Array.from(this.totals.values()).reduce((s, v) => s + v, 0);
+    const rows = Array.from(this.totals.entries())
+      .map(([phase, ms]) => ({ phase, ms, pct: total > 0 ? (ms / total) * 100 : 0 }))
+      .sort((a, b) => b.ms - a.ms);
+    return { rows, totalMs: total };
+  }
+}
+
+let phaseTimer: PhaseTimer | null = null;
+
+async function timed<T>(phase: string, fn: () => Promise<T>): Promise<T> {
+  if (!phaseTimer) return fn();
+  const start = Date.now();
+  try {
+    return await fn();
+  } finally {
+    phaseTimer.add(phase, Date.now() - start);
+  }
+}
+
+/** Pretty-name table so phase keys render as human labels in the summary. */
+const PHASE_LABELS: Record<string, string> = {
+  setup: 'Setup (loadEntity)',
+  structure_walk: 'Drive walk (folders)',
+  structure_classify: 'Classify folders (LLM)',
+  file_discovery: 'Discover files (Drive)',
+  revisions_fetch: 'Revisions fetch (Drive)',
+  extract_text: 'Extract text (per-file)',
+  interpret_file: 'Interpret file (per-file LLM)',
+  distill: 'Distill (per-entity LLM)',
+  synthesis: 'Synthesize (per-entity LLM)',
+  db_writes: 'DB writes (persistTarget)',
+  persist_cursor: 'Persist cursor (DB)',
+};
+
+function printPhaseSummary(wallClockMs: number): void {
+  if (!phaseTimer) return;
+  const { rows, totalMs: instrumentedMs } = phaseTimer.summary();
+  if (rows.length === 0) return;
+  log('');
+  log(rule('Phase timing (this scan)'));
+  const labelWidth = Math.max(
+    ...rows.map((r) => (PHASE_LABELS[r.phase] ?? r.phase).length),
+  );
+  const timeWidth = Math.max(...rows.map((r) => fmtMs(r.ms).length));
+  for (const r of rows) {
+    const label = (PHASE_LABELS[r.phase] ?? r.phase).padEnd(labelWidth);
+    const t = fmtMs(r.ms).padStart(timeWidth);
+    const barLen = Math.round(r.pct / 5); // 20-wide bar
+    const bar = '█'.repeat(barLen) + '░'.repeat(20 - barLen);
+    const pct = `${r.pct.toFixed(0)}%`.padStart(4);
+    log(`  ${label}   ${t}   ${bar}  ${pct}`);
+  }
+  log('  ' + '─'.repeat(labelWidth + 3 + timeWidth + 3 + 20 + 2 + 4));
+  log(`  ${'Instrumented total'.padEnd(labelWidth)}   ${fmtMs(instrumentedMs).padStart(timeWidth)}`);
+  const untracked = wallClockMs - instrumentedMs;
+  if (untracked > 0) {
+    log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}   (un-instrumented: ${fmtMs(untracked)})`);
+  } else {
+    log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}`);
+  }
+}
+
 // ── Cursor + date-grouping helpers ───────────────────────────────────────────
 //
 // Backfill scans by active day. A scan = one calendar-day bucket of files
@@ -1199,7 +1278,7 @@ async function processBatch(
       attribution.ownerType === 'campaign' ? attribution.campaignName : null;
 
     try {
-      const extraction = await extractText(file);
+      const extraction = await timed('extract_text', () => extractText(file));
       if (extraction.kind !== 'ok') {
         const detail = extraction.detail ? ` (${extraction.detail})` : '';
         log(`    ⊘ ${file.name}  [${file.mimeType}]  skip: ${extraction.reason}${detail}`);
@@ -1207,19 +1286,21 @@ async function processBatch(
         continue;
       }
 
-      const res = await interpretFile({
-        file,
-        text: extraction.text,
-        accountName: ctx.accountName,
-        accountCurrentState: ctx.accountState,
-        campaignName: perFileCampaignName,
-        campaignCurrentState: attribution.ownerType === 'campaign' ? ctx.campaignState : null,
-        // Subject-routing vocabulary. The LLM picks entity_campaign_name
-        // from this list when an obs's subject is a specific campaign;
-        // a free-form name signals an unknown campaign to the
-        // orchestrator's phantom bucket.
-        knownCampaigns: nameDirectory?.knownCampaignNames ?? [],
-      });
+      const res = await timed('interpret_file', () =>
+        interpretFile({
+          file,
+          text: extraction.text,
+          accountName: ctx.accountName,
+          accountCurrentState: ctx.accountState,
+          campaignName: perFileCampaignName,
+          campaignCurrentState: attribution.ownerType === 'campaign' ? ctx.campaignState : null,
+          // Subject-routing vocabulary. The LLM picks entity_campaign_name
+          // from this list when an obs's subject is a specific campaign;
+          // a free-form name signals an unknown campaign to the
+          // orchestrator's phantom bucket.
+          knownCampaigns: nameDirectory?.knownCampaignNames ?? [],
+        }),
+      );
 
       const totalObs = res.account.length + res.campaign.length;
       const symbol = totalObs > 0 ? '✓' : '○';
@@ -1520,10 +1601,12 @@ async function processBatch(
           target.entityType === 'account'
             ? target.accountState
             : (target.campaignState ?? EMPTY_CAMPAIGN_STATE);
-        const dry = await runDryRunDistillation(
-          target.entityType,
-          target.observations,
-          baseState,
+        const dry = await timed('distill', () =>
+          runDryRunDistillation(
+            target.entityType,
+            target.observations,
+            baseState,
+          ),
         );
         distillResult = {
           proposalsCreated: dry.field_changes.length,
@@ -1651,12 +1734,14 @@ async function processBatch(
           approvedFieldChangesJson: JSON.stringify([], null, 2),
           approvedAdditionalUpdatesJson: JSON.stringify(approvedAdditionalUpdates, null, 2),
         });
-        const res = await defaultLlm.complete({
-          model: 'gemini-2.5-pro',
-          temperature: 0.2,
-          prompt: renderedPrompt,
-          tag: `backfill.${STATUS_SYNTHESIS_V1_VERSION}`,
-        });
+        const res = await timed('synthesis', () =>
+          defaultLlm.complete({
+            model: 'gemini-2.5-pro',
+            temperature: 0.2,
+            prompt: renderedPrompt,
+            tag: `backfill.${STATUS_SYNTHESIS_V1_VERSION}`,
+          }),
+        );
         // Parse the quad-output. If delimiters are missing, the parser
         // gates the whole response as sensitive — safer than leaking.
         const parsed = parseQuadContextOutput(res.text);
@@ -1691,13 +1776,15 @@ async function processBatch(
       // ── Apply (when --apply is set) ─────────────────────────────────
       if (applyToDb) {
         try {
-          await persistTarget({
-            target,
-            ctx,
-            validatedChanges,
-            synthesizedMarkdown,
-            synthesizedSensitiveMarkdown,
-          });
+          await timed('db_writes', () =>
+            persistTarget({
+              target,
+              ctx,
+              validatedChanges,
+              synthesizedMarkdown,
+              synthesizedSensitiveMarkdown,
+            }),
+          );
           log('      ✓ applied (system-staff attribution)');
         } catch (err) {
           log(`      apply failed: ${summarizeError(err)}`);
@@ -1879,10 +1966,15 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     structureOnlyMode: false,
   });
 
+  // Fresh phase timer for this invocation. Reset between back-to-back
+  // CLI runs in the same process; queue mode spawns one process per
+  // request so it's effectively per-row.
+  phaseTimer = new PhaseTimer();
+
   log('');
   log(rule(args.dryrun ? 'Backfill (dryrun — no DB writes)' : 'Backfill'));
 
-  const ctx = await loadEntity(args);
+  const ctx = await timed('setup', () => loadEntity(args));
   log(`  Entity: ${ctx.type}: ${ctx.name}  (${ctx.id})`);
   log(`  Folder: ${ctx.folderId}`);
 
@@ -1922,24 +2014,28 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log('  Gathering folders…');
     const isTTY = process.stdout.isTTY === true;
     let lastTick = Date.now();
-    const folders = await gatherFolders(ctx.folderId, ctx.name, {
-      onProgress: (n) => {
-        if (!isTTY) return;
-        if (Date.now() - lastTick < 150) return;
-        lastTick = Date.now();
-        process.stdout.write('\r' + `    …${n} folders so far`.padEnd(40));
-      },
-    });
+    const folders = await timed('structure_walk', () =>
+      gatherFolders(ctx.folderId, ctx.name, {
+        onProgress: (n) => {
+          if (!isTTY) return;
+          if (Date.now() - lastTick < 150) return;
+          lastTick = Date.now();
+          process.stdout.write('\r' + `    …${n} folders so far`.padEnd(40));
+        },
+      }),
+    );
     if (isTTY) process.stdout.write('\r' + ' '.repeat(40) + '\r');
     log(`  Gathered ${folders.length} folders.`);
     log('  Classifying with LLM…');
-    const entityMap = await classifyFolders({
-      accountId: ctx.id,
-      accountName: ctx.name,
-      rootFolderId: ctx.folderId,
-      folders,
-      existingCampaigns,
-    });
+    const entityMap = await timed('structure_classify', () =>
+      classifyFolders({
+        accountId: ctx.id,
+        accountName: ctx.name,
+        rootFolderId: ctx.folderId,
+        folders,
+        existingCampaigns,
+      }),
+    );
     const classifiedCounts = {
       existing: entityMap.classified.filter((c) => c.classification === 'existing_campaign').length,
       fresh: entityMap.classified.filter((c) => c.classification === 'new_campaign').length,
@@ -1959,7 +2055,9 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   }
 
   log(rule('Discover files'));
-  const allFiles = await gatherFilesAuto(ctx.folderId, ctx.name, args.newestFirst);
+  const allFiles = await timed('file_discovery', () =>
+    gatherFilesAuto(ctx.folderId, ctx.name, args.newestFirst),
+  );
   log(`  Total files in folder: ${allFiles.length}`);
   if (allFiles.length === 0) {
     log('  Nothing to do. Exiting.');
@@ -2032,7 +2130,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
         process.stdout.write('\r' + `    ${i + 1}/${nextDay.files.length}  ${nameTail}`.padEnd(100).slice(0, 100));
       }
       try {
-        const revs = await listRevisions(file.id);
+        const revs = await timed('revisions_fetch', () => listRevisions(file.id));
         withRevisions.push({ file, revisions: revs });
       } catch {
         revFailures++;
@@ -2107,7 +2205,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     // cursor stamp, which the next chunk will redo from the same
     // starting point.
     if (!args.dryrun) {
-      await persistCursor(ctx.accountId, nextDay.date);
+      await timed('persist_cursor', () => persistCursor(ctx.accountId, nextDay.date));
     }
   }
 
@@ -2117,6 +2215,10 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       `Backfill done — ${scansDone} scan / ${filesProcessed} file${filesProcessed === 1 ? '' : 's'} processed in ${fmtMs(overallMs)}`,
     ),
   );
+
+  // Phase summary goes LAST so it survives the 40-line tailLogSummary
+  // and appears in the gub-admin Recent backfill requests row.
+  printPhaseSummary(overallMs);
   log('');
 
   return {
