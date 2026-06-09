@@ -41,7 +41,19 @@ import { summarizeError } from '../progress';
 import { runBackfill } from '../../scripts/backfill';
 
 /** Stale-running recovery threshold — see project_drive_sync_architecture.md "Self-healing reapers". */
-const STALE_RUNNING_MS = 60 * 60 * 1_000; // 60 minutes
+/**
+ * Reclaim threshold = 3× heartbeat interval. The engine writes a
+ * heartbeat every HEARTBEAT_INTERVAL_MS during a scan; three missed
+ * cycles → almost certainly dead (network blip, GC pause, slow LLM
+ * call can each eat 1 cycle; 3 in a row is the crash signal).
+ *
+ * Was 60 min (started_at-based), missed OOM crashes mid-scan because
+ * started_at is set once at claim and never updated — a row claimed
+ * 40 min ago looked identical whether the engine was humming along or
+ * SIGKILL'd at minute 30. Now it's heartbeat-derived liveness.
+ */
+const STALE_RUNNING_MS = 15 * 60 * 1_000; // 15 minutes
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1_000; // 5 minutes
 /** Per-invocation drain safety cap. Backstop so a runaway queue can't extend a single Job execution indefinitely. */
 const MAX_REQUESTS_PER_INVOCATION = 50;
 /** Maximum claim count before a row is marked terminal-failed. Mirrors gub-research-worker. */
@@ -83,18 +95,36 @@ function backoffMs(attempts: number): number {
 }
 
 /**
- * Reset `running` rows whose `started_at` is older than STALE_RUNNING_MS
+ * Reset `running` rows whose liveness pulse is older than STALE_RUNNING_MS
  * back to `pending`. Runs once at the start of every Job execution.
+ *
+ * Uses last_heartbeat_at as the primary liveness signal; falls back to
+ * started_at for rows from before the heartbeat column existed (NULL).
+ * Heartbeat is written on claim + every HEARTBEAT_INTERVAL_MS while the
+ * scan runs, so missing it for STALE_RUNNING_MS (3× interval) means
+ * the worker is almost certainly dead (OOM SIGKILL, container restart,
+ * network partition that closed the DB connection, etc.).
+ *
  * Mirrors gub-research-worker's reclaimStaleRunning — name kept identical
  * for cross-repo grep-ability.
  */
 async function reclaimStaleRunning(): Promise<number> {
   const cutoff = new Date(Date.now() - STALE_RUNNING_MS);
   const res = await prisma.driveBackfillRequest.updateMany({
-    where: { status: 'running', startedAt: { lt: cutoff } },
+    where: {
+      status: 'running',
+      OR: [
+        { lastHeartbeatAt: { lt: cutoff } },
+        // Legacy rows pre-heartbeat — fall back to started_at so we don't
+        // either reclaim healthy in-flight pre-deploy rows OR leave them
+        // running forever. After all pre-deploy rows terminate this OR
+        // branch goes cold; can drop later.
+        { lastHeartbeatAt: null, startedAt: { lt: cutoff } },
+      ],
+    },
     data: {
       status: 'pending',
-      errorMessage: 'reclaimed: stale running (worker died mid-call)',
+      errorMessage: 'reclaimed: stale running (heartbeat missed — worker died)',
     },
   });
   return res.count;
@@ -132,6 +162,13 @@ async function claimNext(): Promise<{
       data: {
         status: 'running',
         startedAt: new Date(),
+        // Initial heartbeat stamp at claim time. The 5-min ticker in
+        // processOne keeps it fresh; without this seed, a row that
+        // claimed but crashed BEFORE the first tick would have null
+        // heartbeat and fall through to the startedAt-fallback branch
+        // in reclaimStaleRunning — works, but the heartbeat path is
+        // the intended primary.
+        lastHeartbeatAt: new Date(),
         attempts: { increment: 1 },
       },
       select: {
@@ -283,6 +320,29 @@ async function processOne(req: {
       allRemaining: req.allRemaining,
     }),
   );
+
+  // Heartbeat ticker — bumps last_heartbeat_at every HEARTBEAT_INTERVAL_MS.
+  // reclaimStaleRunning treats absence-of-heartbeat (>STALE_RUNNING_MS old)
+  // as crash; this keeps the row alive in the DB's eyes. Errors are swallowed
+  // (best-effort) so a transient DB blip doesn't kill the running scan. The
+  // initial heartbeat was already stamped by claimNext at row claim time.
+  const heartbeat = setInterval(() => {
+    prisma.driveBackfillRequest
+      .update({
+        where: { id: req.id },
+        data: { lastHeartbeatAt: new Date() },
+      })
+      .catch((err) => {
+        console.warn(
+          JSON.stringify({
+            msg: 'backfill-queue.heartbeat_failed',
+            requestId: req.id,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      });
+  }, HEARTBEAT_INTERVAL_MS);
+
   const captureLog: string[] = [];
   try {
     const result = await runBackfill({
@@ -410,6 +470,12 @@ async function processOne(req: {
         );
       });
     return { kind: 'retried' };
+  } finally {
+    // Stop the heartbeat regardless of outcome (completed, retried,
+    // terminal failure). Each processOne call owns its own ticker —
+    // the drain loop may call processOne again on the next iteration
+    // and that call sets up its own.
+    clearInterval(heartbeat);
   }
 }
 
