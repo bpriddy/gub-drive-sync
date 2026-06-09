@@ -111,7 +111,12 @@ steps:
       - --parallelism=1
       - --max-retries=0
       - --task-timeout=86400s
-      - --memory=1Gi
+      # Bumped 1Gi → 2Gi after observing OOM on Chevy backfill ~40min in
+      # (rss exceeded 1Gi during the structure_walk + per-file processing
+      # accumulation). 2Gi gives headroom while we instrument heap usage
+      # via the 30s ticker in backfill.ts. Cloud Run requires ≥1 CPU for
+      # 2Gi (current --cpu=1 is fine for up to 2Gi).
+      - --memory=2Gi
       - --cpu=1
       - --service-account=sa-$_JOB@$PROJECT_ID.iam.gserviceaccount.com
       - --set-cloudsql-instances=$PROJECT_ID:$_REGION:$_CLOUDSQL_INSTANCE

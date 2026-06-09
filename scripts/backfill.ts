@@ -1971,6 +1971,21 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   // request so it's effectively per-row.
   phaseTimer = new PhaseTimer();
 
+  // Heap watcher — emits a [mem] line every 30s with rss/heap/external
+  // so OOM diagnostics survive even though the phase-summary block
+  // can't print after SIGKILL. Cloud Run kills on rss exceeding the
+  // Job's --memory limit; logging rss correlates directly.
+  //
+  // .unref() so the interval doesn't keep the event loop alive past
+  // the scan's natural completion — we never need to clearInterval.
+  setInterval(() => {
+    const m = process.memoryUsage();
+    const mb = (n: number): number => Math.round(n / 1024 / 1024);
+    log(
+      `  [mem] rss=${mb(m.rss)}MB  heapUsed=${mb(m.heapUsed)}MB  heapTotal=${mb(m.heapTotal)}MB  external=${mb(m.external)}MB`,
+    );
+  }, 30_000).unref();
+
   log('');
   log(rule(args.dryrun ? 'Backfill (dryrun — no DB writes)' : 'Backfill'));
 
