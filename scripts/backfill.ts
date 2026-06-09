@@ -77,7 +77,7 @@ import {
   type DriveRevisionMeta,
 } from '../src/drive/client';
 import { traverseFolder } from '../src/drive/traversal';
-import { extractText } from '../src/drive/extract';
+import { extractText, predictExtractionSkip } from '../src/drive/extract';
 import { interpretFile, type AccountObservation, type CampaignObservation } from '../src/drive/interpret';
 import {
   ACCOUNT_FIELD_WRITE,
@@ -2131,18 +2131,45 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log(rule(`Scan: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`));
     filesProcessed = nextDay.files.length;
 
-    // Fetch revisions for this day's files (metadata only).
+    // ── Pre-filter: skip-able files don't need revision metadata ─────────
+    //
+    // The revisions fetch below is one Drive API call per file. Under the
+    // 4/s rate limiter that adds up — a day with 350 files (most of them
+    // PNG/JPEG that extractText would skip on mime alone) was eating ~80s
+    // here for no downstream benefit. predictExtractionSkip is the same
+    // metadata-only check extractText runs first; if it returns a skip,
+    // we know the file is going to be ⊘'d in processBatch anyway. Log it
+    // the same way processBatch would, then short-circuit.
+    const extractable: TraversedFile[] = [];
+    let preFilterSkipped = 0;
+    for (const file of nextDay.files) {
+      const predicted = predictExtractionSkip(file);
+      if (predicted) {
+        const detail = predicted.detail ? ` (${predicted.detail})` : '';
+        log(`    ⊘ ${file.name}  [${file.mimeType}]  skip: ${predicted.reason}${detail}  (pre-filtered, no revisions fetch)`);
+        preFilterSkipped++;
+      } else {
+        extractable.push(file);
+      }
+    }
+    if (preFilterSkipped > 0) {
+      log(
+        `  Pre-filter: ${extractable.length} extractable / ${preFilterSkipped} skipped on mime/size; saving ${preFilterSkipped} revisions.list calls`,
+      );
+    }
+
+    // Fetch revisions only for files that will actually be extracted.
     log('  Fetching revision metadata…');
     const withRevisions: FileWithRevisions[] = [];
     let revFailures = 0;
     const isTTY = process.stdout.isTTY === true;
     let lastTick = Date.now();
-    for (let i = 0; i < nextDay.files.length; i++) {
-      const file = nextDay.files[i]!;
+    for (let i = 0; i < extractable.length; i++) {
+      const file = extractable[i]!;
       if (isTTY && Date.now() - lastTick > 250) {
         lastTick = Date.now();
         const nameTail = file.name.length > 40 ? '…' + file.name.slice(-40) : file.name;
-        process.stdout.write('\r' + `    ${i + 1}/${nextDay.files.length}  ${nameTail}`.padEnd(100).slice(0, 100));
+        process.stdout.write('\r' + `    ${i + 1}/${extractable.length}  ${nameTail}`.padEnd(100).slice(0, 100));
       }
       try {
         const revs = await timed('revisions_fetch', () => listRevisions(file.id));

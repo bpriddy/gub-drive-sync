@@ -42,7 +42,7 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { downloadFileBuffer } from './client';
 import { buildBotOAuthClient } from '../workspace';
-import type { ExtractionOutcome, TraversedFile } from './types';
+import type { ExtractionOutcome, ExtractionSkip, TraversedFile } from './types';
 
 // ── MIME constants ─────────────────────────────────────────────────────────
 
@@ -120,7 +120,7 @@ function ok(text: string, extractor: string): ExtractionOutcome {
  * downstream in interpret.ts) rather than transfer/memory. A 300 MB
  * Google Slides deck is API-traversed, not downloaded.
  */
-function tooLargeForBinaryDownload(file: TraversedFile): ExtractionOutcome | null {
+function tooLargeForBinaryDownload(file: TraversedFile): ExtractionSkip | null {
   if (file.size && file.size > config.DRIVE_MAX_FILE_SIZE_BYTES) {
     return {
       kind: 'skip',
@@ -131,24 +131,24 @@ function tooLargeForBinaryDownload(file: TraversedFile): ExtractionOutcome | nul
   return null;
 }
 
-export async function extractText(file: TraversedFile): Promise<ExtractionOutcome> {
+/**
+ * Pure metadata-only check: would extractText skip this file without
+ * doing any I/O? Returns the skip outcome if so, null if the file is
+ * extraction-eligible (or would fail with a network/parse error, which
+ * we can't predict).
+ *
+ * Mirrors the bail-outs in extractText so callers can pre-filter
+ * before doing expensive setup work (per-file listRevisions, etc).
+ * Both predictExtractionSkip and extractText route through the same
+ * decision tree — extractText calls this first, then proceeds to the
+ * extraction switch only on null.
+ */
+export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | null {
   if (file.isFolder) return { kind: 'skip', reason: 'folder' };
 
-  // ── Shortcut follow (single-level, greedy across drives) ──────────────
-  // Drive shortcuts (mimeType=application/vnd.google-apps.shortcut) are
-  // pointers to another file or folder. The shortcut row has no content
-  // of its own; the real content lives at shortcutTarget.id. We follow
-  // greedily — including cross-drive targets — because shortcuts often
-  // surface shared assets (brand libraries, briefs in other folders)
-  // that are otherwise invisible to the per-entity scan.
-  //
-  // Limit: single-level follow only. Shortcut-to-shortcut chains are
-  // impossible to create in Drive's UI but we guard defensively. Folder
-  // shortcuts get skipped (logged) — traversing the target folder
-  // through a shortcut is a v2 feature (changes the gather phase, not
-  // just the extractor). File shortcuts dispatch into the normal switch
-  // below with the target's mimeType.
-  let effectiveFile = file;
+  // Shortcut resolution — mirror extractText's three early-exit cases.
+  let effective = file;
+  let isShortcutFollow = false;
   if (file.mimeType === MIME.SHORTCUT) {
     if (!file.shortcutTarget) {
       return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut without resolved target' };
@@ -161,13 +161,75 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
       };
     }
     if (file.shortcutTarget.mimeType === MIME.SHORTCUT) {
-      // Defensive: shortcut chains aren't really constructible but guard anyway.
       return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut chain (single-level follow only)' };
     }
-    // Rebuild a virtual file pointing at the target. Keep the shortcut's
-    // name/path so traversal breadcrumbs and progress lines still
-    // identify WHERE the content was reached from. Clear size — the
-    // shortcut's size attribute reflects the pointer, not the target.
+    effective = {
+      ...file,
+      id: file.shortcutTarget.id,
+      mimeType: file.shortcutTarget.mimeType,
+      size: null, // shortcutDetails doesn't include target size — see guard below
+    };
+    isShortcutFollow = true;
+  }
+
+  switch (effective.mimeType) {
+    // Google-native: API-traversed, no size cap.
+    case MIME.GOOGLE_DOC:
+    case MIME.GOOGLE_SLIDES:
+    case MIME.GOOGLE_SHEET:
+      return null;
+
+    // Binary download paths share the same size guard.
+    case MIME.PDF:
+    case MIME.DOCX:
+    case MIME.PPTX: {
+      const tooLarge = tooLargeForBinaryDownload(effective);
+      if (tooLarge) return tooLarge;
+      // Shortcut→binary with unknown size: we can't verify the cap,
+      // and Drive's shortcutDetails doesn't carry the target's size.
+      // Default-skip rather than download blindly (the OOM vector).
+      // To rescue these, do a single files.get on the target ahead
+      // of dispatch — left as a future enhancement.
+      if (isShortcutFollow && effective.size == null) {
+        return {
+          kind: 'skip',
+          reason: 'shortcut_unverified_size',
+          detail: `${effective.mimeType} via shortcut (target id=${effective.id}); shortcutDetails has no size`,
+        };
+      }
+      return null;
+    }
+
+    default:
+      if (effective.mimeType.startsWith('text/')) {
+        const tooLarge = tooLargeForBinaryDownload(effective);
+        if (tooLarge) return tooLarge;
+        if (isShortcutFollow && effective.size == null) {
+          return {
+            kind: 'skip',
+            reason: 'shortcut_unverified_size',
+            detail: `${effective.mimeType} via shortcut (target id=${effective.id}); shortcutDetails has no size`,
+          };
+        }
+        return null;
+      }
+      return { kind: 'skip', reason: 'unsupported_mime', detail: effective.mimeType };
+  }
+}
+
+export async function extractText(file: TraversedFile): Promise<ExtractionOutcome> {
+  // Single source of truth for skip-without-I/O decisions. Lets callers
+  // (e.g. the backfill scan loop) pre-filter to avoid wasted per-file
+  // listRevisions calls on files we'll just skip here anyway.
+  const predicted = predictExtractionSkip(file);
+  if (predicted) return predicted;
+
+  // Resolve the shortcut to its target. predictExtractionSkip already
+  // verified the shortcut's target exists, isn't a folder, isn't a
+  // chain, and (for binary mimes) has a verifiable size — so this
+  // rebuild is safe.
+  let effectiveFile = file;
+  if (file.mimeType === MIME.SHORTCUT && file.shortcutTarget) {
     effectiveFile = {
       ...file,
       id: file.shortcutTarget.id,
@@ -188,10 +250,8 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
       case MIME.GOOGLE_SHEET:
         return ok(await extractGoogleSheets(effectiveFile.id), 'gsheet');
 
-      // ── Binary downloads: size cap applies; we pull bytes into memory.
+      // ── Binary downloads: size cap already checked in predictExtractionSkip.
       case MIME.PDF: {
-        const tooLarge = tooLargeForBinaryDownload(effectiveFile);
-        if (tooLarge) return tooLarge;
         const buf = await downloadFileBuffer(effectiveFile.id);
         // Import lazily to keep the parser off the module init path.
         //
@@ -217,15 +277,11 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
         return ok(text, 'pdf');
       }
       case MIME.DOCX: {
-        const tooLarge = tooLargeForBinaryDownload(effectiveFile);
-        if (tooLarge) return tooLarge;
         const buf = await downloadFileBuffer(effectiveFile.id);
         const { value } = await mammoth.extractRawText({ buffer: buf });
         return ok(value, 'docx');
       }
       case MIME.PPTX: {
-        const tooLarge = tooLargeForBinaryDownload(effectiveFile);
-        if (tooLarge) return tooLarge;
         const buf = await downloadFileBuffer(effectiveFile.id);
         // Import lazily to keep officeparser off the module init path —
         // it has a heavy zlib/xml unpack chain we'd rather defer.
@@ -239,11 +295,12 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
       }
       default: {
         if (effectiveFile.mimeType.startsWith('text/')) {
-          const tooLarge = tooLargeForBinaryDownload(effectiveFile);
-          if (tooLarge) return tooLarge;
           const buf = await downloadFileBuffer(effectiveFile.id);
           return ok(buf.toString('utf-8'), 'plaintext');
         }
+        // predictExtractionSkip would have caught this above; defensive
+        // fall-through in case extractText gets called with a file the
+        // predictor said was extractable but isn't.
         return { kind: 'skip', reason: 'unsupported_mime', detail: effectiveFile.mimeType };
       }
     }

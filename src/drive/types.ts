@@ -52,6 +52,12 @@ export interface ExtractionSkip {
     | 'folder'
     | 'unsupported_mime'
     | 'too_large'
+    /** Shortcut to a binary mime (PDF/DOCX/PPTX/text/*) where the target's
+     *  size isn't available from the shortcut metadata. Default-skip rather
+     *  than download blindly — Drive's shortcutDetails fields don't include
+     *  size, and downloading a multi-hundred-MB binary just to discover
+     *  it exceeds the cap is the OOM vector we're guarding. */
+    | 'shortcut_unverified_size'
     | 'empty'
     | 'delta_unchanged';
   detail?: string;
