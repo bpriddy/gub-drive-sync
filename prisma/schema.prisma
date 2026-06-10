@@ -211,7 +211,7 @@ model Staff {
   // prompt_template_version).
   researchJobs             ResearchJob[]
   researchDossiers         StaffResearchDossier[]
-  driveBackfillsRequested  DriveBackfillRequest[] @relation("DriveBackfillRequestedBy")
+  driveSyncRunsRequested   DriveSyncRun[]         @relation("DriveSyncRunRequestedBy")
 
   @@index([userId])
   @@index([officeId])
@@ -281,10 +281,19 @@ model Account {
   driveFolderId       String?   @map("drive_folder_id")
   driveFolderUrl      String?   @map("drive_folder_url")
   driveFolderPath     String?   @map("drive_folder_path")
-  driveLastScannedAt  DateTime? @map("drive_last_scanned_at") @db.Timestamptz
-  // Daily-scan backfill cursor (DATE). See scripts/backfill.ts and
-  // migration 20260602000000 in gcp-universal-backend.
-  driveBackfillCursor DateTime? @map("drive_backfill_cursor") @db.Date
+  /// Wall-clock of the latest drive-sync run touching this account
+  /// (bootstrap or forward). Renamed from drive_last_scanned_at in v2.
+  driveLastRunAt      DateTime? @map("drive_last_run_at") @db.Timestamptz
+  /// When the one-time bootstrap finished. NULL = bootstrap still pending
+  /// or in progress; UI shows "Bootstrap" button. Set once.
+  driveBootstrapCompletedAt DateTime? @map("drive_bootstrap_completed_at") @db.Timestamptz
+  /// Latest completed forward sync wall-clock. NULL until first forward
+  /// chunk completes after bootstrap.
+  driveLastSyncedAt   DateTime? @map("drive_last_synced_at") @db.Timestamptz
+  /// Activity API pageToken at the start of the next forward run. NULL
+  /// before the first forward chunk — engine calls getStartPageToken()
+  /// to establish baseline.
+  driveActivityPageToken String? @map("drive_activity_page_token")
   createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz
   updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -297,7 +306,7 @@ model Account {
   driveFileSnapshots DriveFileSnapshot[]
   driveScanLogs      DriveScanLog[]
   driveProposals     DriveChangeProposal[]
-  driveBackfillRequests DriveBackfillRequest[]
+  driveSyncRuns       DriveSyncRun[]
 
   @@index([ownerStaffId])
   @@index([accountExecStaffId])
@@ -306,45 +315,43 @@ model Account {
   @@map("accounts")
 }
 
-/// Operator-initiated backfill triggers from gub-admin. Watcher in
-/// gub-drive-sync polls and drives each through the backfill core.
-/// See migration 20260605000000_drive_backfill_requests for lifecycle.
-model DriveBackfillRequest {
+/// Queue of drive-sync runs in either mode (bootstrap or forward).
+/// See gub-drive-sync/docs/drive-sync-v2-design.md for the architecture.
+model DriveSyncRun {
   id            String    @id @default(uuid()) @db.Uuid
   accountId     String    @map("account_id") @db.Uuid
-  scans         Int       @default(1)
+  /// 'bootstrap' | 'forward'
+  mode          String    @default("bootstrap")
   requestedBy   String    @map("requested_by") @db.Uuid
   requestedAt   DateTime  @default(now()) @map("requested_at") @db.Timestamptz
   startedAt     DateTime? @map("started_at") @db.Timestamptz
   completedAt   DateTime? @map("completed_at") @db.Timestamptz
   status        String    @default("pending")
   errorMessage  String?   @map("error_message")
-  scansDone     Int       @default(0) @map("scans_done")
   logSummary    String?   @map("log_summary")
-  /// SKIP-LOCKED claim increments this; retry-in-loop decides backoff vs terminal-failure on it.
   attempts      Int       @default(0)
-  /// Earliest re-claim time after transient failure (exponential backoff).
   nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz
-  /// When true AND this row's scan advances the cursor AND the cursor is
-  /// still before today, the queue auto-creates a successor row for the
-  /// next active day (also allRemaining=true) and self-triggers the Job
-  /// via Cloud Run Admin API. Chain of 1-day rows, not 1 row of N days.
-  /// Chain terminates when cursor catches today or no more active days.
+  /// True → after this chunk completes, queue another row in the same mode
+  /// if more work remains. Chain of chunks via scheduleContinuation.
   allRemaining  Boolean   @default(false) @map("all_remaining")
-  /// Total files examined across all scan days in this chunk.
+  /// Files extracted in this chunk (post pre-filter).
   filesProcessed Int      @default(0) @map("files_processed")
-  /// Liveness pulse for crash recovery. Engine updates on claim + every
-  /// 5 min while running. reclaimStaleRunning resets rows whose
-  /// last_heartbeat_at is older than 15 min back to `pending`.
+  /// Liveness pulse. Stale (>15 min) → reclaimed on next Job startup.
   lastHeartbeatAt DateTime? @map("last_heartbeat_at") @db.Timestamptz
+  /// Bootstrap only: file-list pagination token at chunk end.
+  bootstrapCursor String? @map("bootstrap_cursor")
+  /// Forward only: Activity API pageToken handed to this chunk.
+  activityPageTokenIn  String? @map("activity_page_token_in")
+  /// Forward only: Activity API pageToken at chunk end.
+  activityPageTokenOut String? @map("activity_page_token_out")
 
   account     Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  requestedByStaff Staff @relation("DriveBackfillRequestedBy", fields: [requestedBy], references: [id])
+  requestedByStaff Staff @relation("DriveSyncRunRequestedBy", fields: [requestedBy], references: [id])
 
-  @@index([status, nextAttemptAt, requestedAt], map: "drive_backfill_requests_pickup_idx")
-  @@index([accountId, requestedAt(sort: Desc)], map: "drive_backfill_requests_history_idx")
-  @@index([status, lastHeartbeatAt], map: "drive_backfill_requests_heartbeat_idx")
-  @@map("drive_backfill_requests")
+  @@index([status, nextAttemptAt, requestedAt], map: "drive_sync_runs_pickup_idx")
+  @@index([accountId, requestedAt(sort: Desc)], map: "drive_sync_runs_history_idx")
+  @@index([status, lastHeartbeatAt], map: "drive_sync_runs_heartbeat_idx")
+  @@map("drive_sync_runs")
 }
 
 // Append-only log of account property changes.
@@ -393,7 +400,9 @@ model Campaign {
   driveFolderId      String?   @map("drive_folder_id")
   driveFolderUrl     String?   @map("drive_folder_url")
   driveFolderPath    String?   @map("drive_folder_path")
-  driveLastScannedAt DateTime? @map("drive_last_scanned_at") @db.Timestamptz
+  /// Bumped when this campaign's status_markdown is updated by a drive
+  /// sync run (bootstrap or forward — same campaign-level synthesis).
+  driveLastRunAt     DateTime? @map("drive_last_run_at") @db.Timestamptz
   createdBy          String    @map("created_by") @db.Uuid
   createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
   updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz
