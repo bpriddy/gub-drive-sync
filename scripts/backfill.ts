@@ -121,6 +121,7 @@ import {
 } from '../src/drive/structure';
 import { matchCampaignName } from '../src/drive/name-similarity';
 import type { TraversedFile } from '../src/drive/types';
+import { config } from '../src/config';
 
 /**
  * System-staff UUID used as `changed_by` on every *_changes row written
@@ -334,6 +335,42 @@ function printPhaseSummary(wallClockMs: number): void {
   } else {
     log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}`);
   }
+}
+
+// ── Concurrency helper ───────────────────────────────────────────────────────
+//
+// Worker-pool over an array. N workers race for the next index from a
+// shared counter (race-safe because JS is single-threaded at await
+// boundaries). Results land in the right slot by index, so the returned
+// array preserves input order despite non-deterministic completion order.
+//
+// Used by processBatch's per-entity distill+synth+write loop. Each entity
+// owns a discrete status_markdown row — workers never touch the same row,
+// so parallel writes are safe. See SYNTH_CONCURRENCY in config.ts.
+//
+// The fn is responsible for its own try/catch — uncaught throws will
+// propagate and reject the parent Promise.all, killing peer workers.
+// Callers that need error-per-item isolation should wrap fn accordingly.
+
+async function runWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) return;
+      results[idx] = await fn(items[idx]!, idx);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }
 
 // ── Cursor + date-grouping helpers ───────────────────────────────────────────
@@ -1569,15 +1606,34 @@ async function processBatch(
   if (targets.length === 0) {
     log('  (no entities with observations — nothing to distill or synthesize)');
   } else {
-    log(`  Distill + synthesize ${targets.length} entit${targets.length === 1 ? 'y' : 'ies'}…`);
+    log(
+      `  Distill + synthesize ${targets.length} entit${targets.length === 1 ? 'y' : 'ies'}…  (concurrency=${config.SYNTH_CONCURRENCY})`,
+    );
 
-    for (const target of targets) {
-      log('');
+    // Per-entity work is fully independent: each entity owns its own
+    // status_markdown row (one per account, one per campaign), no two
+    // workers touch the same row, and reads/writes don't cross. Worker
+    // pool with bounded concurrency (config.SYNTH_CONCURRENCY, default 8)
+    // — see helper + config docstrings for rate-limit + DB-pool sizing.
+    //
+    // Log lines from the worker body are buffered locally and flushed
+    // as a single contiguous block when the worker finishes its entity.
+    // JS is single-threaded at await boundaries, so the for-loop flush
+    // can't be preempted by another worker — each entity's block is
+    // atomic in the output, even though entity order may not match
+    // input order.
+    const workerResults = await runWithConcurrency(targets, config.SYNTH_CONCURRENCY, async (target) => {
+      const lineBuffer: string[] = [];
+      const wlog = (line = ''): void => {
+        lineBuffer.push(line);
+      };
+
+      wlog('');
       const statusTag =
         target.entityStatus === 'account' ? 'account'
         : target.entityStatus === 'existing' ? 'existing campaign'
         : 'NEW campaign candidate';
-      log(`  • ${statusTag}: "${target.entityName}"  ·  ${target.observations.length} obs / ${target.fileIds.size} file(s)`);
+      wlog(`  • ${statusTag}: "${target.entityName}"  ·  ${target.observations.length} obs / ${target.fileIds.size} file(s)`);
 
       // ── Distill (uniform across all entity kinds; dry-run only) ────────
       // Every target — account, existing campaign, new candidate — runs the
@@ -1639,7 +1695,7 @@ async function processBatch(
           );
           if (!validation.ok) {
             invalidCount += 1;
-            log(`        ⚠ skip "${fc.field}": ${validation.reason}`);
+            wlog(`        ⚠ skip "${fc.field}": ${validation.reason}`);
             continue;
           }
           const currentValue =
@@ -1662,7 +1718,7 @@ async function processBatch(
 
         const verb = target.entityStatus === 'new' ? 'would propose' : 'would update';
         const persistTag = applyToDb ? '' : ' (dryrun — not persisted)';
-        log(
+        wlog(
           `      ${verb}: ${validatedChanges.length} field changes${invalidCount > 0 ? ` (${invalidCount} invalid)` : ''}${noOpCount > 0 ? ` (${noOpCount} no-op)` : ''}, ${dry.notes.length} notes  [${dry.driver}]${persistTag}`,
         );
 
@@ -1686,10 +1742,10 @@ async function processBatch(
 
         for (const vc of validatedChanges) {
           const val = vc.proposedValueRaw ?? '(null)';
-          log(`        · ${vc.field} = ${val}  (${(vc.confidence * 100).toFixed(0)}%)`);
+          wlog(`        · ${vc.field} = ${val}  (${(vc.confidence * 100).toFixed(0)}%)`);
         }
       } catch (err) {
-        log(`      distill failed: ${summarizeError(err)}`);
+        wlog(`      distill failed: ${summarizeError(err)}`);
       }
 
       // ── Synthesize (dual-output: general + sensitive) ───────────────
@@ -1769,7 +1825,7 @@ async function processBatch(
         synthesizedMarkdown = `(synthesis failed: ${summarizeError(err)})`;
       }
       const synthesisMs = Date.now() - synthStart;
-      log(
+      wlog(
         `      synthesized in ${fmtMs(synthesisMs)}${synthesizedSensitiveMarkdown ? ' (general + sensitive)' : ''}`,
       );
 
@@ -1785,13 +1841,18 @@ async function processBatch(
               synthesizedSensitiveMarkdown,
             }),
           );
-          log('      ✓ applied (system-staff attribution)');
+          wlog('      ✓ applied (system-staff attribution)');
         } catch (err) {
-          log(`      apply failed: ${summarizeError(err)}`);
+          wlog(`      apply failed: ${summarizeError(err)}`);
         }
       }
 
-      synthesized.push({
+      // Flush this entity's buffered log lines as one atomic block.
+      // Synchronous calls to log() — no await between them — so another
+      // worker can't interleave its flush in the middle of ours.
+      for (const line of lineBuffer) log(line);
+
+      return {
         entityType: target.entityType,
         entityName: target.entityName,
         entityStatus: target.entityStatus,
@@ -1801,8 +1862,10 @@ async function processBatch(
         synthesizedMarkdown,
         synthesizedSensitiveMarkdown,
         synthesisMs,
-      });
-    }
+      };
+    });
+
+    synthesized.push(...workerResults);
   }
 
   return {

@@ -38,6 +38,16 @@ const EnvSchema = z.object({
   // ── AI / Gemini ──────────────────────────────────────────────────────────
   GEMINI_API_KEY: z.string().optional(),
   GEMINI_MAX_INPUT_CHARS: z.string().default('40000').transform(Number),
+  /**
+   * Worker-pool concurrency for the per-entity distill+synth+write loop
+   * inside processBatch. Each entity owns a discrete status_markdown blob
+   * on its own row (one per account, one per campaign) — workers never
+   * touch the same row, so parallel writes don't race. Default 8 is
+   * "max safe" under the bumped Prisma pool (10) and Gemini 2.5 Pro's
+   * paid-tier RPM cap (~1000). On a 16-entity day, ~40min sequential
+   * synth → ~5min parallel.
+   */
+  SYNTH_CONCURRENCY: z.string().default('8').transform(Number),
 
   // ── Notify URLs ──────────────────────────────────────────────────────────
   GUB_ADMIN_BASE_URL: z.string().url().default('http://localhost:5173'),
