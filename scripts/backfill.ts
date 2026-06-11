@@ -406,31 +406,56 @@ interface DayBucket {
 }
 
 /**
- * Group files by **modifiedTime**'s calendar date, sort by date ascending.
- * Files without modifiedTime are dropped (rare; Drive sets it on every
- * file edit). Returns one bucket per active day — days with zero files
- * modified are not in the result, so the walker naturally skips them.
+ * Group files by their effective last-touch date, sort ASC. Returns one
+ * bucket per active day — days with zero files modified are not in the
+ * result, so the walker naturally skips them.
+ *
+ * Effective last-touch date = max(modifiedTime, createdTime).
+ * Reasoning:
+ *   - modifiedTime is "the last edit" — should be >= createdTime.
+ *   - When it's NOT (e.g., Drive returns 1970-01-01 or 1980-01-01 for
+ *     files with corrupted metadata or weird import histories), the
+ *     modifiedTime is bogus and createdTime is the truth.
+ *   - Taking max() makes us robust to that: garbage-in-the-past gets
+ *     pulled forward to the real createdTime; legitimate edits stay.
  *
  * v2 semantics:
- * - The bucketing date is the file's LATEST modifiedTime, NOT its
- *   createdTime. A file edited many times appears once, on the day of
- *   its most recent edit.
- * - The day-walk processes files in modifiedTime order; per-entity
+ * - A file edited many times appears once, on the day of its most
+ *   recent edit (or its createdTime, whichever is later).
+ * - The day-walk processes files in chronological order; per-entity
  *   synthesis merges with prior status_markdown, so newer information
  *   naturally supersedes older as the cursor advances.
- * - Days that had file activity but whose files were later edited
- *   (so their modifiedTime moved forward) are effectively rolled
- *   forward to the last-edit day. We accept this — historical
- *   intermediate states aren't recoverable from Google's API anyway.
+ * - Historical intermediate states aren't recoverable from Google's
+ *   API anyway; this approximation is honest about what we know.
  */
 function groupFilesByDate(files: TraversedFile[]): DayBucket[] {
   const byDate = new Map<string, TraversedFile[]>();
+  let bogusBumped = 0;
   for (const f of files) {
-    if (!f.modifiedTime) continue;
-    const date = f.modifiedTime.slice(0, 10);
+    const modified = f.modifiedTime ?? null;
+    const created = f.createdTime ?? null;
+    if (!modified && !created) continue;
+    // max(modified, created) — string ISO 8601 timestamps compare correctly.
+    let effective: string;
+    if (modified && created) {
+      if (modified < created) {
+        bogusBumped++;
+        effective = created;
+      } else {
+        effective = modified;
+      }
+    } else {
+      effective = (modified ?? created)!;
+    }
+    const date = effective.slice(0, 10);
     const bucket = byDate.get(date);
     if (bucket) bucket.push(f);
     else byDate.set(date, [f]);
+  }
+  if (bogusBumped > 0) {
+    log(
+      `  ⚠ ${bogusBumped} file(s) had modifiedTime < createdTime — bumped to createdTime`,
+    );
   }
   return Array.from(byDate.entries())
     .map(([date, files]) => ({ date, files }))
