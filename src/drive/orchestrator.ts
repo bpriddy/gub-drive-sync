@@ -282,16 +282,16 @@ export async function scanEntity(input: ScanEntityInput): Promise<ScanEntityResu
     }
   }
 
-  // Update entity's drive_last_scanned_at.
+  // Update entity's drive_last_run_at.
   if (input.entityType === 'account') {
     await prisma.account.update({
       where: { id: input.entityId },
-      data: { driveLastScannedAt: new Date() },
+      data: { driveLastRunAt: new Date() },
     });
   } else {
     await prisma.campaign.update({
       where: { id: input.entityId },
-      data: { driveLastScannedAt: new Date() },
+      data: { driveLastRunAt: new Date() },
     });
   }
 

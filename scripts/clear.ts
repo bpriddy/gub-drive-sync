@@ -130,7 +130,10 @@ async function clearAccount(accountId: string): Promise<{ childCount: number }> 
       data: {
         statusMarkdown: null,
         statusSensitiveMarkdown: null,
-        driveBackfillCursor: null,
+        driveBootstrapCursor: null,
+        driveBootstrapCompletedAt: null,
+        driveLastSyncedAt: null,
+        driveActivityPageToken: null,
       },
     });
   });

@@ -1,5 +1,5 @@
 /**
- * backfill-queue.ts — drain the drive_backfill_requests queue once.
+ * backfill-queue.ts — drain the drive_sync_runs queue once.
  *
  * Invoked by the `backfill-pending` mode of main.ts. Mirrors the canonical
  * pattern-A job-runner shape from gub-research-worker (the reference
@@ -110,7 +110,7 @@ function backoffMs(attempts: number): number {
  */
 async function reclaimStaleRunning(): Promise<number> {
   const cutoff = new Date(Date.now() - STALE_RUNNING_MS);
-  const res = await prisma.driveBackfillRequest.updateMany({
+  const res = await prisma.driveSyncRun.updateMany({
     where: {
       status: 'running',
       OR: [
@@ -142,13 +142,13 @@ async function reclaimStaleRunning(): Promise<number> {
 async function claimNext(): Promise<{
   id: string;
   accountId: string;
-  scans: number;
+  mode: string;
   attempts: number;
   allRemaining: boolean;
 } | null> {
   return prisma.$transaction(async (tx) => {
     const rows = await tx.$queryRaw<Array<{ id: string }>>`
-      SELECT id FROM drive_backfill_requests
+      SELECT id FROM drive_sync_runs
       WHERE status = 'pending'
         AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
       ORDER BY requested_at
@@ -157,7 +157,7 @@ async function claimNext(): Promise<{
     `;
     if (rows.length === 0) return null;
     const jobId = rows[0]!.id;
-    return tx.driveBackfillRequest.update({
+    return tx.driveSyncRun.update({
       where: { id: jobId },
       data: {
         status: 'running',
@@ -174,7 +174,7 @@ async function claimNext(): Promise<{
       select: {
         id: true,
         accountId: true,
-        scans: true,
+        mode: true,
         attempts: true,
         allRemaining: true,
       },
@@ -198,7 +198,11 @@ async function claimNext(): Promise<{
  * processing. If the trigger fails the continuation request stays
  * `pending` for the next manual click or scheduled invocation to pick up.
  */
-async function scheduleContinuation(parentRequestId: string, accountId: string): Promise<void> {
+async function scheduleContinuation(
+  parentRequestId: string,
+  accountId: string,
+  mode: string,
+): Promise<void> {
   const project = config.GCP_PROJECT_ID;
   const region = config.GCP_REGION;
   const job = config.DRIVE_SYNC_JOB_NAME;
@@ -221,10 +225,10 @@ async function scheduleContinuation(parentRequestId: string, accountId: string):
   // manual click or invocation — the failure is recoverable.
   let continuationId: string;
   try {
-    const created = await prisma.driveBackfillRequest.create({
+    const created = await prisma.driveSyncRun.create({
       data: {
         accountId,
-        scans: 1, // ignored when allRemaining=true; kept for schema validity
+        mode,
         allRemaining: true,
         requestedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
         logSummary: `auto-continuation of ${parentRequestId}`,
@@ -306,7 +310,7 @@ type ProcessOutcome =
 async function processOne(req: {
   id: string;
   accountId: string;
-  scans: number;
+  mode: string;
   attempts: number;
   allRemaining: boolean;
 }): Promise<ProcessOutcome> {
@@ -315,7 +319,7 @@ async function processOne(req: {
       msg: 'backfill-queue.processing',
       requestId: req.id,
       accountId: req.accountId,
-      scans: req.scans,
+      mode: req.mode,
       attempts: req.attempts,
       allRemaining: req.allRemaining,
     }),
@@ -327,7 +331,7 @@ async function processOne(req: {
   // (best-effort) so a transient DB blip doesn't kill the running scan. The
   // initial heartbeat was already stamped by claimNext at row claim time.
   const heartbeat = setInterval(() => {
-    prisma.driveBackfillRequest
+    prisma.driveSyncRun
       .update({
         where: { id: req.id },
         data: { lastHeartbeatAt: new Date() },
@@ -353,12 +357,11 @@ async function processOne(req: {
       dryrun: false,
       captureLog,
     });
-    await prisma.driveBackfillRequest.update({
+    await prisma.driveSyncRun.update({
       where: { id: req.id },
       data: {
         status: 'completed',
         completedAt: new Date(),
-        scansDone: result.scansProcessed,
         filesProcessed: result.filesProcessed,
         logSummary: tailLogSummary(captureLog),
         nextAttemptAt: null,
@@ -368,20 +371,22 @@ async function processOne(req: {
       JSON.stringify({
         msg: 'backfill-queue.completed',
         requestId: req.id,
+        mode: req.mode,
         scansProcessed: result.scansProcessed,
         filesProcessed: result.filesProcessed,
         finalCursorYmd: result.finalCursorYmd,
+        bootstrapCompleted: result.bootstrapCompleted,
         durationMs: result.durationMs,
       }),
     );
 
     // Self-trigger continuation: when this request was all_remaining
-    // (catchup chain) AND we actually advanced the cursor AND we're
-    // still before today. Each continuation produces ONE new 1-day
+    // (bootstrap catchup chain) AND bootstrap is NOT done yet (more
+    // active days remain). Each continuation produces ONE new 1-day
     // row that itself runs and re-queues if still behind. The chain
-    // terminates naturally when the cursor catches up to today (or
-    // when there are no more active days, in which case scansProcessed=0
-    // and we don't fire).
+    // terminates naturally when the cursor catches up to today (then
+    // bootstrapCompleted=true and we don't fire) OR when there are no
+    // more active days (also bootstrapCompleted=true).
     //
     // Return continuationFired=true so the drain loop in
     // processBackfillQueue exits. Without this break, the same Job
@@ -389,14 +394,8 @@ async function processOne(req: {
     // being already-warm, it would usually win the claim, leaving
     // the cold-started successor with nothing to do.
     let continuationFired = false;
-    const todayYmd = new Date().toISOString().slice(0, 10);
-    if (
-      req.allRemaining &&
-      result.scansProcessed === 1 &&
-      result.finalCursorYmd !== null &&
-      result.finalCursorYmd < todayYmd
-    ) {
-      await scheduleContinuation(req.id, req.accountId);
+    if (req.allRemaining && !result.bootstrapCompleted) {
+      await scheduleContinuation(req.id, req.accountId, req.mode);
       continuationFired = true;
     }
 
@@ -415,7 +414,7 @@ async function processOne(req: {
           error: message,
         }),
       );
-      await prisma.driveBackfillRequest
+      await prisma.driveSyncRun
         .update({
           where: { id: req.id },
           data: {
@@ -449,7 +448,7 @@ async function processOne(req: {
         error: message,
       }),
     );
-    await prisma.driveBackfillRequest
+    await prisma.driveSyncRun
       .update({
         where: { id: req.id },
         data: {

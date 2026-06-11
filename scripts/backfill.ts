@@ -191,6 +191,14 @@ export interface BackfillRunResult {
   activeDaysCount: number;
   /** True if the run took the structureOnly early-exit path. */
   structureOnlyMode: boolean;
+  /**
+   * True when this chunk processed the last active day (cursor is now at
+   * the most-recently-modified file's day) OR no active days remained at
+   * the start of the chunk. Queue uses this to set
+   * accounts.drive_bootstrap_completed_at and to stop the continuation
+   * chain.
+   */
+  bootstrapCompleted: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -396,15 +404,28 @@ interface DayBucket {
 }
 
 /**
- * Group files by createdTime's calendar date, sort by date ascending.
- * Files without createdTime are dropped (rare in practice; Drive sets
- * it on every file). Returns one bucket per active day.
+ * Group files by **modifiedTime**'s calendar date, sort by date ascending.
+ * Files without modifiedTime are dropped (rare; Drive sets it on every
+ * file edit). Returns one bucket per active day — days with zero files
+ * modified are not in the result, so the walker naturally skips them.
+ *
+ * v2 semantics:
+ * - The bucketing date is the file's LATEST modifiedTime, NOT its
+ *   createdTime. A file edited many times appears once, on the day of
+ *   its most recent edit.
+ * - The day-walk processes files in modifiedTime order; per-entity
+ *   synthesis merges with prior status_markdown, so newer information
+ *   naturally supersedes older as the cursor advances.
+ * - Days that had file activity but whose files were later edited
+ *   (so their modifiedTime moved forward) are effectively rolled
+ *   forward to the last-edit day. We accept this — historical
+ *   intermediate states aren't recoverable from Google's API anyway.
  */
 function groupFilesByDate(files: TraversedFile[]): DayBucket[] {
   const byDate = new Map<string, TraversedFile[]>();
   for (const f of files) {
-    if (!f.createdTime) continue;
-    const date = f.createdTime.slice(0, 10);
+    if (!f.modifiedTime) continue;
+    const date = f.modifiedTime.slice(0, 10);
     const bucket = byDate.get(date);
     if (bucket) bucket.push(f);
     else byDate.set(date, [f]);
@@ -416,25 +437,32 @@ function groupFilesByDate(files: TraversedFile[]): DayBucket[] {
 
 /**
  * Persist per-scan progress on the account row. Called at the end of
- * every scan regardless of synthesis output. Two columns written in one
+ * every chunk regardless of synthesis output. Two columns written in one
  * round-trip:
  *
- *   - drive_backfill_cursor  → the historical calendar day this scan
- *     just processed (DATE; advances the walker for the NEXT scan)
- *   - drive_last_scanned_at  → wall-clock time the scan completed
- *     (TIMESTAMPTZ; "how recently did we work on this account",
- *     surfaced in gub-admin's Data Sources page)
+ *   - drive_bootstrap_cursor → the modifiedTime calendar day this chunk
+ *     just processed (DATE; advances the walker for the NEXT chunk)
+ *   - drive_last_run_at      → wall-clock time the chunk completed
+ *     (TIMESTAMPTZ; "how recently did we work on this account")
  *
- * Both are account-scoped — even when the scan is `--campaign-id`, both
- * live on the parent account, so account-wide backfills and per-campaign
- * backfills cooperate without divergent timestamps.
+ * Both are account-scoped — even when the chunk is `--campaign-id`, both
+ * live on the parent account.
+ *
+ * When `setCompleted` is true (cursor caught up to today), also stamps
+ * drive_bootstrap_completed_at — bootstrap is done, forward sync takes
+ * over from here.
  */
-async function persistCursor(accountId: string, ymd: string): Promise<void> {
+async function persistCursor(
+  accountId: string,
+  ymd: string,
+  setCompleted = false,
+): Promise<void> {
   await prisma.account.update({
     where: { id: accountId },
     data: {
-      driveBackfillCursor: new Date(`${ymd}T00:00:00Z`),
-      driveLastScannedAt: new Date(),
+      driveBootstrapCursor: new Date(`${ymd}T00:00:00Z`),
+      driveLastRunAt: new Date(),
+      ...(setCompleted ? { driveBootstrapCompletedAt: new Date() } : {}),
     },
   });
 }
@@ -448,8 +476,8 @@ interface EntityCtx {
   folderId: string;
   /**
    * The parent account id for both account- and campaign-scoped ctx —
-   * the backfill cursor lives on `accounts.drive_backfill_cursor` and
-   * is account-scoped regardless of which entity drove the scan.
+   * the bootstrap cursor lives on `accounts.drive_bootstrap_cursor` and
+   * is account-scoped regardless of which entity drove the chunk.
    */
   accountId: string;
   accountState: AccountCurrentState;
@@ -461,11 +489,11 @@ interface EntityCtx {
   /** Current persisted status_sensitive_markdown or null (per D29). */
   statusSensitiveMarkdown: string | null;
   /**
-   * Persisted `accounts.drive_backfill_cursor` as YYYY-MM-DD, or null.
-   * Drives the daily-scan walker's "next pending day" lookup. Written
-   * at the end of every scan regardless of synthesis output.
+   * Persisted `accounts.drive_bootstrap_cursor` as YYYY-MM-DD, or null.
+   * Drives the modifiedTime-day walker's "next pending day" lookup.
+   * Written at the end of every chunk regardless of synthesis output.
    */
-  driveBackfillCursor: string | null;
+  driveBootstrapCursor: string | null;
   reviewerEmail: string | null;
   reviewerStaffId: string | null;
 }
@@ -489,7 +517,7 @@ async function loadEntity(args: Args): Promise<EntityCtx> {
       campaignState: null,
       statusMarkdown: a.statusMarkdown ?? null,
       statusSensitiveMarkdown: a.statusSensitiveMarkdown ?? null,
-      driveBackfillCursor: ymdFromDate(a.driveBackfillCursor),
+      driveBootstrapCursor: ymdFromDate(a.driveBootstrapCursor),
       reviewerEmail: a.owner?.email ?? null,
       reviewerStaffId: a.owner?.id ?? null,
     };
@@ -511,7 +539,7 @@ async function loadEntity(args: Args): Promise<EntityCtx> {
     campaignState: buildCampaignCurrentState(c),
     statusMarkdown: c.statusMarkdown ?? null,
     statusSensitiveMarkdown: c.statusSensitiveMarkdown ?? null,
-    driveBackfillCursor: ymdFromDate(c.account.driveBackfillCursor),
+    driveBootstrapCursor: ymdFromDate(c.account.driveBootstrapCursor),
     reviewerEmail: c.account.owner?.email ?? null,
     reviewerStaffId: c.account.owner?.id ?? null,
   };
@@ -2027,6 +2055,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     activeDaysLast: null,
     activeDaysCount: 0,
     structureOnlyMode: false,
+    bootstrapCompleted: false,
   });
 
   // Fresh phase timer for this invocation. Reset between back-to-back
@@ -2181,15 +2210,25 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
 
   let scansDone = 0;
   let filesProcessed = 0;
-  const effectiveCursor: string | null = ctx.driveBackfillCursor;
+  const effectiveCursor: string | null = ctx.driveBootstrapCursor;
   const initialCursor = effectiveCursor;
-  log(`  Cursor (accounts.drive_backfill_cursor): ${effectiveCursor ?? 'none — starting from earliest active day'}`);
+  log(`  Cursor (accounts.drive_bootstrap_cursor): ${effectiveCursor ?? 'none — starting from earliest active day'}`);
   log('');
 
   let finalCursor: string | null = effectiveCursor;
+  let bootstrapCompleted = false;
   const nextDay = activeDates.find((d) => !effectiveCursor || d.date > effectiveCursor);
   if (!nextDay) {
-    log(rule(`No active days past ${effectiveCursor ?? '(start)'} — already caught up`));
+    log(rule(`No active days past ${effectiveCursor ?? '(start)'} — bootstrap caught up`));
+    bootstrapCompleted = true;
+    // Persist the completion flag even when no day was processed —
+    // signals to the queue and UI that bootstrap is done. Cursor stays
+    // at the last processed day (or null if the drive was empty).
+    if (!args.dryrun && effectiveCursor) {
+      await timed('persist_cursor', () =>
+        persistCursor(ctx.accountId, effectiveCursor, true),
+      );
+    }
   } else {
     log(rule(`Scan: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`));
     filesProcessed = nextDay.files.length;
@@ -2301,16 +2340,23 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     scansDone = 1;
     finalCursor = nextDay.date;
 
+    // Was this the last active day? If so, bootstrap is complete after
+    // this chunk — mark it. The find returns the FIRST date strictly
+    // greater than nextDay.date; if there isn't one, we're done.
+    const followUpDay = activeDates.find((d) => d.date > nextDay.date);
+    bootstrapCompleted = !followUpDay;
+
     // Persist the cursor. NO try/catch — failure must propagate. With
-    // only one scan per chunk, swallowing here would leave the row
-    // reporting `completed` while the DB cursor stays stale, exactly
-    // the symptom we just engineered away. Synthesis writes are
-    // already committed above (processBatch with persist=true), so
-    // letting this throw doesn't lose observation data — only the
-    // cursor stamp, which the next chunk will redo from the same
-    // starting point.
+    // only one day per chunk, swallowing here would leave the row
+    // reporting `completed` while the DB cursor stays stale. Synthesis
+    // writes are already committed above (processBatch with
+    // persist=true), so letting this throw doesn't lose observation
+    // data — only the cursor stamp, which the next chunk will redo
+    // from the same starting point.
     if (!args.dryrun) {
-      await timed('persist_cursor', () => persistCursor(ctx.accountId, nextDay.date));
+      await timed('persist_cursor', () =>
+        persistCursor(ctx.accountId, nextDay.date, bootstrapCompleted),
+      );
     }
   }
 
@@ -2335,6 +2381,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     activeDaysLast: activeDates[activeDates.length - 1]!.date,
     activeDaysCount: activeDates.length,
     structureOnlyMode: false,
+    bootstrapCompleted,
   };
 }
 
