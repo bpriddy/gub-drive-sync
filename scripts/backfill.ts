@@ -69,6 +69,8 @@
  */
 import { writeFileSync, appendFileSync } from 'node:fs';
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../src/prisma';
 import {
   listRevisions,
@@ -462,7 +464,78 @@ async function persistCursor(
     data: {
       driveBootstrapCursor: new Date(`${ymd}T00:00:00Z`),
       driveLastRunAt: new Date(),
-      ...(setCompleted ? { driveBootstrapCompletedAt: new Date() } : {}),
+      ...(setCompleted
+        ? {
+            driveBootstrapCompletedAt: new Date(),
+            // Bootstrap is done — file list cache no longer useful. Free
+            // the ~7-10MB JSONB. Structure classification stays for
+            // forward sync to pick up.
+            driveBootstrapFiles: Prisma.JsonNull,
+          }
+        : {}),
+    },
+  });
+}
+
+// ── Bootstrap chain cache ────────────────────────────────────────────────
+//
+// Shape stored in accounts.drive_structure_classification and
+// accounts.drive_bootstrap_files. Chunk #1 in a bootstrap chain writes
+// both; chunks 2..N read both and skip the ~5-min prelude.
+//
+// Fingerprint = hash of the canonical folder list. Forward sync reads
+// the structure classification, re-gathers folders, hashes them again,
+// and re-classifies only on mismatch.
+
+interface StructureCache {
+  /** sha256 of sorted folder list + classifier prompt version + model id. */
+  fingerprint: string;
+  /** Persisted classifier output. */
+  entityMap: unknown; // EntityMap shape from drive/structure module
+  /** Snapshot of the folder list that produced the fingerprint. */
+  folders: unknown;
+  classifierPromptVersion?: string;
+  classifierModelId?: string;
+}
+
+interface BootstrapFilesCache {
+  /** Full file list (modifiedTime + metadata) from chunk #1's discovery. */
+  files: TraversedFile[];
+  /** Pre-bucketed active days. Re-derivable from files but cheap to store. */
+  activeDates: DayBucket[];
+}
+
+function structureFingerprint(folders: Array<{ id: string; name: string; parentId: string | null }>): string {
+  // Sort by id for determinism, then JSON-stringify a minimal canonical
+  // form. Same folders → same hash regardless of API return order.
+  const canonical = folders
+    .map((f) => ({ id: f.id, name: f.name, parentId: f.parentId }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  return createHash('sha256')
+    .update(JSON.stringify(canonical))
+    .digest('hex');
+}
+
+async function persistStructureCache(
+  accountId: string,
+  cache: StructureCache,
+): Promise<void> {
+  await prisma.account.update({
+    where: { id: accountId },
+    data: {
+      driveStructureClassification: cache as unknown as Prisma.InputJsonValue,
+    },
+  });
+}
+
+async function persistBootstrapFilesCache(
+  accountId: string,
+  cache: BootstrapFilesCache,
+): Promise<void> {
+  await prisma.account.update({
+    where: { id: accountId },
+    data: {
+      driveBootstrapFiles: cache as unknown as Prisma.InputJsonValue,
     },
   });
 }
@@ -494,6 +567,18 @@ interface EntityCtx {
    * Written at the end of every chunk regardless of synthesis output.
    */
   driveBootstrapCursor: string | null;
+  /**
+   * Cached structure (folders + entity_map + fingerprint) from a prior
+   * chunk. NULL = first chunk in chain, or cache invalidated. Engine
+   * checks fingerprint; on match, skips the ~1m 45s LLM classify step.
+   */
+  driveStructureClassification: unknown;
+  /**
+   * Cached file list + active_dates from bootstrap chunk #1. NULL after
+   * bootstrap completes (or before first chunk). When present, chunks
+   * 2..N skip the ~3 min file discovery + grouping step.
+   */
+  driveBootstrapFiles: unknown;
   reviewerEmail: string | null;
   reviewerStaffId: string | null;
 }
@@ -518,6 +603,8 @@ async function loadEntity(args: Args): Promise<EntityCtx> {
       statusMarkdown: a.statusMarkdown ?? null,
       statusSensitiveMarkdown: a.statusSensitiveMarkdown ?? null,
       driveBootstrapCursor: ymdFromDate(a.driveBootstrapCursor),
+      driveStructureClassification: a.driveStructureClassification,
+      driveBootstrapFiles: a.driveBootstrapFiles,
       reviewerEmail: a.owner?.email ?? null,
       reviewerStaffId: a.owner?.id ?? null,
     };
@@ -540,6 +627,8 @@ async function loadEntity(args: Args): Promise<EntityCtx> {
     statusMarkdown: c.statusMarkdown ?? null,
     statusSensitiveMarkdown: c.statusSensitiveMarkdown ?? null,
     driveBootstrapCursor: ymdFromDate(c.account.driveBootstrapCursor),
+    driveStructureClassification: c.account.driveStructureClassification,
+    driveBootstrapFiles: c.account.driveBootstrapFiles,
     reviewerEmail: c.account.owner?.email ?? null,
     reviewerStaffId: c.account.owner?.id ?? null,
   };
@@ -2109,6 +2198,9 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   let nameDirectory: CampaignNameDirectory | null = null;
   if (ctx.type === 'account') {
     log(rule('Resolve structure (Stage 2 — file→entity attribution)'));
+    // existingCampaigns is read fresh every chunk — auto-created
+    // candidates during bootstrap mean the DB list grows mid-chain;
+    // nameDirectory rebuilds against the current list. Cheap query.
     const existingCampaigns = (
       await prisma.campaign.findMany({
         where: { accountId: ctx.id, driveFolderId: { not: null } },
@@ -2118,31 +2210,60 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       .filter((c): c is { id: string; name: string; driveFolderId: string } => !!c.driveFolderId)
       .map((c) => ({ id: c.id, name: c.name, driveFolderId: c.driveFolderId }));
     log(`  Existing campaigns in DB: ${existingCampaigns.length}`);
-    log('  Gathering folders…');
-    const isTTY = process.stdout.isTTY === true;
-    let lastTick = Date.now();
-    const folders = await timed('structure_walk', () =>
-      gatherFolders(ctx.folderId, ctx.name, {
-        onProgress: (n) => {
-          if (!isTTY) return;
-          if (Date.now() - lastTick < 150) return;
-          lastTick = Date.now();
-          process.stdout.write('\r' + `    …${n} folders so far`.padEnd(40));
-        },
-      }),
-    );
-    if (isTTY) process.stdout.write('\r' + ' '.repeat(40) + '\r');
-    log(`  Gathered ${folders.length} folders.`);
-    log('  Classifying with LLM…');
-    const entityMap = await timed('structure_classify', () =>
-      classifyFolders({
-        accountId: ctx.id,
-        accountName: ctx.name,
-        rootFolderId: ctx.folderId,
-        folders,
-        existingCampaigns,
-      }),
-    );
+
+    // ── Structure cache check ─────────────────────────────────────────
+    //
+    // Chunks 2..N of a bootstrap chain reuse the structure computed by
+    // chunk #1. We trust the cache for bootstrap (chain runs in hours;
+    // structure barely changes). For forward sync, we'll re-gather +
+    // re-hash + compare fingerprint before reusing. Today this code
+    // only runs from bootstrap mode, so cache-hit = trust.
+    let entityMap: EntityMap | null = null;
+    const cached = ctx.driveStructureClassification as StructureCache | null;
+    if (cached && cached.entityMap) {
+      log(`  ✓ Structure cache HIT  (fingerprint=${cached.fingerprint.slice(0, 12)}…)`);
+      log(`    Skipping ~33s folder gather + ~1m45s LLM classify.`);
+      entityMap = cached.entityMap as EntityMap;
+    } else {
+      log('  Gathering folders…');
+      const isTTY = process.stdout.isTTY === true;
+      let lastTick = Date.now();
+      const folders = await timed('structure_walk', () =>
+        gatherFolders(ctx.folderId, ctx.name, {
+          onProgress: (n) => {
+            if (!isTTY) return;
+            if (Date.now() - lastTick < 150) return;
+            lastTick = Date.now();
+            process.stdout.write('\r' + `    …${n} folders so far`.padEnd(40));
+          },
+        }),
+      );
+      if (isTTY) process.stdout.write('\r' + ' '.repeat(40) + '\r');
+      log(`  Gathered ${folders.length} folders.`);
+      log('  Classifying with LLM…');
+      entityMap = await timed('structure_classify', () =>
+        classifyFolders({
+          accountId: ctx.id,
+          accountName: ctx.name,
+          rootFolderId: ctx.folderId,
+          folders,
+          existingCampaigns,
+        }),
+      );
+      // Persist for chunks 2..N. Fingerprint over the folder list so
+      // forward sync can detect drift later.
+      if (!args.dryrun) {
+        const fingerprint = structureFingerprint(
+          folders.map((f) => ({ id: f.id, name: f.name, parentId: f.parentId })),
+        );
+        await persistStructureCache(ctx.accountId, {
+          fingerprint,
+          entityMap,
+          folders,
+        });
+        log(`  ✓ Structure cache WRITTEN  (fingerprint=${fingerprint.slice(0, 12)}…)`);
+      }
+    }
     const classifiedCounts = {
       existing: entityMap.classified.filter((c) => c.classification === 'existing_campaign').length,
       fresh: entityMap.classified.filter((c) => c.classification === 'new_campaign').length,
@@ -2151,7 +2272,6 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log(
       `  Classified: ${classifiedCounts.existing} existing campaigns, ${classifiedCounts.fresh} new candidates, ${classifiedCounts.acct} account-level  [${entityMap.driver}]`,
     );
-    log('  (run with --structure to see the full map)');
     log('');
     attributor = buildAttributor(entityMap);
     nameDirectory = buildCampaignNameDirectory(entityMap, existingCampaigns);
@@ -2161,23 +2281,42 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log('');
   }
 
+  // ── Files cache check ─────────────────────────────────────────────────
+  //
+  // Chunks 2..N of a bootstrap chain reuse the file list + active-date
+  // buckets computed by chunk #1. Each chunk just advances the cursor
+  // through the cached activeDates — no fresh files.list pagination
+  // needed. Cache is NULLed on bootstrap completion (see persistCursor).
   log(rule('Discover files'));
-  const allFiles = await timed('file_discovery', () =>
-    gatherFilesAuto(ctx.folderId, ctx.name, args.newestFirst),
-  );
-  log(`  Total files in folder: ${allFiles.length}`);
-  if (allFiles.length === 0) {
-    log('  Nothing to do. Exiting.');
-    return emptyResult();
-  }
+  let allFiles: TraversedFile[];
+  let activeDates: DayBucket[];
+  const cachedFiles = ctx.driveBootstrapFiles as BootstrapFilesCache | null;
+  if (cachedFiles && cachedFiles.files && cachedFiles.activeDates) {
+    log(`  ✓ Files cache HIT  (${cachedFiles.files.length} files, ${cachedFiles.activeDates.length} active days)`);
+    log(`    Skipping ~3 min file discovery + grouping.`);
+    allFiles = cachedFiles.files;
+    activeDates = cachedFiles.activeDates;
+  } else {
+    allFiles = await timed('file_discovery', () =>
+      gatherFilesAuto(ctx.folderId, ctx.name, args.newestFirst),
+    );
+    log(`  Total files in folder: ${allFiles.length}`);
+    if (allFiles.length === 0) {
+      log('  Nothing to do. Exiting.');
+      return emptyResult();
+    }
 
-  // Group files by createdTime calendar date → "active days." Empty days
-  // simply aren't in this list, so they cost zero compute downstream.
-  const activeDates = groupFilesByDate(allFiles);
-  if (args.newestFirst) activeDates.reverse();
-  if (activeDates.length === 0) {
-    log('  No files have createdTime — nothing to scan. Exiting.');
-    return emptyResult();
+    activeDates = groupFilesByDate(allFiles);
+    if (args.newestFirst) activeDates.reverse();
+    if (activeDates.length === 0) {
+      log('  No files have modifiedTime — nothing to scan. Exiting.');
+      return emptyResult();
+    }
+    // Persist for chunks 2..N.
+    if (!args.dryrun) {
+      await persistBootstrapFilesCache(ctx.accountId, { files: allFiles, activeDates });
+      log(`  ✓ Files cache WRITTEN  (${allFiles.length} files)`);
+    }
   }
   log(`  Active days: ${activeDates.length}  (${activeDates[0]!.date} → ${activeDates[activeDates.length - 1]!.date})`);
   log('');

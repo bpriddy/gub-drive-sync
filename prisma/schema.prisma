@@ -288,6 +288,11 @@ model Account {
   driveBootstrapCursor DateTime? @map("drive_bootstrap_cursor") @db.Date
   /// Set ONCE when bootstrap catches the cursor up to today.
   driveBootstrapCompletedAt DateTime? @map("drive_bootstrap_completed_at") @db.Timestamptz
+  /// Cached structure (folders + entity_map + fingerprint). Survives
+  /// bootstrap completion; forward sync re-uses with hash invalidation.
+  driveStructureClassification Json? @map("drive_structure_classification")
+  /// Cached file list + active_dates (bootstrap-only; NULL on completion).
+  driveBootstrapFiles Json? @map("drive_bootstrap_files")
   /// Latest completed forward sync wall-clock. NULL until first forward
   /// chunk completes after bootstrap.
   driveLastSyncedAt   DateTime? @map("drive_last_synced_at") @db.Timestamptz
