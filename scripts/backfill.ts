@@ -1934,7 +1934,7 @@ async function processBatch(
         });
         const res = await timed('synthesis', () =>
           defaultLlm.complete({
-            model: 'gemini-2.5-pro',
+            model: 'gemini-3.5-flash',
             temperature: 0.2,
             prompt: renderedPrompt,
             tag: `backfill.${STATUS_SYNTHESIS_V1_VERSION}`,

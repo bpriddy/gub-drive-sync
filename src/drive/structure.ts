@@ -37,7 +37,7 @@ import { structureResolutionResponseSchema } from './structured-output';
 // an infinite-recursion bug, matching traversal.ts's cap.
 const MAX_DEPTH = 100;
 
-const STRUCTURE_MODEL = 'gemini-2.5-pro';
+const STRUCTURE_MODEL = 'gemini-3.5-flash';
 const STRUCTURE_TEMPERATURE = 0.2;
 export const STRUCTURE_RESOLUTION_VERSION = 'drive.structure_resolution.v1-inline';
 
