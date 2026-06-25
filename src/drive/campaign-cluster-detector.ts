@@ -23,14 +23,12 @@ import { logger } from '../logger';
 
 const MODEL = 'gemini-3.5-flash';
 const CONFIDENCE_FLOOR = 0.8;
-const MARKDOWN_EXCERPT_CHARS = 500;
 /**
- * The clustering response scales with the number of duplicate clusters in
- * the account. A big roster (e.g. Chevy) can emit dozens of clusters; the
- * model's default output cap truncates the JSON mid-string and fails the
- * parse. Set generously — structured output keeps it from rambling.
+ * Each window only sees ≤ WINDOW_SIZE names, so its cluster output is small.
+ * Keep this modest — an oversized cap lets the thinking model run long and was
+ * a big slice of per-call latency on the full roster.
  */
-const MAX_OUTPUT_TOKENS = 32768;
+const MAX_OUTPUT_TOKENS = 4096;
 
 export interface CampaignForClustering {
   id: string;
@@ -95,18 +93,12 @@ function buildPrompt(args: {
   accountName: string;
   campaigns: CampaignForClustering[];
 }): string {
+  // Names only. The orchestrator picks the canonical row in code
+  // (folder-anchored > has markdown > oldest) and only consumes the GROUPING,
+  // so the model never needs markdown/folder/date — feeding them just inflated
+  // each call's latency (~20K chars/window). Keeping it lean is the speed win.
   const campaignsJson = JSON.stringify(
-    args.campaigns.map((c) => ({
-      id: c.id,
-      name: c.name,
-      status: c.status,
-      folder_anchored: c.driveFolderId !== null,
-      markdown_excerpt:
-        c.statusMarkdown && c.statusMarkdown.length > 0
-          ? c.statusMarkdown.slice(0, MARKDOWN_EXCERPT_CHARS)
-          : null,
-      created_at: c.createdAt.toISOString().slice(0, 10),
-    })),
+    args.campaigns.map((c) => ({ id: c.id, name: c.name })),
     null,
     2,
   );
@@ -115,14 +107,14 @@ function buildPrompt(args: {
 
 ACCOUNT: ${args.accountName}
 
-CAMPAIGNS (id, name, status, folder_anchored, markdown_excerpt, created_at):
+CAMPAIGNS (id, name):
 ${campaignsJson}
 
 TASK
 Group campaigns that represent the SAME real-world campaign. For each cluster of duplicates, return:
-- canonicalId: the id of the campaign to KEEP (others get merged into it and deleted)
-- canonicalName: the canonical name, verbatim from one of the input "name" fields
-- variantIds: ids of campaigns that should be merged INTO the canonical
+- canonicalId: any one member id of the cluster (the orchestrator re-derives which row to keep — just pick any member)
+- canonicalName: a representative name, verbatim from one of the input "name" fields
+- variantIds: the OTHER member ids of the cluster
 - confidence: 0.0–1.0 — how sure you are these are the same campaign
 - reasoning: one sentence explaining the grouping
 
@@ -136,19 +128,10 @@ WHAT COUNTS AS A DUPLICATE (collapse these)
 WHAT IS NOT A DUPLICATE (keep distinct)
 - Campaigns that share a theme but are different programs: "Truck Day" (one-day promo) vs "Truck Season" (Q4 retail push) are distinct.
 - Different annual editions: "Holiday 2023" vs "Holiday 2024" — both real, both kept.
+- Different waves/phases: "Wave 2" vs "Wave 3"; "T1-1" vs "T1-2" — kept distinct.
 - Brief vs Pitch concept ideas vs final campaign — keep distinct unless the names truly converge.
 
 Use real-world knowledge: Army-Navy is the annual college football game in December; a "truck season" is the auto-industry's Q4 retail push; "Heartbeat of America" is a Chevy slogan from 1986 (not a live campaign).
-
-CANONICAL SELECTION inside a cluster (priority order)
-1. Prefer the campaign with folder_anchored=true (real Drive folder backing it).
-2. Among folder-less rows, prefer the one with a non-empty markdown_excerpt.
-3. Tie-break by most recent created_at.
-
-CANONICAL NAME (within priority)
-- Verbatim from one of the input names.
-- Prefer the variant that INCLUDES the year if one is present.
-- Prefer the form WITHOUT a trailing "Campaign" noise word.
 
 HARD RULES
 - Every id in your output must appear in the INPUT campaigns. No invented ids.
@@ -291,10 +274,14 @@ export async function detectCampaignClusters(args: {
 
 const WINDOW_SIZE = 40;
 const VOTE_THRESHOLD = 2;
-/** Backstop on schedules regardless of convergence (each schedule = full coverage). */
-const MAX_SCHEDULES = 4;
-/** Concurrent window LLM calls. */
-const WINDOW_CONCURRENCY = 6;
+/**
+ * Backstop on schedules. Each schedule = full pairwise coverage; schedule 1
+ * catches ~95% of merges and schedules 3-4 found <5 each on the full roster,
+ * so 2 is the sweet spot. The merge is idempotent — re-run to mop up the tail.
+ */
+const MAX_SCHEDULES = 2;
+/** Concurrent window LLM calls. The dev Gemini key tolerates this fine. */
+const WINDOW_CONCURRENCY = 10;
 
 /** Deterministic PRNG (mulberry32) so block assignments are reproducible. */
 function mulberry32(seed: number): () => number {
