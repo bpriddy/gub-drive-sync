@@ -260,45 +260,43 @@ export async function detectCampaignClusters(args: {
   return validateClusters(parsed, args.campaigns);
 }
 
-// ── Randomized-round clustering ─────────────────────────────────────────────
+// ── Deterministic round-robin clustering ────────────────────────────────────
 //
 // A single LLM call over a large roster (e.g. Chevy's 404 campaigns) is
 // unreliable — the model can't exhaustively group hundreds of names in one
 // shot (observed: 1 cluster one run, 20+ the next).
 //
-// Sorting variants adjacent (an earlier approach) is brittle: it assumes
-// duplicates share a prefix. "Red Tag" vs "Chevy Red Tag Holiday Event" never
-// sort together. So instead we RANDOMIZE:
+// Sorting variants adjacent is brittle (assumes duplicates share a prefix:
+// "Red Tag" vs "Chevy Red Tag Holiday Event" never sort together). Random
+// shuffles fix that but pay a coupon-collector penalty — to GUARANTEE every
+// pair has shared a window you'd need ~(N/W)·ln(#pairs) rounds, ~15× the floor.
 //
-//   1. SCRAMBLE the working list (seeded shuffle → reproducible).
-//   2. CHUNK into non-overlapping windows; each is a small, focused single-shot
-//      clustering call (≤ WINDOW_SIZE names), run concurrently.
-//   3. VOTE: tally how many windows co-group each pair across rounds. Union a
-//      pair once it reaches VOTE_THRESHOLD corroborating co-occurrences — this
-//      guards against one spurious LLM grouping transitively chaining unrelated
-//      campaigns.
-//   4. COLLAPSE: after each round, reduce the working list to one representative
-//      (the code-chosen canonical) per merged component. The list shrinks as
-//      duplicates fold in.
-//   5. RECOMPUTE the target round count from the shrunken list size, and stop
-//      once we've done enough rounds AND recent rounds found nothing new.
+// So we cover deterministically, at the combinatorial floor. In one round an
+// item shares its window with ≤ W−1 others, so full pairwise coverage needs
+// ≥ (N−1)/(W−1) rounds — that bound is achievable with a round-robin:
 //
-// Over enough random rounds, ANY pair eventually shares a window regardless of
-// spelling — no prefix assumption. As the list shrinks below WINDOW_SIZE every
-// remaining campaign is compared every round, so the tail is fully covered.
+//   1. Split the working list into BLOCKS of W/2. A window = two blocks (≤ W).
+//   2. ROUND-ROBIN the blocks (circle method): over (B−1) rounds every pair of
+//      blocks shares a window exactly once → every cross-block campaign pair
+//      co-occurs once; same-block pairs co-occur every round (≥2×).
+//   3. Run VOTE_THRESHOLD passes with different block assignments. Cross-block
+//      pairs get 1 co-occurrence per pass → ≥ threshold overall; same-block get
+//      more. So EVERY pair is examined ≥ threshold times, guaranteed.
+//   4. UNION pairs the LLM co-grouped in ≥ threshold windows (guards against a
+//      single spurious grouping chaining unrelated campaigns).
+//   5. COLLAPSE to one canonical per merged component and repeat the schedule on
+//      the shrunken list until a schedule finds no new merge (catches LLM
+//      per-window misses + transitive joins). Round count recomputes from the
+//      smaller B each schedule.
 
 const WINDOW_SIZE = 40;
 const VOTE_THRESHOLD = 2;
-/** Target rounds = ceil(COVERAGE * N / WINDOW_SIZE); ≈ expected co-occurrences per pair. */
-const COVERAGE = 4;
-/** Stop once round count is satisfied AND this many consecutive rounds found no new merge. */
-const DRY_STOP = 2;
-/** Absolute backstop on rounds regardless of convergence. */
-const HARD_ROUND_CAP = 80;
-/** Concurrent window LLM calls within a round. */
+/** Backstop on schedules regardless of convergence (each schedule = full coverage). */
+const MAX_SCHEDULES = 4;
+/** Concurrent window LLM calls. */
 const WINDOW_CONCURRENCY = 6;
 
-/** Deterministic PRNG (mulberry32) so scrambles are reproducible per run. */
+/** Deterministic PRNG (mulberry32) so block assignments are reproducible. */
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
@@ -321,14 +319,39 @@ function shuffled<T>(arr: T[], seed: number): T[] {
   return a;
 }
 
-/** Split into non-overlapping chunks of `size` (last chunk may be smaller). */
-function chunk<T>(arr: T[], size: number): T[][] {
+/** Split into non-overlapping blocks of `size` (keeps a smaller final block). */
+function intoBlocks<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) {
-    const c = arr.slice(i, i + size);
-    if (c.length >= 2) out.push(c);
-  }
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
+}
+
+/**
+ * Round-robin (circle method) over B block indices. Returns (B−1 or B) rounds,
+ * each a list of [blockA, blockB] index pairs. Every pair of block indices
+ * appears together in exactly one round. A dummy "bye" (-1) is added when B is
+ * odd and filtered from the output.
+ */
+function roundRobinPairings(B: number): Array<Array<[number, number]>> {
+  const arr: number[] = [];
+  for (let i = 0; i < B; i++) arr.push(i);
+  if (arr.length % 2 === 1) arr.push(-1); // bye
+  const n = arr.length;
+  const rounds: Array<Array<[number, number]>> = [];
+  for (let r = 0; r < n - 1; r++) {
+    const pairs: Array<[number, number]> = [];
+    for (let i = 0; i < n / 2; i++) {
+      const a = arr[i]!;
+      const b = arr[n - 1 - i]!;
+      if (a !== -1 && b !== -1) pairs.push([a, b]);
+    }
+    rounds.push(pairs);
+    // Rotate all but the first element clockwise.
+    const last = arr[n - 1]!;
+    for (let i = n - 1; i > 1; i--) arr[i] = arr[i - 1]!;
+    arr[1] = last;
+  }
+  return rounds;
 }
 
 /** Bounded-concurrency map. */
@@ -359,20 +382,48 @@ function pickCanonical(members: CampaignForClustering[]): CampaignForClustering 
 }
 
 /**
- * Detect duplicate clusters across a large roster via randomized rounds of
- * windowed single-shot clustering, with corroborated union and a working list
- * that shrinks as duplicates fold in. See the block comment above.
+ * Build the full set of windows for one schedule: `voteThreshold` round-robin
+ * passes over W/2-blocks, with a fast path when the whole list fits one window.
+ * Guarantees every pair of the input campaigns is examined ≥ voteThreshold
+ * times. Returns each window's campaign list.
+ */
+function buildScheduleWindows(
+  working: CampaignForClustering[],
+  windowSize: number,
+  voteThreshold: number,
+  scheduleSeed: number,
+): CampaignForClustering[][] {
+  const windows: CampaignForClustering[][] = [];
+  if (working.length <= windowSize) {
+    for (let p = 0; p < voteThreshold; p++) windows.push(working);
+    return windows;
+  }
+  const blockSize = Math.max(1, Math.floor(windowSize / 2));
+  for (let p = 0; p < voteThreshold; p++) {
+    const blocks = intoBlocks(shuffled(working, scheduleSeed * 31 + p), blockSize);
+    for (const round of roundRobinPairings(blocks.length)) {
+      for (const [a, b] of round) {
+        windows.push([...blocks[a]!, ...blocks[b]!]);
+      }
+    }
+  }
+  return windows;
+}
+
+/**
+ * Detect duplicate clusters across a large roster via repeated deterministic
+ * round-robin schedules (full pairwise coverage per schedule) with corroborated
+ * union and a working list that shrinks as duplicates fold in. See the block
+ * comment above.
  */
 export async function detectCampaignClustersWindowed(args: {
   accountName: string;
   campaigns: CampaignForClustering[];
   windowSize?: number;
   voteThreshold?: number;
-  coverage?: number;
 }): Promise<ClusterDetectionResult> {
   const windowSize = args.windowSize ?? WINDOW_SIZE;
   const voteThreshold = args.voteThreshold ?? VOTE_THRESHOLD;
-  const coverage = args.coverage ?? COVERAGE;
 
   if (args.campaigns.length < 2) return { clusters: [], droppedClusterCount: 0 };
 
@@ -403,26 +454,24 @@ export async function detectCampaignClustersWindowed(args: {
 
   // working = current representatives (canonical per merged component).
   let working = [...args.campaigns];
-  let round = 0;
-  let dryStreak = 0;
+  let schedule = 0;
   let windowCalls = 0;
 
-  while (round < HARD_ROUND_CAP && working.length >= 2) {
-    round++;
-    const order = shuffled(working, round * 0x9e3779b1);
-    const windows = chunk(order, windowSize);
+  while (schedule < MAX_SCHEDULES && working.length >= 2) {
+    schedule++;
+    const windows = buildScheduleWindows(working, windowSize, voteThreshold, schedule);
 
     const results = await mapPool(windows, WINDOW_CONCURRENCY, async (window) => {
       windowCalls++;
       try {
         return await detectCampaignClusters({ accountName: args.accountName, campaigns: window });
       } catch (err) {
-        logger.warn({ err, round }, '[cluster-detector] window detection failed — skipped');
+        logger.warn({ err, schedule }, '[cluster-detector] window detection failed — skipped');
         return { clusters: [], droppedClusterCount: 0 } as ClusterDetectionResult;
       }
     });
 
-    // Tally pair co-occurrences from this round's window groupings.
+    // Tally pair co-occurrences from this schedule's window groupings.
     for (const res of results) {
       for (const cl of res.clusters) {
         const ids = [cl.canonicalId, ...cl.variantIds];
@@ -463,13 +512,11 @@ export async function detectCampaignClustersWindowed(args: {
     }
     working = [...groups.values()].map((members) => pickCanonical(members));
 
-    dryStreak = newMerges > 0 ? 0 : dryStreak + 1;
-    const targetRounds = Math.ceil((coverage * working.length) / windowSize);
     logger.info(
-      { round, working: working.length, newMerges, targetRounds, dryStreak },
-      '[cluster-detector] round complete',
+      { schedule, windows: windows.length, working: working.length, newMerges, windowCalls },
+      '[cluster-detector] schedule complete',
     );
-    if (round >= targetRounds && dryStreak >= DRY_STOP) break;
+    if (newMerges === 0) break;
   }
 
   // Build final clusters from union-find over ALL original ids.
@@ -504,20 +551,19 @@ export async function detectCampaignClustersWindowed(args: {
       variantIds: variants.map((v) => v.id),
       variantNames: variants.map((v) => v.name),
       confidence: compConf.get(root) ?? CONFIDENCE_FLOOR,
-      reasoning: `${compReason.get(root) ?? 'duplicate group'} [randomized rounds: ${members.length} campaigns, corroborated ×${voteThreshold}]`,
+      reasoning: `${compReason.get(root) ?? 'duplicate group'} [round-robin: ${members.length} campaigns, corroborated ×${voteThreshold}]`,
     });
   }
 
   logger.info(
     {
       totalCampaigns: args.campaigns.length,
-      rounds: round,
+      schedules: schedule,
       windowCalls,
       voteThreshold,
-      coverage,
       clustersFound: clusters.length,
     },
-    '[cluster-detector] randomized-round clustering complete',
+    '[cluster-detector] round-robin clustering complete',
   );
 
   return { clusters, droppedClusterCount: 0 };

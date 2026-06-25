@@ -123,7 +123,6 @@ export interface RunCampaignMergeOptions {
   /** Clustering tuning knobs (CLI-overridable so we can tune without redeploy). */
   windowSize?: number;
   voteThreshold?: number;
-  coverage?: number;
 }
 
 type ClusterOutcome = 'merged' | 'would-merge' | 'skipped' | 'failed' | 'below-confidence';
@@ -329,7 +328,6 @@ export async function runCampaignMerge(
     campaigns,
     ...(opts.windowSize !== undefined ? { windowSize: opts.windowSize } : {}),
     ...(opts.voteThreshold !== undefined ? { voteThreshold: opts.voteThreshold } : {}),
-    ...(opts.coverage !== undefined ? { coverage: opts.coverage } : {}),
   });
 
   const clusterReports: ClusterReport[] = [];

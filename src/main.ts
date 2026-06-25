@@ -75,7 +75,6 @@ interface ParsedArgs {
   /** merge-campaign-dupes clustering tuning. */
   windowSize?: number;
   voteThreshold?: number;
-  coverage?: number;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -157,16 +156,6 @@ function parseArgs(argv: string[]): ParsedArgs {
         }
         out.voteThreshold = parsed;
         if (arg === '--vote-threshold') i++;
-        continue;
-      }
-      const cov = takeValue(arg, '--coverage', i);
-      if (cov !== undefined) {
-        const parsed = Number(cov);
-        if (!Number.isFinite(parsed) || parsed <= 0) {
-          throw new Error(`--coverage must be a positive number, got: ${cov}`);
-        }
-        out.coverage = parsed;
-        if (arg === '--coverage') i++;
         continue;
       }
       if (arg === '--confirm') out.confirm = true;
@@ -270,7 +259,6 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
         ...(args.minConfidence !== undefined ? { minConfidence: args.minConfidence } : {}),
         ...(args.windowSize !== undefined ? { windowSize: args.windowSize } : {}),
         ...(args.voteThreshold !== undefined ? { voteThreshold: args.voteThreshold } : {}),
-        ...(args.coverage !== undefined ? { coverage: args.coverage } : {}),
       });
       return result as unknown as Record<string, unknown>;
     }

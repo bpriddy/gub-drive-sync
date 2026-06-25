@@ -211,16 +211,20 @@ gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
   --args=merge-campaign-dupes,--account-id,<uuid>,--min-confidence,0.9,--confirm
 ```
 
-Detection uses randomized-round windowed clustering (sorting is too brittle —
-it assumes duplicates share a prefix). Each round scrambles the roster, chunks
-it into focused single-shot LLM clustering calls, and unions pairs co-grouped
-in ≥ `--vote-threshold` windows; the working list shrinks as dupes fold in and
-the round target recomputes. Tuning knobs (defaults: window 40, vote-threshold
-2, coverage 4) are CLI-overridable so they can be tuned without a redeploy:
+Detection uses deterministic round-robin windowed clustering. Sorting is too
+brittle (it assumes duplicates share a prefix) and random shuffles can't
+*guarantee* coverage. Instead each "schedule" splits the roster into W/2-blocks
+and round-robins them (every pair of blocks shares a window exactly once), run
+`--vote-threshold` times — so every campaign pair is examined ≥ threshold times,
+at the combinatorial floor of ~`(N-1)/(W-1)` rounds. Pairs the LLM co-groups in
+≥ threshold windows are unioned; the list collapses to canonicals and the
+schedule repeats on the shrunken set until no new merge. Tuning knobs (defaults:
+window 40, vote-threshold 2) are CLI-overridable so they can be tuned without a
+redeploy:
 
 ```bash
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=merge-campaign-dupes,--account-name,chevy,--window,40,--coverage,4,--vote-threshold,2
+  --args=merge-campaign-dupes,--account-name,chevy,--window,40,--vote-threshold,2
 ```
 
 Review the result (the `outcome` object is logged as structured JSON):
