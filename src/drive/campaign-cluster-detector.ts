@@ -260,58 +260,88 @@ export async function detectCampaignClusters(args: {
   return validateClusters(parsed, args.campaigns);
 }
 
-// ── Windowed clustering ─────────────────────────────────────────────────────
+// ── Randomized-round clustering ─────────────────────────────────────────────
 //
 // A single LLM call over a large roster (e.g. Chevy's 404 campaigns) is
-// unreliable — the model can't hold and exhaustively group hundreds of names
-// in one shot (observed: 1 cluster one run, 20+ the next). Treat it as a
-// sorting problem instead:
+// unreliable — the model can't exhaustively group hundreds of names in one
+// shot (observed: 1 cluster one run, 20+ the next).
 //
-//   1. SORT campaigns by a normalized key so variants land adjacent.
-//   2. SLIDE an overlapping window across the sorted list; each window is a
-//      small, focused single-shot clustering call (≤ WINDOW_SIZE names).
-//   3. REPEAT with a second sort key (token-sorted) so word-order variants
-//      also become adjacent.
-//   4. UNION pairs that were co-grouped in ≥ VOTE_THRESHOLD windows. The vote
-//      threshold guards against one spurious LLM grouping transitively
-//      chaining unrelated campaigns through union-find.
+// Sorting variants adjacent (an earlier approach) is brittle: it assumes
+// duplicates share a prefix. "Red Tag" vs "Chevy Red Tag Holiday Event" never
+// sort together. So instead we RANDOMIZE:
 //
-// Canonical selection happens deterministically in code (folder-anchored >
-// has markdown > oldest), so per-window canonical disagreement doesn't matter.
+//   1. SCRAMBLE the working list (seeded shuffle → reproducible).
+//   2. CHUNK into non-overlapping windows; each is a small, focused single-shot
+//      clustering call (≤ WINDOW_SIZE names), run concurrently.
+//   3. VOTE: tally how many windows co-group each pair across rounds. Union a
+//      pair once it reaches VOTE_THRESHOLD corroborating co-occurrences — this
+//      guards against one spurious LLM grouping transitively chaining unrelated
+//      campaigns.
+//   4. COLLAPSE: after each round, reduce the working list to one representative
+//      (the code-chosen canonical) per merged component. The list shrinks as
+//      duplicates fold in.
+//   5. RECOMPUTE the target round count from the shrunken list size, and stop
+//      once we've done enough rounds AND recent rounds found nothing new.
+//
+// Over enough random rounds, ANY pair eventually shares a window regardless of
+// spelling — no prefix assumption. As the list shrinks below WINDOW_SIZE every
+// remaining campaign is compared every round, so the tail is fully covered.
 
 const WINDOW_SIZE = 40;
-const WINDOW_STEP = 20; // 50% overlap → interior pairs appear in ~2 windows/pass
-const PASSES = 2;
 const VOTE_THRESHOLD = 2;
+/** Target rounds = ceil(COVERAGE * N / WINDOW_SIZE); ≈ expected co-occurrences per pair. */
+const COVERAGE = 4;
+/** Stop once round count is satisfied AND this many consecutive rounds found no new merge. */
+const DRY_STOP = 2;
+/** Absolute backstop on rounds regardless of convergence. */
+const HARD_ROUND_CAP = 80;
+/** Concurrent window LLM calls within a round. */
+const WINDOW_CONCURRENCY = 6;
 
-/** Brand prefix + all non-alphanumeric stripped — variants sort adjacent. */
-function alnumKey(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/^\s*(chevrolet|chevy)\s*[|:–-]\s*/i, '')
-    .replace(/[^a-z0-9]+/g, '');
+/** Deterministic PRNG (mulberry32) so scrambles are reproducible per run. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-/** Tokens sorted alphabetically — word-order variants collide. */
-function tokenSortedKey(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/^\s*(chevrolet|chevy)\s*[|:–-]\s*/i, '')
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean)
-    .sort()
-    .join('');
-}
-
-function windowsOf<T>(arr: T[], size: number, step: number): T[][] {
-  if (arr.length < 2) return [];
-  if (arr.length <= size) return [arr];
-  const out: T[][] = [];
-  for (let start = 0; start < arr.length; start += step) {
-    const w = arr.slice(start, start + size);
-    if (w.length >= 2) out.push(w);
-    if (start + size >= arr.length) break;
+/** Seeded Fisher-Yates shuffle (returns a new array). */
+function shuffled<T>(arr: T[], seed: number): T[] {
+  const a = [...arr];
+  const rand = mulberry32(seed);
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [a[i], a[j]] = [a[j]!, a[i]!];
   }
+  return a;
+}
+
+/** Split into non-overlapping chunks of `size` (last chunk may be smaller). */
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    const c = arr.slice(i, i + size);
+    if (c.length >= 2) out.push(c);
+  }
+  return out;
+}
+
+/** Bounded-concurrency map. */
+async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let idx = 0;
+  const worker = async (): Promise<void> => {
+    while (idx < items.length) {
+      const i = idx++;
+      out[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return out;
 }
 
@@ -329,52 +359,71 @@ function pickCanonical(members: CampaignForClustering[]): CampaignForClustering 
 }
 
 /**
- * Detect duplicate clusters across a large roster via sorted sliding windows
- * + corroborated union. See the block comment above for the algorithm.
+ * Detect duplicate clusters across a large roster via randomized rounds of
+ * windowed single-shot clustering, with corroborated union and a working list
+ * that shrinks as duplicates fold in. See the block comment above.
  */
 export async function detectCampaignClustersWindowed(args: {
   accountName: string;
   campaigns: CampaignForClustering[];
   windowSize?: number;
-  windowStep?: number;
-  passes?: number;
   voteThreshold?: number;
+  coverage?: number;
 }): Promise<ClusterDetectionResult> {
   const windowSize = args.windowSize ?? WINDOW_SIZE;
-  const windowStep = args.windowStep ?? WINDOW_STEP;
-  const passes = args.passes ?? PASSES;
   const voteThreshold = args.voteThreshold ?? VOTE_THRESHOLD;
+  const coverage = args.coverage ?? COVERAGE;
 
   if (args.campaigns.length < 2) return { clusters: [], droppedClusterCount: 0 };
 
-  const byId = new Map(args.campaigns.map((c) => [c.id, c]));
   // pairKey "idA|idB" (sorted) → vote count + best contributing group's conf/reason.
   const pairTally = new Map<string, { count: number; conf: number; reason: string }>();
 
-  const sortKeys: Array<(c: CampaignForClustering) => string> = [
-    (c) => alnumKey(c.name),
-    (c) => tokenSortedKey(c.name),
-  ];
+  // Union-find over campaign ids (path compression).
+  const parent = new Map<string, string>();
+  const find = (x: string): string => {
+    if (!parent.has(x)) parent.set(x, x);
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root)!;
+    let cur = x;
+    while (parent.get(cur) !== root) {
+      const next = parent.get(cur)!;
+      parent.set(cur, root);
+      cur = next;
+    }
+    return root;
+  };
+  const union = (a: string, b: string): boolean => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra === rb) return false;
+    parent.set(ra, rb);
+    return true;
+  };
 
+  // working = current representatives (canonical per merged component).
+  let working = [...args.campaigns];
+  let round = 0;
+  let dryStreak = 0;
   let windowCalls = 0;
-  for (let pass = 0; pass < passes; pass++) {
-    const keyFn = sortKeys[pass % sortKeys.length]!;
-    const sorted = [...args.campaigns].sort((a, b) => {
-      const ka = keyFn(a);
-      const kb = keyFn(b);
-      if (ka < kb) return -1;
-      if (ka > kb) return 1;
-      return a.id.localeCompare(b.id);
-    });
-    for (const window of windowsOf(sorted, windowSize, windowStep)) {
+
+  while (round < HARD_ROUND_CAP && working.length >= 2) {
+    round++;
+    const order = shuffled(working, round * 0x9e3779b1);
+    const windows = chunk(order, windowSize);
+
+    const results = await mapPool(windows, WINDOW_CONCURRENCY, async (window) => {
       windowCalls++;
-      let res: ClusterDetectionResult;
       try {
-        res = await detectCampaignClusters({ accountName: args.accountName, campaigns: window });
+        return await detectCampaignClusters({ accountName: args.accountName, campaigns: window });
       } catch (err) {
-        logger.warn({ err, pass }, '[cluster-detector] window detection failed — skipped');
-        continue;
+        logger.warn({ err, round }, '[cluster-detector] window detection failed — skipped');
+        return { clusters: [], droppedClusterCount: 0 } as ClusterDetectionResult;
       }
+    });
+
+    // Tally pair co-occurrences from this round's window groupings.
+    for (const res of results) {
       for (const cl of res.clusters) {
         const ids = [cl.canonicalId, ...cl.variantIds];
         for (let i = 0; i < ids.length; i++) {
@@ -394,56 +443,58 @@ export async function detectCampaignClustersWindowed(args: {
         }
       }
     }
+
+    // Promote corroborated pairs to merges.
+    let newMerges = 0;
+    for (const [key, v] of pairTally) {
+      if (v.count >= voteThreshold) {
+        const [a, b] = key.split('|') as [string, string];
+        if (union(a, b)) newMerges++;
+      }
+    }
+
+    // Collapse the working list to one representative per component.
+    const groups = new Map<string, CampaignForClustering[]>();
+    for (const c of working) {
+      const r = find(c.id);
+      const g = groups.get(r) ?? [];
+      g.push(c);
+      groups.set(r, g);
+    }
+    working = [...groups.values()].map((members) => pickCanonical(members));
+
+    dryStreak = newMerges > 0 ? 0 : dryStreak + 1;
+    const targetRounds = Math.ceil((coverage * working.length) / windowSize);
+    logger.info(
+      { round, working: working.length, newMerges, targetRounds, dryStreak },
+      '[cluster-detector] round complete',
+    );
+    if (round >= targetRounds && dryStreak >= DRY_STOP) break;
   }
 
-  // Union pairs meeting the vote threshold (union-find with path compression).
-  const parent = new Map<string, string>();
-  const find = (x: string): string => {
-    if (!parent.has(x)) parent.set(x, x);
-    let root = x;
-    while (parent.get(root) !== root) root = parent.get(root)!;
-    let cur = x;
-    while (parent.get(cur) !== root) {
-      const next = parent.get(cur)!;
-      parent.set(cur, root);
-      cur = next;
-    }
-    return root;
-  };
-  const union = (a: string, b: string): void => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent.set(ra, rb);
-  };
-
-  const survivingPairs: Array<{ a: string; b: string; conf: number; reason: string }> = [];
-  for (const [key, v] of pairTally) {
-    if (v.count >= voteThreshold) {
-      const [a, b] = key.split('|') as [string, string];
-      union(a, b);
-      survivingPairs.push({ a, b, conf: v.conf, reason: v.reason });
-    }
+  // Build final clusters from union-find over ALL original ids.
+  const compMembers = new Map<string, CampaignForClustering[]>();
+  for (const c of args.campaigns) {
+    const r = find(c.id);
+    const g = compMembers.get(r) ?? [];
+    g.push(c);
+    compMembers.set(r, g);
   }
-
-  // Group surviving members by component root; track best conf/reason per root.
-  const compMembers = new Map<string, Set<string>>();
+  // Per component, the best conf/reason among its corroborated pairs.
   const compConf = new Map<string, number>();
   const compReason = new Map<string, string>();
-  for (const p of survivingPairs) {
-    const root = find(p.a);
-    const set = compMembers.get(root) ?? new Set<string>();
-    set.add(p.a);
-    set.add(p.b);
-    compMembers.set(root, set);
-    if ((compConf.get(root) ?? 0) < p.conf) {
-      compConf.set(root, p.conf);
-      compReason.set(root, p.reason);
+  for (const [key, v] of pairTally) {
+    if (v.count < voteThreshold) continue;
+    const [a] = key.split('|') as [string, string];
+    const root = find(a);
+    if ((compConf.get(root) ?? 0) < v.conf) {
+      compConf.set(root, v.conf);
+      compReason.set(root, v.reason);
     }
   }
 
   const clusters: DetectedCluster[] = [];
-  for (const [root, memberIds] of compMembers) {
-    const members = [...memberIds].map((id) => byId.get(id)).filter((c): c is CampaignForClustering => !!c);
+  for (const [root, members] of compMembers) {
     if (members.length < 2) continue;
     const canonical = pickCanonical(members);
     const variants = members.filter((m) => m.id !== canonical.id);
@@ -453,19 +504,20 @@ export async function detectCampaignClustersWindowed(args: {
       variantIds: variants.map((v) => v.id),
       variantNames: variants.map((v) => v.name),
       confidence: compConf.get(root) ?? CONFIDENCE_FLOOR,
-      reasoning: `${compReason.get(root) ?? 'duplicate group'} [sliding-window: ${members.length} campaigns, corroborated]`,
+      reasoning: `${compReason.get(root) ?? 'duplicate group'} [randomized rounds: ${members.length} campaigns, corroborated ×${voteThreshold}]`,
     });
   }
 
   logger.info(
     {
       totalCampaigns: args.campaigns.length,
+      rounds: round,
       windowCalls,
-      passes,
       voteThreshold,
+      coverage,
       clustersFound: clusters.length,
     },
-    '[cluster-detector] windowed clustering complete',
+    '[cluster-detector] randomized-round clustering complete',
   );
 
   return { clusters, droppedClusterCount: 0 };

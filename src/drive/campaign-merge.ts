@@ -120,6 +120,10 @@ export interface RunCampaignMergeOptions {
   apply: boolean;
   /** Defaults to 0.8. Clusters below this are reported but not merged. */
   minConfidence?: number;
+  /** Clustering tuning knobs (CLI-overridable so we can tune without redeploy). */
+  windowSize?: number;
+  voteThreshold?: number;
+  coverage?: number;
 }
 
 type ClusterOutcome = 'merged' | 'would-merge' | 'skipped' | 'failed' | 'below-confidence';
@@ -323,6 +327,9 @@ export async function runCampaignMerge(
   const detection = await detectCampaignClustersWindowed({
     accountName: account.name,
     campaigns,
+    ...(opts.windowSize !== undefined ? { windowSize: opts.windowSize } : {}),
+    ...(opts.voteThreshold !== undefined ? { voteThreshold: opts.voteThreshold } : {}),
+    ...(opts.coverage !== undefined ? { coverage: opts.coverage } : {}),
   });
 
   const clusterReports: ClusterReport[] = [];

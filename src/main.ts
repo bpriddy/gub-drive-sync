@@ -72,6 +72,10 @@ interface ParsedArgs {
   confirm?: boolean;
   /** merge-campaign-dupes: raise the merge confidence floor above 0.8. */
   minConfidence?: number;
+  /** merge-campaign-dupes clustering tuning. */
+  windowSize?: number;
+  voteThreshold?: number;
+  coverage?: number;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -133,6 +137,36 @@ function parseArgs(argv: string[]): ParsedArgs {
         }
         out.minConfidence = parsed;
         if (arg === '--min-confidence') i++;
+        continue;
+      }
+      const win = takeValue(arg, '--window', i);
+      if (win !== undefined) {
+        const parsed = Number(win);
+        if (!Number.isInteger(parsed) || parsed < 2) {
+          throw new Error(`--window must be an integer >= 2, got: ${win}`);
+        }
+        out.windowSize = parsed;
+        if (arg === '--window') i++;
+        continue;
+      }
+      const votes = takeValue(arg, '--vote-threshold', i);
+      if (votes !== undefined) {
+        const parsed = Number(votes);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          throw new Error(`--vote-threshold must be an integer >= 1, got: ${votes}`);
+        }
+        out.voteThreshold = parsed;
+        if (arg === '--vote-threshold') i++;
+        continue;
+      }
+      const cov = takeValue(arg, '--coverage', i);
+      if (cov !== undefined) {
+        const parsed = Number(cov);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          throw new Error(`--coverage must be a positive number, got: ${cov}`);
+        }
+        out.coverage = parsed;
+        if (arg === '--coverage') i++;
         continue;
       }
       if (arg === '--confirm') out.confirm = true;
@@ -234,6 +268,9 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
         ...(args.accountName ? { accountName: args.accountName } : {}),
         apply: args.confirm ?? false,
         ...(args.minConfidence !== undefined ? { minConfidence: args.minConfidence } : {}),
+        ...(args.windowSize !== undefined ? { windowSize: args.windowSize } : {}),
+        ...(args.voteThreshold !== undefined ? { voteThreshold: args.voteThreshold } : {}),
+        ...(args.coverage !== undefined ? { coverage: args.coverage } : {}),
       });
       return result as unknown as Record<string, unknown>;
     }
