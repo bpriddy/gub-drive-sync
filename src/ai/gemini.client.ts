@@ -73,6 +73,9 @@ class GeminiLlmDriver implements LlmDriver {
       generationConfig.responseMimeType = 'application/json';
       generationConfig.responseSchema = req.responseSchema;
     }
+    if (req.maxOutputTokens) {
+      generationConfig.maxOutputTokens = req.maxOutputTokens;
+    }
     const model = this.client.getGenerativeModel({
       model: req.model,
       generationConfig: generationConfig as never,

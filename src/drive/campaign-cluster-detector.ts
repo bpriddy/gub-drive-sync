@@ -24,6 +24,13 @@ import { logger } from '../logger';
 const MODEL = 'gemini-3.5-flash';
 const CONFIDENCE_FLOOR = 0.8;
 const MARKDOWN_EXCERPT_CHARS = 500;
+/**
+ * The clustering response scales with the number of duplicate clusters in
+ * the account. A big roster (e.g. Chevy) can emit dozens of clusters; the
+ * model's default output cap truncates the JSON mid-string and fails the
+ * parse. Set generously — structured output keeps it from rambling.
+ */
+const MAX_OUTPUT_TOKENS = 32768;
 
 export interface CampaignForClustering {
   id: string;
@@ -235,6 +242,7 @@ export async function detectCampaignClusters(args: {
     prompt,
     tag: 'campaign_cluster_detection.v1',
     responseSchema: RESPONSE_SCHEMA,
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
   });
 
   let parsed: z.infer<typeof ResponseSchemaZ>;

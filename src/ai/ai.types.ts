@@ -17,6 +17,13 @@ export interface LlmCompletionRequest {
    * the pipeline keeps running when no API key is set.
    */
   responseSchema?: ResponseSchema;
+  /**
+   * Cap on generated tokens. Omit to inherit the model default. Set high
+   * for calls whose JSON response scales with input size (e.g. clustering a
+   * large campaign roster) — a truncated response is invalid JSON and fails
+   * the caller's parse.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface LlmCompletionResult {
