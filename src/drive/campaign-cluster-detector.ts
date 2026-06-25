@@ -24,11 +24,14 @@ import { logger } from '../logger';
 const MODEL = 'gemini-3.5-flash';
 const CONFIDENCE_FLOOR = 0.8;
 /**
- * Each window only sees ≤ WINDOW_SIZE names, so its cluster output is small.
- * Keep this modest — an oversized cap lets the thinking model run long and was
- * a big slice of per-call latency on the full roster.
+ * MUST be generous: gemini-3.5-flash's THINKING tokens count against this cap.
+ * A dense window can emit a dozen clusters; too low a cap gets eaten by
+ * thinking and truncates the JSON mid-array → parse failure → the window
+ * silently returns empty and merges are lost (4096 caused ~400 such failures
+ * and a 5× under-merge). Speed comes from the lean names-only INPUT, not from
+ * starving the output.
  */
-const MAX_OUTPUT_TOKENS = 4096;
+const MAX_OUTPUT_TOKENS = 16384;
 
 export interface CampaignForClustering {
   id: string;
