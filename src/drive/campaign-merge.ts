@@ -32,7 +32,7 @@ import { prisma } from '../prisma';
 import { logger } from '../logger';
 import { buildCampaignCurrentState } from './schema';
 import {
-  detectCampaignClusters,
+  detectCampaignClustersWindowed,
   type DetectedCluster,
 } from './campaign-cluster-detector';
 import { mergeCampaignMarkdowns, type VariantMarkdown } from './campaign-merge-synthesizer';
@@ -45,6 +45,73 @@ const DRIVE_SYNC_SYSTEM_STAFF_ID = 'dcd5d8e3-0000-4000-a000-000000000001';
 
 /** Detector floor; clusters never come back below this. Operators may raise. */
 const DEFAULT_MIN_CONFIDENCE = 0.8;
+
+/** Higher = kept when collapsing a user's duplicate grants. */
+const ROLE_RANK: Record<string, number> = {
+  viewer: 1,
+  contributor: 2,
+  manager: 3,
+  admin: 4,
+};
+
+/**
+ * Redirect campaign access_grants from the variants to the canonical,
+ * collapsing collisions. A user may hold a grant on both a variant and the
+ * canonical (or on two variants); a blind `resource_id` update would then
+ * violate the unique (user_id, resource_type, resource_id). So per user we
+ * keep ONE surviving grant — active beats revoked, then higher role, then a
+ * grant already on the canonical — point it at the canonical, and delete the
+ * rest. Handles all grants (incl. revoked) so it's correct whether the unique
+ * index is partial or full.
+ */
+async function redirectAccessGrants(
+  tx: Prisma.TransactionClient,
+  canonicalId: string,
+  variantIds: string[],
+): Promise<void> {
+  const allIds = [canonicalId, ...variantIds];
+  const grants = await tx.accessGrant.findMany({
+    where: { resourceType: 'campaign', resourceId: { in: allIds } },
+    select: { id: true, userId: true, resourceId: true, role: true, revokedAt: true },
+  });
+  if (grants.length === 0) return;
+
+  const score = (g: (typeof grants)[number]): number =>
+    (g.revokedAt ? 0 : 100) + (ROLE_RANK[g.role] ?? 0);
+
+  const byUser = new Map<string, typeof grants>();
+  for (const g of grants) {
+    const arr = byUser.get(g.userId) ?? [];
+    arr.push(g);
+    byUser.set(g.userId, arr);
+  }
+
+  const toDelete: string[] = [];
+  const toRedirect: string[] = [];
+  for (const [, gs] of byUser) {
+    let survivor = gs[0]!;
+    for (const g of gs) {
+      const better = score(g) > score(survivor);
+      const tieToCanonical = score(g) === score(survivor) && g.resourceId === canonicalId;
+      if (better || tieToCanonical) survivor = g;
+    }
+    for (const g of gs) {
+      if (g.id !== survivor.id) toDelete.push(g.id);
+    }
+    if (survivor.resourceId !== canonicalId) toRedirect.push(survivor.id);
+  }
+
+  // Delete losers FIRST so the survivor's redirect can't collide with one.
+  if (toDelete.length > 0) {
+    await tx.accessGrant.deleteMany({ where: { id: { in: toDelete } } });
+  }
+  if (toRedirect.length > 0) {
+    await tx.accessGrant.updateMany({
+      where: { id: { in: toRedirect } },
+      data: { resourceId: canonicalId },
+    });
+  }
+}
 
 export interface RunCampaignMergeOptions {
   accountId?: string;
@@ -191,11 +258,9 @@ async function applyCluster(
       where: { campaignId: { in: variantIds } },
       data: { campaignId: cluster.canonicalId },
     });
-    // access_grants soft FK: resource_type='campaign' + resource_id=campaignId.
-    await tx.accessGrant.updateMany({
-      where: { resourceType: 'campaign', resourceId: { in: variantIds } },
-      data: { resourceId: cluster.canonicalId },
-    });
+    // access_grants soft FK: resource_type='campaign'. Collapse per-user
+    // collisions instead of a blind redirect (see redirectAccessGrants).
+    await redirectAccessGrants(tx, cluster.canonicalId, variantIds);
 
     // 3. Delete variant rows.
     await tx.campaign.deleteMany({ where: { id: { in: variantIds } } });
@@ -252,10 +317,10 @@ export async function runCampaignMerge(
 
   logger.info(
     { accountId: account.id, accountName: account.name, campaignCount: campaigns.length, apply: opts.apply },
-    '[campaign-merge] detecting duplicate clusters',
+    '[campaign-merge] detecting duplicate clusters (sliding-window)',
   );
 
-  const detection = await detectCampaignClusters({
+  const detection = await detectCampaignClustersWindowed({
     accountName: account.name,
     campaigns,
   });
