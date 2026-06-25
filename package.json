@@ -14,6 +14,7 @@
     "seed:new-entity": "tsx -r dotenv/config scripts/seed-new-entity-proposal.ts",
     "backfill": "tsx -r dotenv/config scripts/backfill.ts",
     "clear": "tsx -r dotenv/config scripts/clear.ts",
+    "merge-campaign-dupes": "tsx -r dotenv/config src/main.ts merge-campaign-dupes",
     "backfill-pending": "tsx -r dotenv/config src/main.ts backfill-pending",
     "probe-activity": "tsx -r dotenv/config scripts/probe-activity.ts",
     "probe-file-history": "tsx -r dotenv/config scripts/probe-file-history.ts",

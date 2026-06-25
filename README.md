@@ -181,6 +181,51 @@ gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
   --args=sweep-expired
 ```
 
+### Merge duplicate campaigns (`merge-campaign-dupes`)
+
+One-shot cleanup that detects duplicate Campaign rows for one account
+(year-drift / suffix-noise / separator-drift name variants — e.g. "Truck
+Season 2025" vs "TRUCK SEASON CAMPAIGN") via a single Gemini call, then
+merges each cluster into one canonical row. The detector is
+split-by-default and only proposes clusters at confidence ≥ 0.8.
+
+**Destructive and irreversible** — variant rows are deleted, their FK
+references (campaign_changes, drive_file_snapshots, drive_scan_logs,
+drive_change_proposals, access_grants) redirected to the canonical, and
+the canonical's `status_markdown` re-synthesized from the merged set. Each
+merge is recorded in `audit_log` (action `campaign_merged`) but there is no
+rollback table.
+
+```bash
+# DRY-RUN — detect + log the clusters that WOULD merge. No writes, no LLM
+# synthesis. Read the logged `outcome.clusters` to review before applying.
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=merge-campaign-dupes,--account-name,chevy
+
+# APPLY — same detection, then merge every cluster ≥ 0.8 confidence.
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=merge-campaign-dupes,--account-name,chevy,--confirm
+
+# Optional: raise the floor (only merge ≥ 0.9), or target by id.
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=merge-campaign-dupes,--account-id,<uuid>,--min-confidence,0.9,--confirm
+```
+
+Review the result (the `outcome` object is logged as structured JSON):
+
+```bash
+gcloud logging read \
+  'resource.labels.service_name="gub-drive-sync-dev" AND jsonPayload.msg="gub-drive-sync complete"' \
+  --project=os-test-491819 --limit=1 --format='value(jsonPayload.outcome)'
+```
+
+Local equivalent (hits whatever `DATABASE_URL` points at):
+
+```bash
+npm run merge-campaign-dupes -- --account-name chevy            # dry-run
+npm run merge-campaign-dupes -- --account-name chevy --confirm  # apply
+```
+
 ## Prod implementation checklist
 
 When a prod environment exists:

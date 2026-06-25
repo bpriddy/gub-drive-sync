@@ -16,6 +16,10 @@
  *                                                    drive_backfill_requests
  *                                                    queue; Cloud Scheduler
  *                                                    target)
+ *   merge-campaign-dupes     → runCampaignMerge  (operator gcloud; one-shot
+ *     --account-name X [--confirm]                 detect + merge duplicate
+ *     [--min-confidence 0..1]                      campaigns. No --confirm =
+ *                                                  dry-run.)
  *
  * Every work mode runs the reaper first — same self-heal as the original
  * router. Exit code: 0 success / 1 fatal. Cloud Run Jobs marks the
@@ -36,6 +40,7 @@ import {
   startFullSync,
 } from './drive/runner';
 import { processBackfillQueue } from './drive/backfill-queue';
+import { runCampaignMerge } from './drive/campaign-merge';
 
 type Mode =
   | 'poll'
@@ -44,7 +49,8 @@ type Mode =
   | 'cron'
   | 'notify'
   | 'sweep-expired'
-  | 'backfill-pending';
+  | 'backfill-pending'
+  | 'merge-campaign-dupes';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -54,11 +60,18 @@ const ALL_MODES: readonly Mode[] = [
   'notify',
   'sweep-expired',
   'backfill-pending',
+  'merge-campaign-dupes',
 ];
 
 interface ParsedArgs {
   mode: Mode;
   syncRunId?: string;
+  accountId?: string;
+  accountName?: string;
+  /** merge-campaign-dupes: actually apply (delete rows). Absent = dry-run. */
+  confirm?: boolean;
+  /** merge-campaign-dupes: raise the merge confidence floor above 0.8. */
+  minConfidence?: number;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -86,6 +99,46 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
     if (!out.syncRunId) {
       throw new Error(`mode=continue requires --sync-run-id <uuid>`);
+    }
+  }
+
+  if (mode === 'merge-campaign-dupes') {
+    // --account-id <uuid> | --account-name <fragment> (one required)
+    // --confirm                (apply; absent = dry-run)
+    // --min-confidence <0..1>  (optional; raises the 0.8 floor)
+    const takeValue = (arg: string, flag: string, i: number): string | undefined => {
+      if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
+      if (arg === flag) return positional[i + 1];
+      return undefined;
+    };
+    for (let i = 1; i < positional.length; i++) {
+      const arg = positional[i]!;
+      const acctId = takeValue(arg, '--account-id', i);
+      if (acctId !== undefined) {
+        out.accountId = acctId;
+        if (arg === '--account-id') i++;
+        continue;
+      }
+      const acctName = takeValue(arg, '--account-name', i);
+      if (acctName !== undefined) {
+        out.accountName = acctName;
+        if (arg === '--account-name') i++;
+        continue;
+      }
+      const minConf = takeValue(arg, '--min-confidence', i);
+      if (minConf !== undefined) {
+        const parsed = Number(minConf);
+        if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+          throw new Error(`--min-confidence must be a number in [0,1], got: ${minConf}`);
+        }
+        out.minConfidence = parsed;
+        if (arg === '--min-confidence') i++;
+        continue;
+      }
+      if (arg === '--confirm') out.confirm = true;
+    }
+    if (!out.accountId && !out.accountName) {
+      throw new Error('mode=merge-campaign-dupes requires --account-id <uuid> or --account-name <fragment>');
     }
   }
 
@@ -170,6 +223,18 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
       // sync-runs. The backfill queue does its own stale-recovery on
       // entry (rows stuck in 'running' for >60min).
       const result = await processBackfillQueue();
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'merge-campaign-dupes': {
+      // Orthogonal to sync state — no reapStaleSyncs(). One-shot detect +
+      // (with --confirm) merge of duplicate campaigns for one account.
+      const result = await runCampaignMerge({
+        ...(args.accountId ? { accountId: args.accountId } : {}),
+        ...(args.accountName ? { accountName: args.accountName } : {}),
+        apply: args.confirm ?? false,
+        ...(args.minConfidence !== undefined ? { minConfidence: args.minConfidence } : {}),
+      });
       return result as unknown as Record<string, unknown>;
     }
   }
