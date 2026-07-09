@@ -9,19 +9,16 @@
  * Three modes (pass exactly one):
  *
  *   --account-id <uuid>
- *     Clear all Drive-sync state for an account AND every child campaign.
- *     The account row itself stays. Child campaign ROWS are deleted (you
- *     re-discover them on the next structure-aware backfill scan).
- *     Specifically deletes:
- *       - drive_change_proposals tied to the account or any child campaign
- *       - drive_scan_logs tied to the account or any child campaign
- *       - account_changes for this account
- *       - campaign_changes for each child campaign (cascade with delete)
- *       - all child campaigns
- *     And resets to NULL:
- *       - accounts.status_markdown + accounts.status_sensitive_markdown
- *       - accounts.drive_backfill_cursor (so the next backfill restarts
- *         from the earliest active day)
+ *     COMPLETE per-account nuke for a clean re-bootstrap. The account row
+ *     itself stays (folder pointer + business fields kept); everything else
+ *     Drive-sync goes. Delegates to clearAccountComplete (src/drive/
+ *     clear-account.ts) — the same code the `clear-account` Cloud Run mode
+ *     runs — so it wipes ALL of: drive_change_proposals, drive_scan_logs,
+ *     drive_file_snapshots, drive_sync_runs, campaign_changes, campaigns,
+ *     account_changes, access_grants (account + campaign), audit_log; and
+ *     resets every account sync/cache column incl. drive_bootstrap_cursor,
+ *     drive_structure_classification, drive_bootstrap_files. See that module
+ *     for the audit_log dev/prod strictness note.
  *
  *   --campaign-id <uuid>
  *     Clear sync state for a single campaign. The campaign row stays.
@@ -45,6 +42,7 @@
  */
 import * as readline from 'node:readline/promises';
 import { prisma } from '../src/prisma';
+import { clearAccountComplete } from '../src/drive/clear-account';
 
 interface Args {
   accountId?: string;
@@ -104,41 +102,17 @@ async function clearCampaign(campaignId: string): Promise<void> {
   });
 }
 
-// ── Account clear (deletes child campaigns) ────────────────────────────────
+// ── Account clear (COMPLETE nuke — deletes child campaigns) ─────────────────
+//
+// Delegates to the shared clearAccountComplete so the local script and the
+// `clear-account` Cloud Run mode do the identical, gap-free wipe (bootstrap
+// cache columns, drive_file_snapshots, drive_sync_runs, access_grants,
+// audit_log — none of which the old inline version handled). See
+// src/drive/clear-account.ts.
 
 async function clearAccount(accountId: string): Promise<{ childCount: number }> {
-  const childCampaigns = await prisma.campaign.findMany({
-    where: { accountId },
-    select: { id: true },
-  });
-
-  await prisma.$transaction(async (tx) => {
-    for (const c of childCampaigns) {
-      await tx.driveChangeProposal.deleteMany({ where: { campaignId: c.id } });
-      await tx.driveScanLog.deleteMany({ where: { campaignId: c.id } });
-      // campaign_changes ↔ campaigns FK is NOT cascade-on-delete in this
-      // schema; explicit delete required before the campaign row goes.
-      await tx.campaignChange.deleteMany({ where: { campaignId: c.id } });
-      await tx.campaign.delete({ where: { id: c.id } });
-    }
-    // Account-level cleanup.
-    await tx.driveChangeProposal.deleteMany({ where: { accountId, campaignId: null } });
-    await tx.driveScanLog.deleteMany({ where: { accountId, campaignId: null } });
-    await tx.accountChange.deleteMany({ where: { accountId } });
-    await tx.account.update({
-      where: { id: accountId },
-      data: {
-        statusMarkdown: null,
-        statusSensitiveMarkdown: null,
-        driveBootstrapCursor: null,
-        driveBootstrapCompletedAt: null,
-        driveLastSyncedAt: null,
-        driveActivityPageToken: null,
-      },
-    });
-  });
-
-  return { childCount: childCampaigns.length };
+  const result = await clearAccountComplete({ accountId, apply: true });
+  return { childCount: result.counts.campaigns };
 }
 
 // ── All-campaigns nuclear ──────────────────────────────────────────────────

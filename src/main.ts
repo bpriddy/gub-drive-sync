@@ -20,6 +20,10 @@
  *     --account-name X [--confirm]                 detect + merge duplicate
  *     [--min-confidence 0..1]                      campaigns. No --confirm =
  *                                                  dry-run.)
+ *   clear-account            → clearAccountComplete (operator gcloud; COMPLETE
+ *     --account-name X [--confirm]                   per-account nuke for a
+ *                                                    clean re-bootstrap. No
+ *                                                    --confirm = dry-run counts.)
  *
  * Every work mode runs the reaper first — same self-heal as the original
  * router. Exit code: 0 success / 1 fatal. Cloud Run Jobs marks the
@@ -41,6 +45,7 @@ import {
 } from './drive/runner';
 import { processBackfillQueue } from './drive/backfill-queue';
 import { runCampaignMerge } from './drive/campaign-merge';
+import { clearAccountComplete } from './drive/clear-account';
 
 type Mode =
   | 'poll'
@@ -50,7 +55,8 @@ type Mode =
   | 'notify'
   | 'sweep-expired'
   | 'backfill-pending'
-  | 'merge-campaign-dupes';
+  | 'merge-campaign-dupes'
+  | 'clear-account';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -61,6 +67,7 @@ const ALL_MODES: readonly Mode[] = [
   'sweep-expired',
   'backfill-pending',
   'merge-campaign-dupes',
+  'clear-account',
 ];
 
 interface ParsedArgs {
@@ -165,6 +172,22 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
+  if (mode === 'clear-account') {
+    // --account-id <uuid> | --account-name <fragment> (one required)
+    // --confirm  (apply; absent = dry-run counts only)
+    for (let i = 1; i < positional.length; i++) {
+      const arg = positional[i]!;
+      if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
+      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
+      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
+      else if (arg === '--confirm') out.confirm = true;
+    }
+    if (!out.accountId && !out.accountName) {
+      throw new Error('mode=clear-account requires --account-id <uuid> or --account-name <fragment>');
+    }
+  }
+
   return out;
 }
 
@@ -259,6 +282,17 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
         ...(args.minConfidence !== undefined ? { minConfidence: args.minConfidence } : {}),
         ...(args.windowSize !== undefined ? { windowSize: args.windowSize } : {}),
         ...(args.voteThreshold !== undefined ? { voteThreshold: args.voteThreshold } : {}),
+      });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'clear-account': {
+      // Orthogonal to sync state — no reapStaleSyncs(). Complete per-account
+      // nuke for a clean re-bootstrap. No --confirm = dry-run (counts only).
+      const result = await clearAccountComplete({
+        ...(args.accountId ? { accountId: args.accountId } : {}),
+        ...(args.accountName ? { accountName: args.accountName } : {}),
+        apply: args.confirm ?? false,
       });
       return result as unknown as Record<string, unknown>;
     }

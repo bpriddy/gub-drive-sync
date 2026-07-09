@@ -242,6 +242,37 @@ npm run merge-campaign-dupes -- --account-name chevy            # dry-run
 npm run merge-campaign-dupes -- --account-name chevy --confirm  # apply
 ```
 
+### Complete per-account nuke (`clear-account`)
+
+Clean-slate an account so a re-bootstrap starts blank. The account row
+survives (its `drive_folder_id` + business fields are kept); **everything
+else Drive-sync is wiped** in one transaction — child campaigns, all their
+changes/proposals/scan-logs/snapshots, the `drive_sync_runs` queue,
+`access_grants` (account + campaign), Chevy `audit_log` entries, and every
+account sync/cache column (`drive_bootstrap_cursor`,
+`drive_structure_classification`, `drive_bootstrap_files`, …). This exists
+because the old per-account `clear` left bootstrap-cache + snapshot residue
+that silently skipped re-classification/re-extraction.
+
+**Destructive & irreversible.** No `--confirm` = dry-run (counts only).
+
+```bash
+# DRY-RUN — counts what would be deleted/reset. No writes.
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=clear-account,--account-name,chevy
+
+# APPLY — the full nuke.
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=clear-account,--account-name,chevy,--confirm
+```
+
+**audit_log — dev vs prod:** the whole nuke is one transaction. In dev the
+audit-log immutability triggers are dropped, so the `audit_log` purge
+succeeds. When prod re-enables those triggers, that delete raises and the
+entire transaction rolls back — production stays strict, enforced by the DB
+(not by `NODE_ENV`, which is `production` on the deployed dev job). Local
+equivalent: `npm run clear -- --account-id <uuid>` (same shared code path).
+
 ## Prod implementation checklist
 
 When a prod environment exists:
