@@ -417,6 +417,7 @@ model Campaign {
   driveFileSnapshots DriveFileSnapshot[]
   driveScanLogs      DriveScanLog[]
   driveProposals     DriveChangeProposal[]
+  pieces             CampaignPiece[]
 
   @@index([accountId])
   @@index([status])
@@ -1079,4 +1080,50 @@ model StaffResearchDossier {
   @@unique([staffId, provider, preset, promptTemplateVersion])
   @@index([staffId])
   @@map("staff_research_dossiers")
+}
+// ── Campaign pieces ─────────────────────────────────────────────────────────
+// Execution deliverables of a campaign — a commercial, a website, a social
+// run, an interactive experience. A level below Campaign so a multi-deliverable
+// campaign (BHAC = commercial + character customizer) isn't forced into
+// duplicate campaign rows. Folder-derived; carries its own status_markdown
+// "to start". campaign_id CASCADE — a clear-account / campaign nuke removes it.
+model CampaignPiece {
+  id              String    @id @default(uuid()) @db.Uuid
+  campaignId      String    @map("campaign_id") @db.Uuid
+  name            String
+  statusMarkdown  String?   @map("status_markdown") @db.Text
+  driveFolderId   String?   @map("drive_folder_id")
+  driveFolderUrl  String?   @map("drive_folder_url")
+  driveFolderPath String?   @map("drive_folder_path")
+  driveLastRunAt  DateTime? @map("drive_last_run_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+  @@index([driveFolderId])
+  @@map("campaign_pieces")
+}
+
+// ── Pitch concepts ──────────────────────────────────────────────────────────
+// Institutional-memory tier: ideas pitched to answer a brief. DECOUPLED from
+// operational tables on purpose — references account / campaign / piece by
+// EXTERNAL id (plain text, NO foreign key). `facets` are right-sized
+// natural-language rows; the description IS these rows. `pieceId` set ⟹ the
+// idea was implicitly awarded / signed off. Search indexes come later.
+model PitchConcept {
+  id                 String    @id @default(uuid()) @db.Uuid
+  accountExternalId  String    @map("account_external_id")
+  campaignExternalId String?   @map("campaign_external_id")
+  pieceId            String?   @map("piece_id")
+  name               String
+  facets             String[]  @default([])
+  pitchedAt          DateTime? @map("pitched_at") @db.Date
+  sourceFileId       String?   @map("source_file_id")
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([accountExternalId])
+  @@index([pieceId])
+  @@map("pitch_concepts")
 }
