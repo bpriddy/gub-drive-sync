@@ -1123,7 +1123,32 @@ model Idea {
   sourceFileId       String?   @map("source_file_id")
   createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
 
+  changes IdeaChange[]
+
   @@index([accountExternalId])
   @@index([pieceId])
   @@map("ideas")
+}
+
+// Append-only log of an idea's evolution. An idea is a LIVING entity (like a
+// campaign's status_markdown): matched across decks and updated in place
+// rather than snapshotted per deck. Each update writes one row here. Kept in
+// the decoupled knowledge tier — only FK is ideaId → Idea (CASCADE);
+// `changedBy` is the system-staff uuid but carries NO Staff FK, so the memory
+// tier stays self-contained. value_text / previous_value_text hold the facet
+// rows rendered as text (one per line), the way status_markdown changes hold
+// the markdown blob.
+model IdeaChange {
+  id                String   @id @default(uuid()) @db.Uuid
+  ideaId            String   @map("idea_id") @db.Uuid
+  property          String
+  previousValueText String?  @map("previous_value_text")
+  valueText         String?  @map("value_text")
+  changedBy         String   @map("changed_by") @db.Uuid
+  changedAt         DateTime @default(now()) @map("changed_at") @db.Timestamptz
+
+  idea Idea @relation(fields: [ideaId], references: [id], onDelete: Cascade)
+
+  @@index([ideaId, changedAt(sort: Desc)])
+  @@map("idea_changes")
 }

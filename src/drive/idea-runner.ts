@@ -22,6 +22,8 @@ import { traverseFolder } from './traversal';
 import { gatherFolders } from './structure';
 import { extractText } from './extract';
 import { extractIdeasFromFile, type DeckType, type ExtractedIdea } from './idea-extraction';
+import { matchAndMergeIdea, type KnownIdea } from './idea-matcher';
+import { DRIVE_SYNC_SYSTEM_STAFF_ID } from './heal';
 
 export interface RunIdeaExtractionOptions {
   folderId: string;
@@ -42,6 +44,20 @@ export interface IdeaRunFileResult {
   ideas: ExtractedIdea[];
 }
 
+/**
+ * One resolved idea AFTER match-and-merge collapse — what actually lands (or
+ * would land) in the memory tier. `contributingDecks` is how many extracted
+ * ideas folded into this one (BHAC's ~9 character-generator variants → 1).
+ */
+export interface ResolvedIdea {
+  action: 'create' | 'update';
+  /** Present when action='update' (or after a create is persisted). */
+  ideaId?: string;
+  name: string;
+  facets: string[];
+  contributingDecks: number;
+}
+
 export interface IdeaRunResult {
   folderId: string;
   apply: boolean;
@@ -50,8 +66,41 @@ export interface IdeaRunResult {
   extractionErrors: number;
   deckFiles: number;
   ideasFound: number;
+  /** Distinct ideas after collapse (created + updated). */
+  ideasResolved: number;
+  ideasCreated: number;
+  ideasUpdated: number;
+  /** No-op merges: a deck re-stated an idea with nothing new (idempotent). */
+  ideasUnchanged: number;
   ideasPersisted: number;
+  /** Change-log rows written (creates + non-empty updates). */
+  changesLogged: number;
   files: IdeaRunFileResult[];
+  resolved: ResolvedIdea[];
+}
+
+/** A single planned mutation, built during resolution, executed during persist. */
+interface PlannedEvent {
+  kind: 'create' | 'update' | 'noop';
+  /** Real uuid for an existing idea, or a synthetic `new:N` for a planned create. */
+  targetId: string;
+  name: string;
+  previousFacets: string[];
+  facets: string[];
+  sourceFileId: string;
+}
+
+function renderFacets(facets: string[]): string {
+  return facets.map((f) => `- ${f}`).join('\n');
+}
+
+/** Order-insensitive set equality — skip no-op updates so re-runs don't churn. */
+function facetsEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const norm = (xs: string[]) => new Set(xs.map((x) => x.trim().toLowerCase()));
+  const sa = norm(a);
+  for (const x of norm(b)) if (!sa.has(x)) return false;
+  return true;
 }
 
 export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise<IdeaRunResult> {
@@ -101,26 +150,142 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
     }
   }
 
-  let ideasPersisted = 0;
-  if (opts.apply && ideasFound > 0) {
-    for (const f of files) {
-      for (const idea of f.ideas) {
-        await prisma.idea.create({
-          data: {
-            accountExternalId: opts.accountExternalId,
-            ...(opts.campaignExternalId ? { campaignExternalId: opts.campaignExternalId } : {}),
-            name: idea.name,
-            facets: idea.facets,
-            sourceFileId: f.fileId,
-          },
-        });
-        ideasPersisted++;
+  // ── Phase 2: RESOLVE — match each extracted idea against the account's
+  // memory and merge (add + supersede) rather than snapshot per deck. Runs in
+  // BOTH dry-run and apply so the preview shows the real collapse; only Phase 3
+  // writes. `known` is the growing set (persisted ideas + creates planned this
+  // run), so duplicates within a single run collapse too — BHAC's first deck
+  // creates the idea, the rest merge into it.
+  const known: KnownIdea[] = (
+    await prisma.idea.findMany({
+      where: { accountExternalId: opts.accountExternalId },
+      select: { id: true, name: true, facets: true },
+      orderBy: { createdAt: 'asc' },
+    })
+  ).map((k) => ({ id: k.id, name: k.name, facets: k.facets }));
+
+  const events: PlannedEvent[] = [];
+  const decksInto = new Map<string, number>(); // targetId → # of decks folded in
+  let synthSeq = 0;
+
+  for (const f of files) {
+    for (const idea of f.ideas) {
+      let matchId: string | null;
+      let mergedFacets: string[];
+      try {
+        ({ matchId, mergedFacets } = await matchAndMergeIdea({
+          newIdea: idea,
+          existingIdeas: known,
+          accountName: opts.accountName,
+        }));
+      } catch (err) {
+        // Matcher failure must not lose the idea — fall back to a plain create.
+        logger.warn({ err, ideaName: idea.name }, '[idea-runner] match failed — creating as new');
+        matchId = null;
+        mergedFacets = idea.facets;
+      }
+
+      if (matchId) {
+        const target = known.find((k) => k.id === matchId)!;
+        decksInto.set(matchId, (decksInto.get(matchId) ?? 1) + 1);
+        if (facetsEqual(target.facets, mergedFacets)) {
+          events.push({ kind: 'noop', targetId: matchId, name: target.name, previousFacets: target.facets, facets: target.facets, sourceFileId: f.fileId });
+        } else {
+          events.push({ kind: 'update', targetId: matchId, name: target.name, previousFacets: target.facets, facets: mergedFacets, sourceFileId: f.fileId });
+          target.facets = mergedFacets; // advance the in-memory memory
+        }
+      } else {
+        const synthId = `new:${synthSeq++}`;
+        known.push({ id: synthId, name: idea.name, facets: mergedFacets });
+        decksInto.set(synthId, 1);
+        events.push({ kind: 'create', targetId: synthId, name: idea.name, previousFacets: [], facets: mergedFacets, sourceFileId: f.fileId });
       }
     }
   }
 
+  // ── Phase 3: PERSIST (apply only). Creates first map their synthetic id to a
+  // real uuid; later updates that target a same-run create resolve through it.
+  const realId = new Map<string, string>();
+  let ideasPersisted = 0;
+  let changesLogged = 0;
+  if (opts.apply) {
+    for (const ev of events) {
+      if (ev.kind === 'create') {
+        const created = await prisma.idea.create({
+          data: {
+            accountExternalId: opts.accountExternalId,
+            ...(opts.campaignExternalId ? { campaignExternalId: opts.campaignExternalId } : {}),
+            name: ev.name,
+            facets: ev.facets,
+            sourceFileId: ev.sourceFileId,
+          },
+        });
+        realId.set(ev.targetId, created.id);
+        await prisma.ideaChange.create({
+          data: {
+            ideaId: created.id,
+            property: 'facets',
+            previousValueText: null,
+            valueText: renderFacets(ev.facets),
+            changedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
+          },
+        });
+        ideasPersisted++;
+        changesLogged++;
+      } else if (ev.kind === 'update') {
+        const id = realId.get(ev.targetId) ?? ev.targetId;
+        await prisma.$transaction([
+          prisma.idea.update({ where: { id }, data: { facets: ev.facets } }),
+          prisma.ideaChange.create({
+            data: {
+              ideaId: id,
+              property: 'facets',
+              previousValueText: renderFacets(ev.previousFacets),
+              valueText: renderFacets(ev.facets),
+              changedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
+            },
+          }),
+        ]);
+        changesLogged++;
+      }
+      // noop: idea re-stated with nothing new — no write.
+    }
+  }
+
+  // Fold the event stream into the resolved (post-collapse) idea view.
+  const resolvedMap = new Map<string, ResolvedIdea>();
+  for (const ev of events) {
+    if (ev.kind === 'create') {
+      resolvedMap.set(ev.targetId, {
+        action: 'create',
+        ...(realId.has(ev.targetId) ? { ideaId: realId.get(ev.targetId)! } : {}),
+        name: ev.name,
+        facets: ev.facets,
+        contributingDecks: decksInto.get(ev.targetId) ?? 1,
+      });
+    } else {
+      const existing = resolvedMap.get(ev.targetId);
+      if (existing) {
+        existing.facets = ev.facets; // latest merged state
+      } else {
+        // Update to a PRE-EXISTING idea (not created this run).
+        resolvedMap.set(ev.targetId, {
+          action: 'update',
+          ideaId: ev.targetId,
+          name: ev.name,
+          facets: ev.facets,
+          contributingDecks: decksInto.get(ev.targetId) ?? 1,
+        });
+      }
+    }
+  }
+  const resolved = [...resolvedMap.values()];
+  const ideasCreated = resolved.filter((r) => r.action === 'create').length;
+  const ideasUpdated = resolved.filter((r) => r.action === 'update').length;
+  const ideasUnchanged = events.filter((e) => e.kind === 'noop').length;
+
   logger.info(
-    { folderId: opts.folderId, apply: opts.apply, filesSeen, deckFiles, ideasFound, ideasPersisted },
+    { folderId: opts.folderId, apply: opts.apply, filesSeen, deckFiles, ideasFound, ideasResolved: resolved.length, ideasCreated, ideasUpdated, ideasPersisted, changesLogged },
     '[idea-runner] complete',
   );
 
@@ -132,8 +297,14 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
     extractionErrors,
     deckFiles,
     ideasFound,
+    ideasResolved: resolved.length,
+    ideasCreated,
+    ideasUpdated,
+    ideasUnchanged,
     ideasPersisted,
+    changesLogged,
     files,
+    resolved,
   };
 }
 
