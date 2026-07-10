@@ -46,6 +46,7 @@ import {
 import { processBackfillQueue } from './drive/backfill-queue';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
+import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
 
 type Mode =
   | 'poll'
@@ -56,7 +57,8 @@ type Mode =
   | 'sweep-expired'
   | 'backfill-pending'
   | 'merge-campaign-dupes'
-  | 'clear-account';
+  | 'clear-account'
+  | 'extract-ideas';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -68,6 +70,7 @@ const ALL_MODES: readonly Mode[] = [
   'backfill-pending',
   'merge-campaign-dupes',
   'clear-account',
+  'extract-ideas',
 ];
 
 interface ParsedArgs {
@@ -82,6 +85,9 @@ interface ParsedArgs {
   /** merge-campaign-dupes clustering tuning. */
   windowSize?: number;
   voteThreshold?: number;
+  /** extract-ideas targeting. */
+  campaignName?: string;
+  folderId?: string;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -185,6 +191,29 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
     if (!out.accountId && !out.accountName) {
       throw new Error('mode=clear-account requires --account-id <uuid> or --account-name <fragment>');
+    }
+  }
+
+  if (mode === 'extract-ideas') {
+    // --account-name X (or --account-id) + one of --campaign-name X | --folder-id X
+    // --confirm  (persist; absent = dry-run report)
+    for (let i = 1; i < positional.length; i++) {
+      const arg = positional[i]!;
+      if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
+      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
+      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
+      else if (arg.startsWith('--campaign-name=')) out.campaignName = arg.slice('--campaign-name='.length);
+      else if (arg === '--campaign-name') { out.campaignName = positional[i + 1]; i++; }
+      else if (arg.startsWith('--folder-id=')) out.folderId = arg.slice('--folder-id='.length);
+      else if (arg === '--folder-id') { out.folderId = positional[i + 1]; i++; }
+      else if (arg === '--confirm') out.confirm = true;
+    }
+    if (!out.accountId && !out.accountName) {
+      throw new Error('mode=extract-ideas requires --account-name <fragment> (or --account-id)');
+    }
+    if (!out.campaignName && !out.folderId) {
+      throw new Error('mode=extract-ideas requires --campaign-name <name> or --folder-id <drive folder id>');
     }
   }
 
@@ -294,6 +323,19 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
         ...(args.accountName ? { accountName: args.accountName } : {}),
         apply: args.confirm ?? false,
       });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'extract-ideas': {
+      // Focused idea extraction over a campaign/folder. No --confirm = dry-run
+      // (report the ideas found); --confirm persists them.
+      const target = await resolveIdeaTarget({
+        ...(args.accountId ? { accountId: args.accountId } : {}),
+        ...(args.accountName ? { accountName: args.accountName } : {}),
+        ...(args.campaignName ? { campaignName: args.campaignName } : {}),
+        ...(args.folderId ? { folderId: args.folderId } : {}),
+      });
+      const result = await runIdeaExtraction({ ...target, apply: args.confirm ?? false });
       return result as unknown as Record<string, unknown>;
     }
   }
