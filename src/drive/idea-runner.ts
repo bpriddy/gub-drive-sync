@@ -19,6 +19,7 @@
 import { prisma } from '../prisma';
 import { logger } from '../logger';
 import { traverseFolder } from './traversal';
+import { gatherFolders } from './structure';
 import { extractText } from './extract';
 import { extractIdeasFromFile, type DeckType, type ExtractedIdea } from './idea-extraction';
 
@@ -162,22 +163,44 @@ export async function resolveIdeaTarget(args: {
 
   // Target by campaign name → its folder; else by explicit --folder-id.
   if (args.campaignName) {
+    // First try a bootstrapped campaign row (fast).
     const campaign = await prisma.campaign.findFirst({
       where: { accountId: account.id, name: { contains: args.campaignName, mode: 'insensitive' } },
       select: { name: true, driveFolderId: true },
     });
-    if (!campaign) {
+    if (campaign?.driveFolderId) {
+      return {
+        folderId: campaign.driveFolderId,
+        folderLabel: `${account.name} / ${campaign.name}`,
+        accountName: account.name,
+        accountExternalId: account.driveFolderId,
+        campaignExternalId: campaign.driveFolderId,
+      };
+    }
+
+    // Fallback: no campaign row (e.g. account was nuked) — find the folder by
+    // name in the account's Drive tree. Prefer the shallowest match (the
+    // campaign root over a sub-folder that happens to share the word).
+    logger.info(
+      { accountName: account.name, campaignName: args.campaignName },
+      '[idea-runner] no campaign row — searching Drive folders by name',
+    );
+    const folders = await gatherFolders(account.driveFolderId, account.name);
+    const needle = args.campaignName.toLowerCase();
+    const match = folders
+      .filter((f) => f.name.toLowerCase().includes(needle))
+      .sort((a, b) => a.depth - b.depth)[0];
+    if (!match) {
       throw new Error(
-        `campaign ~"${args.campaignName}" not found for ${account.name} — if it isn't bootstrapped yet, pass --folder-id <drive folder id> instead`,
+        `no campaign row or Drive folder matching "${args.campaignName}" under ${account.name} — pass --folder-id <drive folder id> explicitly`,
       );
     }
-    if (!campaign.driveFolderId) throw new Error(`campaign "${campaign.name}" has no drive_folder_id`);
     return {
-      folderId: campaign.driveFolderId,
-      folderLabel: `${account.name} / ${campaign.name}`,
+      folderId: match.id,
+      folderLabel: `${account.name} / ${match.name}`,
       accountName: account.name,
       accountExternalId: account.driveFolderId,
-      campaignExternalId: campaign.driveFolderId,
+      campaignExternalId: match.id,
     };
   }
 
