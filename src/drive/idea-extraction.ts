@@ -1,28 +1,26 @@
 /**
  * idea-extraction.ts — #3 of the "leaf size" work: derive `ideas` (the
- * institutional-memory tier) from pitch artifacts.
+ * institutional-memory tier) from pitch decks and creative review decks.
  *
  * Runs PER FILE, alongside interpret.ts (which stays a pure observation
  * extractor — we don't bloat it). This is a separate, focused call because
  * carving N ideas out of a deck + right-sizing their facet rows is a
  * different, meatier job than "what does this file reveal about the account".
  *
- * Two things happen in one call:
- *   1. GATE — is this file a pitch artifact at all? Heavily weight the file
- *      NAME and FOLDER PATH (agency filenames are dense with intent: "Pitch",
- *      "RFP", "Concepts", "Round 2", "Deck", "Brief response"), CONFIRMED by
- *      content. Status reports / media plans / wrap decks / final deliverables
- *      are NOT pitch artifacts. Non-artifact → return empty, cheaply.
- *   2. SEGMENT + FACET — a single deck usually holds MULTIPLE distinct ideas.
- *      Split them, and for each emit right-sized facet rows: full
- *      natural-language phrases capturing whatever axes the idea activates
- *      (tone, mechanic, platform, cultural hook, references…), neither padded
- *      to prose nor truncated to keywords. The facet rows ARE the idea's
- *      description.
+ * TIGHTLY GATED — an idea is a thing PRESENTED AS an idea in one of exactly
+ * two artifact types, and nowhere else:
+ *   - a PITCH DECK        (concepts proposed to win/answer a brief), or
+ *   - a CREATIVE REVIEW DECK (creative presented for feedback/approval).
+ * Everything else — briefs, strategy/planning decks, media plans, status/wrap
+ * decks, final delivered creative, capabilities/credentials, SOPs — is `other`
+ * and yields NO ideas. We do not *infer* ideas from strategy, background, or
+ * execution notes; we only capture what the deck itself frames as a creative
+ * idea/concept/territory/route. If `deck_type` is `other`, ideas are dropped
+ * even if the model emitted some — the gate wins.
  *
  * Conservative by design (same discipline as the structure classifier and the
- * dedup): when a file isn't clearly a pitch artifact, emit nothing rather than
- * fabricate ideas. Persistence + external-id wiring is the caller's job.
+ * dedup): when a file isn't clearly one of the two idea decks, emit nothing
+ * rather than fabricate. Persistence + external-id wiring is the caller's job.
  */
 
 import { z } from 'zod';
@@ -38,6 +36,8 @@ const TEMPERATURE = 0.2;
 // truncates the JSON → parse failure → the file silently yields no ideas.
 const MAX_OUTPUT_TOKENS = 16384;
 
+export type DeckType = 'pitch' | 'creative_review' | 'other';
+
 export interface ExtractedIdea {
   /** The idea's handle/title, verbatim-ish from the deck. */
   name: string;
@@ -50,12 +50,13 @@ export interface ExtractedIdea {
 }
 
 export interface IdeaExtractionResult {
-  isPitchArtifact: boolean;
+  /** 'pitch' | 'creative_review' → an idea source; 'other' → yields no ideas. */
+  deckType: DeckType;
   ideas: ExtractedIdea[];
 }
 
 const ResponseSchemaZ = z.object({
-  is_pitch_artifact: z.boolean(),
+  deck_type: z.enum(['pitch', 'creative_review', 'other']),
   ideas: z
     .array(
       z.object({
@@ -69,7 +70,7 @@ const ResponseSchemaZ = z.object({
 const RESPONSE_SCHEMA: ResponseSchema = {
   type: SchemaType.OBJECT,
   properties: {
-    is_pitch_artifact: { type: SchemaType.BOOLEAN },
+    deck_type: { type: SchemaType.STRING, enum: ['pitch', 'creative_review', 'other'], format: 'enum' },
     ideas: {
       type: SchemaType.ARRAY,
       items: {
@@ -82,7 +83,7 @@ const RESPONSE_SCHEMA: ResponseSchema = {
       },
     },
   },
-  required: ['is_pitch_artifact', 'ideas'],
+  required: ['deck_type', 'ideas'],
 };
 
 function buildPrompt(args: {
@@ -91,7 +92,7 @@ function buildPrompt(args: {
   fileName: string;
   fileText: string;
 }): string {
-  return `You are mining an agency's Google Drive for PITCH IDEAS — the creative concepts the agency proposed to answer a brief. These become institutional memory: "have we already pitched something like this?"
+  return `You are mining an agency's Google Drive for PITCH IDEAS — creative concepts the agency proposed. These become institutional memory ("have we already pitched something like this?"), so precision matters more than recall: a wrong idea pollutes the memory.
 
 ACCOUNT: ${args.accountName ?? '(unknown)'}
 FILE NAME: ${args.fileName}
@@ -102,19 +103,23 @@ FILE CONTENT:
 ${args.fileText}
 """
 
-STEP 1 — IS THIS A PITCH ARTIFACT?
-A pitch artifact is a deck or doc that PROPOSES creative ideas/concepts to answer a brief (a pitch deck, an RFP/brief response, a concept round, a "big idea" doc).
+STEP 1 — WHAT KIND OF DECK IS THIS?  (deck_type)
+Ideas live in exactly TWO kinds of artifact, and NOWHERE else:
+  - "pitch"           — a PITCH DECK: creative concepts proposed to win or answer a brief (new business, an RFP response, a concept round against a client brief).
+  - "creative_review" — a CREATIVE REVIEW DECK: creative work/concepts presented internally or to the client for feedback or approval during development.
 
-Weight the FILE NAME and FOLDER PATH heavily — agency naming is dense with intent: "Pitch", "RFP", "Concepts", "Ideas", "Round 1/2", "Deck", "Brief Response", "Territories". BUT confirm with the content — filenames lie ("final_v7_ACTUAL"), so the slides must actually contain proposed creative ideas.
+Everything else is "other" → deck_type="other" and ideas=[]. Explicitly NOT idea sources:
+  briefs / RFPs that only state the ASK, strategy or planning decks, media plans, timelines, budgets, status / wrap / recap decks, final delivered creative, case studies, capabilities / credentials decks, SOPs, agency-internal material.
 
-NOT pitch artifacts (set is_pitch_artifact=false, ideas=[]): status reports, media plans, timelines, budgets, wrap/recap decks, final delivered creative, SOPs/capabilities/agency-internal decks, contact sheets, briefs that only state the ASK without proposing ideas.
+Weight the FILE NAME and FOLDER PATH heavily — agency naming is dense with intent ("Pitch", "Concepts", "Round 1/2", "Creative Review", "Territories", "R&D") — but CONFIRM with the content; filenames lie. If the deck does not actually PRESENT proposed creative ideas for a decision, it is "other".
 
-If it is NOT a pitch artifact → is_pitch_artifact=false and an empty ideas array. Do not fabricate ideas from a non-pitch file.
+STEP 2 — EXTRACT IDEAS  (only when deck_type is "pitch" or "creative_review")
+Extract ONLY things the deck itself PRESENTS AS an idea — a named creative concept, territory, route, or an explicit "here's our idea." These are the distinct creative directions the deck frames as ideas.
+Do NOT infer ideas from: the brief, the strategy, the insight, the background, the media plan, or execution/production notes. If it isn't presented as a creative idea, it is not one.
 
-STEP 2 — SEGMENT + FACET (only if it IS a pitch artifact)
-A single deck usually contains MULTIPLE distinct ideas (an agency answers a brief with several concepts). Split them into separate ideas. For each idea:
+For each idea:
   - name: the idea's handle/title as the deck calls it (verbatim when it has one; a short faithful label otherwise).
-  - facets: a list of RIGHT-SIZED natural-language rows — one per axis the idea activates. Capture whatever the idea leans on: tone, format/mechanic, platform/channel, cultural or seasonal hook, memes/references, casting, the core creative device. Examples of good rows:
+  - facets: RIGHT-SIZED natural-language rows — one per axis the idea activates (tone, format/mechanic, platform/channel, cultural or seasonal hook, memes/references, casting, the core creative device). Good rows:
       "tongue in cheek"
       "social-first campaign"
       "leverages the current World Cup"
@@ -123,15 +128,15 @@ A single deck usually contains MULTIPLE distinct ideas (an agency answers a brie
     Each row keeps the words that carry its meaning — do NOT pad to prose, do NOT compress to a bare keyword. The facet rows together ARE the idea's description.
 
 RULES
-  - Conservative: if unsure whether the file is a pitch artifact, lean is_pitch_artifact=false. Better to miss than to invent.
-  - Only emit ideas that are genuinely PROPOSED creative concepts — not the brief's requirements, not production notes, not the media plan.
-  - Distinct ideas only: if the deck presents one idea in several executions, that's ONE idea (the executions are facets), not several.`;
+  - The gate is strict: if it isn't clearly a pitch or creative_review deck, deck_type="other" and no ideas. Better to miss than to invent.
+  - One idea shown in several executions is ONE idea (the executions are facets), not several.
+  - Distinct creative concepts only — not the brief's requirements, not production notes, not the media plan.`;
 }
 
 /**
- * Extract pitch ideas from a single file. Returns {isPitchArtifact:false,
- * ideas:[]} for non-artifacts (the common case) — the caller skips persistence
- * for those. Throws on LLM/parse failure so the caller can log + continue.
+ * Extract pitch ideas from a single file. Returns deckType='other' + ideas=[]
+ * for non-idea-decks (the common case) — the caller skips persistence for
+ * those. Throws on LLM/parse failure so the caller can log + continue.
  */
 export async function extractIdeasFromFile(args: {
   file: TraversedFile;
@@ -166,15 +171,15 @@ export async function extractIdeasFromFile(args: {
     throw err;
   }
 
-  // Guard: even if the model set is_pitch_artifact=true, drop ideas with no
-  // name; and if it emitted ideas while claiming non-artifact, trust the ideas
-  // (content won over the gate).
+  // The gate WINS: a non-idea deck yields no ideas, even if the model listed
+  // some. This is the tightening — memory precision over recall.
+  if (parsed.deck_type === 'other') {
+    return { deckType: 'other', ideas: [] };
+  }
+
   const ideas = parsed.ideas
     .map((i) => ({ name: i.name.trim(), facets: i.facets.map((f) => f.trim()).filter(Boolean) }))
     .filter((i) => i.name.length > 0);
 
-  return {
-    isPitchArtifact: parsed.is_pitch_artifact || ideas.length > 0,
-    ideas,
-  };
+  return { deckType: parsed.deck_type, ideas };
 }
