@@ -66,33 +66,38 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
     if (file.isFolder) continue;
     filesSeen++;
 
-    const outcome = await extractText(file);
-    if (outcome.kind !== 'ok') continue;
-    filesExtracted++;
-
-    let res;
+    // Per-file try/catch — one unreadable file (a doc not shared with the bot,
+    // a corrupt export, an LLM hiccup) must not kill the whole run. Same
+    // discipline as the bootstrap's scanFolder/processFile.
     try {
-      res = await extractIdeasFromFile({ file, text: outcome.text, accountName: opts.accountName });
+      const outcome = await extractText(file);
+      if (outcome.kind !== 'ok') continue;
+      filesExtracted++;
+
+      const res = await extractIdeasFromFile({
+        file,
+        text: outcome.text,
+        accountName: opts.accountName,
+      });
+
+      if (res.deckType !== 'other') deckFiles++;
+      if (res.ideas.length > 0) {
+        ideasFound += res.ideas.length;
+        files.push({
+          fileName: file.name,
+          filePath: file.path,
+          fileId: file.id,
+          deckType: res.deckType,
+          ideas: res.ideas,
+        });
+        logger.info(
+          { fileName: file.name, deckType: res.deckType, ideaCount: res.ideas.length },
+          '[idea-runner] ideas found',
+        );
+      }
     } catch (err) {
       extractionErrors++;
-      logger.warn({ err, fileId: file.id }, '[idea-runner] idea extraction failed — skipped');
-      continue;
-    }
-
-    if (res.deckType !== 'other') deckFiles++;
-    if (res.ideas.length > 0) {
-      ideasFound += res.ideas.length;
-      files.push({
-        fileName: file.name,
-        filePath: file.path,
-        fileId: file.id,
-        deckType: res.deckType,
-        ideas: res.ideas,
-      });
-      logger.info(
-        { fileName: file.name, deckType: res.deckType, ideaCount: res.ideas.length },
-        '[idea-runner] ideas found',
-      );
+      logger.warn({ err, fileId: file.id, fileName: file.name }, '[idea-runner] file failed — skipped');
     }
   }
 
