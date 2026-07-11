@@ -75,6 +75,8 @@ export interface IdeaRunResult {
   ideasPersisted: number;
   /** Change-log rows written (creates + non-empty updates). */
   changesLogged: number;
+  /** Persist-phase writes that failed and were skipped (apply mode only). */
+  persistErrors: number;
   files: IdeaRunFileResult[];
   resolved: ResolvedIdea[];
 }
@@ -141,12 +143,12 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
         });
         logger.info(
           { fileName: file.name, deckType: res.deckType, ideaCount: res.ideas.length },
-          '[idea-runner] ideas found',
+          '[drive.idea-runner] ideas found',
         );
       }
     } catch (err) {
       extractionErrors++;
-      logger.warn({ err, fileId: file.id, fileName: file.name }, '[idea-runner] file failed — skipped');
+      logger.warn({ err, fileId: file.id, fileName: file.name }, '[drive.idea-runner] file failed — skipped');
     }
   }
 
@@ -180,14 +182,17 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
         }));
       } catch (err) {
         // Matcher failure must not lose the idea — fall back to a plain create.
-        logger.warn({ err, ideaName: idea.name }, '[idea-runner] match failed — creating as new');
+        logger.warn({ err, ideaName: idea.name }, '[drive.idea-runner] match failed — creating as new');
         matchId = null;
         mergedFacets = idea.facets;
       }
 
       if (matchId) {
         const target = known.find((k) => k.id === matchId)!;
-        decksInto.set(matchId, (decksInto.get(matchId) ?? 1) + 1);
+        // Base 0 for the match path: a pre-existing idea has no prior entry, so
+        // its first deck this run must count as 1 (0+1). Creates seed 1 below,
+        // so a same-run create-then-match still climbs 1→2 correctly.
+        decksInto.set(matchId, (decksInto.get(matchId) ?? 0) + 1);
         if (facetsEqual(target.facets, mergedFacets)) {
           events.push({ kind: 'noop', targetId: matchId, name: target.name, previousFacets: target.facets, facets: target.facets, sourceFileId: f.fileId });
         } else {
@@ -205,50 +210,73 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
 
   // ── Phase 3: PERSIST (apply only). Creates first map their synthetic id to a
   // real uuid; later updates that target a same-run create resolve through it.
+  // Per-event try/catch mirrors Phase 1/2: one failed write must not abort the
+  // rest of the run — a re-run heals a partial apply (created ideas land in
+  // `known` and re-match, so only the un-applied ideas are retried).
   const realId = new Map<string, string>();
   let ideasPersisted = 0;
   let changesLogged = 0;
+  let persistErrors = 0;
   if (opts.apply) {
     for (const ev of events) {
-      if (ev.kind === 'create') {
-        const created = await prisma.idea.create({
-          data: {
-            accountExternalId: opts.accountExternalId,
-            ...(opts.campaignExternalId ? { campaignExternalId: opts.campaignExternalId } : {}),
-            name: ev.name,
-            facets: ev.facets,
-            sourceFileId: ev.sourceFileId,
-          },
-        });
-        realId.set(ev.targetId, created.id);
-        await prisma.ideaChange.create({
-          data: {
-            ideaId: created.id,
-            property: 'facets',
-            previousValueText: null,
-            valueText: renderFacets(ev.facets),
-            changedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
-          },
-        });
-        ideasPersisted++;
-        changesLogged++;
-      } else if (ev.kind === 'update') {
-        const id = realId.get(ev.targetId) ?? ev.targetId;
-        await prisma.$transaction([
-          prisma.idea.update({ where: { id }, data: { facets: ev.facets } }),
-          prisma.ideaChange.create({
-            data: {
-              ideaId: id,
-              property: 'facets',
-              previousValueText: renderFacets(ev.previousFacets),
-              valueText: renderFacets(ev.facets),
-              changedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
-            },
-          }),
-        ]);
-        changesLogged++;
+      try {
+        if (ev.kind === 'create') {
+          // Entity + birth change-log written atomically — same discipline as
+          // the update branch and heal.ts. A create that committed without its
+          // birth row would leave the change log permanently incomplete (the
+          // ideas tier has no rebuild source to reconcile from).
+          const created = await prisma.$transaction(async (tx) => {
+            const c = await tx.idea.create({
+              data: {
+                accountExternalId: opts.accountExternalId,
+                ...(opts.campaignExternalId ? { campaignExternalId: opts.campaignExternalId } : {}),
+                name: ev.name,
+                facets: ev.facets,
+                sourceFileId: ev.sourceFileId,
+              },
+            });
+            await tx.ideaChange.create({
+              data: {
+                ideaId: c.id,
+                property: 'facets',
+                previousValueText: null,
+                valueText: renderFacets(ev.facets),
+                changedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
+              },
+            });
+            return c;
+          });
+          realId.set(ev.targetId, created.id);
+          ideasPersisted++;
+          changesLogged++;
+        } else if (ev.kind === 'update') {
+          const id = realId.get(ev.targetId) ?? ev.targetId;
+          // An unresolved synthetic id means this update targets a create that
+          // failed earlier this run — skip rather than write against a non-uuid.
+          if (id.startsWith('new:')) {
+            persistErrors++;
+            logger.warn({ targetId: ev.targetId, name: ev.name }, '[drive.idea-runner] update skipped — its create failed');
+            continue;
+          }
+          await prisma.$transaction([
+            prisma.idea.update({ where: { id }, data: { facets: ev.facets } }),
+            prisma.ideaChange.create({
+              data: {
+                ideaId: id,
+                property: 'facets',
+                previousValueText: renderFacets(ev.previousFacets),
+                valueText: renderFacets(ev.facets),
+                changedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
+              },
+            }),
+          ]);
+          changesLogged++;
+        }
+        // noop: idea re-stated with nothing new — no write.
+      } catch (err) {
+        persistErrors++;
+        logger.warn({ err, kind: ev.kind, name: ev.name, sourceFileId: ev.sourceFileId }, '[drive.idea-runner] persist failed — skipped');
       }
-      // noop: idea re-stated with nothing new — no write.
     }
   }
 
@@ -285,8 +313,8 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
   const ideasUnchanged = events.filter((e) => e.kind === 'noop').length;
 
   logger.info(
-    { folderId: opts.folderId, apply: opts.apply, filesSeen, deckFiles, ideasFound, ideasResolved: resolved.length, ideasCreated, ideasUpdated, ideasPersisted, changesLogged },
-    '[idea-runner] complete',
+    { folderId: opts.folderId, apply: opts.apply, filesSeen, deckFiles, ideasFound, ideasResolved: resolved.length, ideasCreated, ideasUpdated, ideasPersisted, changesLogged, persistErrors },
+    '[drive.idea-runner] complete',
   );
 
   return {
@@ -303,6 +331,7 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
     ideasUnchanged,
     ideasPersisted,
     changesLogged,
+    persistErrors,
     files,
     resolved,
   };
@@ -359,7 +388,7 @@ export async function resolveIdeaTarget(args: {
     // campaign root over a sub-folder that happens to share the word).
     logger.info(
       { accountName: account.name, campaignName: args.campaignName },
-      '[idea-runner] no campaign row — searching Drive folders by name',
+      '[drive.idea-runner] no campaign row — searching Drive folders by name',
     );
     const folders = await gatherFolders(account.driveFolderId, account.name);
     const needle = args.campaignName.toLowerCase();

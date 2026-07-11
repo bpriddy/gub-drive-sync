@@ -139,7 +139,7 @@ export async function matchAndMergeIdea(args: {
   try {
     parsed = ResponseSchemaZ.parse(parseLlmJson<unknown>(completion.text));
   } catch (err) {
-    logger.error({ err, raw: completion.text.slice(0, 400) }, '[idea-matcher] parse failed');
+    logger.error({ err, raw: completion.text.slice(0, 400) }, '[drive.idea-matcher] parse failed');
     throw err;
   }
 
