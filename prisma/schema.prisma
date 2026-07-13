@@ -1092,7 +1092,10 @@ model CampaignPiece {
   campaignId      String    @map("campaign_id") @db.Uuid
   name            String
   statusMarkdown  String?   @map("status_markdown") @db.Text
-  driveFolderId   String?   @map("drive_folder_id")
+  /// Sensitive companion (D28/D29, same design as Campaign). Pieces are
+  /// synthesis targets; the quad-output prompt always emits a sensitive tier.
+  statusSensitiveMarkdown String? @map("status_sensitive_markdown") @db.Text
+  driveFolderId   String?   @map("drive_folder_id") @unique
   driveFolderUrl  String?   @map("drive_folder_url")
   driveFolderPath String?   @map("drive_folder_path")
   driveLastRunAt  DateTime? @map("drive_last_run_at") @db.Timestamptz
@@ -1102,7 +1105,6 @@ model CampaignPiece {
   campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
 
   @@index([campaignId])
-  @@index([driveFolderId])
   @@map("campaign_pieces")
 }
 

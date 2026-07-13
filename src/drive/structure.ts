@@ -425,6 +425,14 @@ export interface EntityAttribution {
    * structure scan surfaced. Null when ownerType=account.
    */
   campaignStatus: 'existing' | 'new' | null;
+  /**
+   * Set when the campaign-root ancestor is a PIECE folder (campaign_pieces):
+   * the file belongs to this piece, whose content rolls up to the owning
+   * campaign (matchedCampaignId). Null for plain campaign/account attribution.
+   */
+  pieceId: string | null;
+  pieceName: string | null;
+  pieceFolderId: string | null;
 }
 
 export type Attributor = (
@@ -460,6 +468,10 @@ export interface PieceAnchor {
   driveFolderId: string;
   campaignId: string;
   campaignName: string;
+  /** The campaign_pieces row id — attribution reports it so files under this
+   *  folder bucket to the PIECE (fine detail), rolling up to the campaign. */
+  pieceId: string;
+  pieceName: string;
 }
 
 export function overlayPieceAnchors(map: EntityMap, pieces: PieceAnchor[]): EntityMap {
@@ -484,12 +496,14 @@ export function overlayPieceAnchors(map: EntityMap, pieces: PieceAnchor[]): Enti
   return { ...map, classified: [...kept, ...injected] };
 }
 
-export function buildAttributor(map: EntityMap): Attributor {
+export function buildAttributor(map: EntityMap, pieces: PieceAnchor[] = []): Attributor {
   const folderById = new Map<string, FolderNode>();
   for (const f of map.allFolders) folderById.set(f.id, f);
 
   const classifiedByFolderId = new Map<string, ClassifiedFolder>();
   for (const c of map.classified) classifiedByFolderId.set(c.folderId, c);
+
+  const pieceByFolderId = new Map(pieces.map((p) => [p.driveFolderId, p]));
 
   const accountAttribution: EntityAttribution = {
     ownerType: 'account',
@@ -497,6 +511,9 @@ export function buildAttributor(map: EntityMap): Attributor {
     campaignName: null,
     matchedCampaignId: null,
     campaignStatus: null,
+    pieceId: null,
+    pieceName: null,
+    pieceFolderId: null,
   };
 
   return (parentFolderId) => {
@@ -512,6 +529,10 @@ export function buildAttributor(map: EntityMap): Attributor {
         (classification.classification === 'existing_campaign' ||
           classification.classification === 'new_campaign')
       ) {
+        // When the campaign-root ancestor is a PIECE folder (overlaid from
+        // campaign_pieces), the file belongs to that piece — fine detail
+        // buckets there; the campaign identity is the piece's owner.
+        const piece = pieceByFolderId.get(currentId) ?? null;
         return {
           ownerType: 'campaign',
           campaignFolderId: currentId,
@@ -519,6 +540,9 @@ export function buildAttributor(map: EntityMap): Attributor {
           matchedCampaignId: classification.matchedCampaignId,
           campaignStatus:
             classification.classification === 'existing_campaign' ? 'existing' : 'new',
+          pieceId: piece?.pieceId ?? null,
+          pieceName: piece?.pieceName ?? null,
+          pieceFolderId: piece ? currentId : null,
         };
       }
       const folder = folderById.get(currentId);

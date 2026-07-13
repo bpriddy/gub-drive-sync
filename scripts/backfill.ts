@@ -801,7 +801,7 @@ function buildCampaignNameDirectory(
 
 /** Stage 3: per-entity distill+synth output, one entry per entity touched. */
 interface EntitySynthesisResult {
-  entityType: 'account' | 'campaign';
+  entityType: 'account' | 'campaign' | 'piece';
   entityName: string;
   /**
    * Status of the entity at synthesis time:
@@ -809,7 +809,7 @@ interface EntitySynthesisResult {
    * - 'existing': existing campaign (matched to a DB row).
    * - 'new': new campaign candidate (no DB row yet — distill is skipped).
    */
-  entityStatus: 'account' | 'existing' | 'new';
+  entityStatus: 'account' | 'existing' | 'new' | 'piece';
   observationsCount: number;
   filesCount: number;
   distillResult: {
@@ -979,9 +979,9 @@ interface ValidatedChange {
 
 /** Module-level Target type — used by both processBatch and persistTarget. */
 interface PersistTarget {
-  entityType: 'account' | 'campaign';
+  entityType: 'account' | 'campaign' | 'piece';
   entityName: string;
-  entityStatus: 'account' | 'existing' | 'new';
+  entityStatus: 'account' | 'existing' | 'new' | 'piece';
   entityId: string | null;
   campaignFolderId: string | null;
   /**
@@ -1004,6 +1004,10 @@ async function persistTarget(args: {
 }): Promise<void> {
   const { target, ctx, validatedChanges, synthesizedMarkdown, synthesizedSensitiveMarkdown } = args;
 
+  if (target.entityType === 'piece' && target.entityId) {
+    await persistPieceTarget(target.entityId, synthesizedMarkdown, synthesizedSensitiveMarkdown);
+    return;
+  }
   if (target.entityType === 'account' && target.entityId) {
     await persistAccountTarget(
       target.entityId,
@@ -1088,6 +1092,27 @@ async function persistTarget(args: {
     return;
   }
   throw new Error(`persistTarget: unsupported target shape (${target.entityType}/${target.entityStatus})`);
+}
+
+/**
+ * Persist a piece's synthesized markdown. Pieces have no *_changes audit
+ * table and no writable structured fields — markdown + last-run only.
+ */
+async function persistPieceTarget(
+  pieceId: string,
+  synthesizedMarkdown: string,
+  synthesizedSensitiveMarkdown: string | null,
+): Promise<void> {
+  await prisma.campaignPiece.update({
+    where: { id: pieceId },
+    data: {
+      statusMarkdown: synthesizedMarkdown,
+      ...(synthesizedSensitiveMarkdown !== null
+        ? { statusSensitiveMarkdown: synthesizedSensitiveMarkdown }
+        : {}),
+      driveLastRunAt: new Date(),
+    },
+  });
 }
 
 async function persistAccountTarget(
@@ -1441,6 +1466,12 @@ async function processBatch(
    * campaign.drive_folder_path on newly created campaigns.
    */
   folderPathById: Map<string, string> | null,
+  /**
+   * Pieces of the SCANNED campaign (campaign-scoped runs only; null for
+   * account scans). Used by regime-1 routing to bucket piece-tagged files
+   * (file.pieceId, set at discovery) to their piece.
+   */
+  piecesById: Map<string, { name: string; driveFolderId: string }> | null,
   applyToDb: boolean,
   /**
    * The "as-of" date for this scan in YYYY-MM-DD form. Used to stamp the
@@ -1462,6 +1493,21 @@ async function processBatch(
   // Legacy single campaign bucket — used when attributor is null (campaign
   // scans, or if structure hasn't been resolved for any reason).
   const legacyCampaignBucket: Array<{ observation: CampaignObservation; sourceFileId: string }> = [];
+  // Per-piece buckets — files under a piece's folder bucket to the PIECE
+  // (fine detail); their high-level rolls up to the owning campaign at
+  // synthesis time (absorb-up). Keyed by pieceId. Populated in account scans
+  // via attribution.pieceId (piece-anchor overlay) and in campaign scans via
+  // file.pieceId (tagged at discovery when gathering piece folders).
+  interface PieceBucket {
+    pieceId: string;
+    pieceName: string;
+    campaignId: string;
+    campaignName: string;
+    pieceFolderId: string;
+    observations: Array<{ observation: CampaignObservation; sourceFileId: string }>;
+    fileIds: Set<string>;
+  }
+  const pieceBuckets = new Map<string, PieceBucket>();
 
   const editors = new Map<string, number>();
 
@@ -1496,6 +1542,9 @@ async function processBatch(
         campaignName: ctx.campaignName,
         matchedCampaignId: null,
         campaignStatus: ctx.type === 'campaign' ? 'existing' : null,
+        pieceId: null,
+        pieceName: null,
+        pieceFolderId: null,
       };
     }
 
@@ -1564,12 +1613,59 @@ async function processBatch(
       //     in campaign folders nest under that campaign. Account-level
       //     files have no owner; campaign obs are discarded (counted).
       if (!attributor) {
-        // Regime 1
+        // Regime 1 — piece-tagged files (gathered from a piece's folder in a
+        // campaign-scoped scan) bucket to the piece; the rest to the campaign.
         for (const obs of res.campaign) {
+          if (file.pieceId && piecesById?.has(file.pieceId)) {
+            const info = piecesById.get(file.pieceId)!;
+            let pb = pieceBuckets.get(file.pieceId);
+            if (!pb) {
+              pb = {
+                pieceId: file.pieceId,
+                pieceName: info.name,
+                campaignId: ctx.id,
+                campaignName: ctx.name,
+                pieceFolderId: info.driveFolderId,
+                observations: [],
+                fileIds: new Set(),
+              };
+              pieceBuckets.set(file.pieceId, pb);
+            }
+            pb.observations.push({ observation: obs, sourceFileId: file.id });
+            pb.fileIds.add(file.id);
+            continue;
+          }
           legacyCampaignBucket.push({ observation: obs, sourceFileId: file.id });
         }
       } else {
         for (const obs of res.campaign) {
+          // Piece routing (account scans): the file lives under a piece's
+          // folder. Fine detail buckets to the piece — UNLESS the obs's tag
+          // names a DIFFERENT campaign than the piece's owner (genuine
+          // cross-reference → subject routing wins below).
+          if (attribution.pieceId && attribution.matchedCampaignId) {
+            const tag = (obs.entity_campaign_name ?? '').trim().toLowerCase();
+            const ownerName = (attribution.campaignName ?? '').trim().toLowerCase();
+            const tagIsForeign = tag !== '' && tag !== ownerName;
+            if (!tagIsForeign) {
+              let pb = pieceBuckets.get(attribution.pieceId);
+              if (!pb) {
+                pb = {
+                  pieceId: attribution.pieceId,
+                  pieceName: attribution.pieceName ?? '(unnamed piece)',
+                  campaignId: attribution.matchedCampaignId,
+                  campaignName: attribution.campaignName ?? '(unnamed)',
+                  pieceFolderId: attribution.pieceFolderId!,
+                  observations: [],
+                  fileIds: new Set(),
+                };
+                pieceBuckets.set(attribution.pieceId, pb);
+              }
+              pb.observations.push({ observation: obs, sourceFileId: file.id });
+              pb.fileIds.add(file.id);
+              continue;
+            }
+          }
           const routed = routeCampaignObs(obs, attribution, nameDirectory);
           if (routed.kind === 'discard') {
             campaignObsDiscarded += 1;
@@ -1644,7 +1740,12 @@ async function processBatch(
     if (fuzzyMatchedObs > 0) {
       log(`    Fuzzy-matched obs (typo-corrected): ${fuzzyMatchedObs}`);
     }
-  } else if (legacyCampaignBucket.length > 0) {
+  }
+
+  for (const pb of pieceBuckets.values()) {
+    log(`    Piece "${pb.pieceName}" (campaign "${pb.campaignName}")  ·  ${pb.observations.length} obs`);
+  }
+  if (legacyCampaignBucket.length > 0 && !attributor) {
     // Campaign scan: report the single bucket plainly.
     log(`    Campaign "${ctx.campaignName ?? ctx.name}"  ·  ${legacyCampaignBucket.length} obs`);
   }
@@ -1685,9 +1786,12 @@ async function processBatch(
   // re-extractions. The file-extraction work above ran ONCE per file.
 
   interface Target {
-    entityType: 'account' | 'campaign';
+    entityType: 'account' | 'campaign' | 'piece';
     entityName: string;
-    entityStatus: 'account' | 'existing' | 'new';
+    entityStatus: 'account' | 'existing' | 'new' | 'piece';
+    /** For piece targets: the owning campaign (absorb-up destination). */
+    pieceCampaignId?: string | null;
+    pieceCampaignName?: string | null;
     entityId: string | null; // null for new candidates; otherwise account or campaign id
     /** Campaign-root folder id. Set for both existing + new candidate targets. */
     campaignFolderId: string | null;
@@ -1801,6 +1905,38 @@ async function processBatch(
     });
   }
 
+  // Piece targets — one per piece bucket with observations. Pieces are
+  // markdown-only synthesis targets: no writable fields, no distillation,
+  // prior markdown from the campaign_pieces row.
+  const pieceBucketsList = Array.from(pieceBuckets.values());
+  if (pieceBucketsList.length > 0) {
+    const pieceRowsForTargets = await prisma.campaignPiece.findMany({
+      where: { id: { in: pieceBucketsList.map((b) => b.pieceId) } },
+      select: { id: true, statusMarkdown: true, statusSensitiveMarkdown: true },
+    });
+    const pieceRowById = new Map(pieceRowsForTargets.map((r) => [r.id, r]));
+    for (const pb of pieceBucketsList) {
+      if (pb.observations.length === 0) continue;
+      const row = pieceRowById.get(pb.pieceId);
+      targets.push({
+        entityType: 'piece',
+        entityName: pb.pieceName,
+        entityStatus: 'piece',
+        entityId: pb.pieceId,
+        campaignFolderId: pb.pieceFolderId,
+        campaignFolderPath: null,
+        pieceCampaignId: pb.campaignId,
+        pieceCampaignName: pb.campaignName,
+        accountState: ctx.accountState,
+        campaignState: null,
+        priorStatusMarkdown: row?.statusMarkdown ?? null,
+        priorSensitiveMarkdown: row?.statusSensitiveMarkdown ?? null,
+        observations: pb.observations,
+        fileIds: pb.fileIds,
+      });
+    }
+  }
+
   const synthesized: EntitySynthesisResult[] = [];
 
   if (targets.length === 0) {
@@ -1822,7 +1958,7 @@ async function processBatch(
     // can't be preempted by another worker — each entity's block is
     // atomic in the output, even though entity order may not match
     // input order.
-    const workerResults = await runWithConcurrency(targets, config.SYNTH_CONCURRENCY, async (target) => {
+    const synthesizeTarget = async (target: Target): Promise<EntitySynthesisResult> => {
       const lineBuffer: string[] = [];
       const wlog = (line = ''): void => {
         lineBuffer.push(line);
@@ -1832,6 +1968,7 @@ async function processBatch(
       const statusTag =
         target.entityStatus === 'account' ? 'account'
         : target.entityStatus === 'existing' ? 'existing campaign'
+        : target.entityStatus === 'piece' ? `piece of "${target.pieceCampaignName ?? '?'}"`
         : 'NEW campaign candidate';
       wlog(`  • ${statusTag}: "${target.entityName}"  ·  ${target.observations.length} obs / ${target.fileIds.size} file(s)`);
 
@@ -1852,14 +1989,23 @@ async function processBatch(
       // dev-run proposals.
       let distillResult: EntitySynthesisResult['distillResult'] = null;
       let validatedChanges: ValidatedChange[] = [];
+      if (target.entityType === 'piece') {
+        // Pieces are markdown-only: no writable fields → nothing to distill.
+        // Observations flow straight into synthesis below.
+        wlog('      (piece — markdown-only; distillation skipped)');
+      } else
       try {
+        // Captured OUTSIDE the closure: property narrowing ('piece' excluded
+        // by the guard above) doesn't propagate into callbacks.
+        const distillEntityType: 'account' | 'campaign' =
+          target.entityType === 'account' ? 'account' : 'campaign';
         const baseState =
           target.entityType === 'account'
             ? target.accountState
             : (target.campaignState ?? EMPTY_CAMPAIGN_STATE);
         const dry = await timed('distill', () =>
           runDryRunDistillation(
-            target.entityType,
+            distillEntityType,
             target.observations,
             baseState,
           ),
@@ -1963,7 +2109,9 @@ async function processBatch(
         const atAGlanceMap =
           target.entityType === 'account'
             ? accountFieldsAsMap(target.accountState)
-            : campaignFieldsAsMap(target.campaignState ?? EMPTY_CAMPAIGN_STATE);
+            : target.entityType === 'piece'
+              ? { Name: target.entityName, Campaign: target.pieceCampaignName ?? '—' }
+              : campaignFieldsAsMap(target.campaignState ?? EMPTY_CAMPAIGN_STATE);
         // Per D23: pre-prune expired transient bullets from prior blobs
         // BEFORE the LLM sees them. asOfDate = the scan day = editedAt.
         const priorGeneralTransient = pruneExpiredTransientBullets(
@@ -1979,7 +2127,11 @@ async function processBatch(
           entityType: target.entityType,
           entityName: target.entityName,
           parentContext:
-            target.entityType === 'campaign' ? `account: ${ctx.accountName}` : null,
+            target.entityType === 'campaign'
+              ? `account: ${ctx.accountName}`
+              : target.entityType === 'piece'
+                ? `campaign: ${target.pieceCampaignName ?? '?'} · account: ${ctx.accountName}`
+                : null,
           // Merge per-tier × per-durability against prior bullets (D25 + D23).
           currentContextBullets: extractContextSection(target.priorStatusMarkdown ?? '') ?? null,
           currentSensitiveBullets: extractContextSection(target.priorSensitiveMarkdown ?? '') ?? null,
@@ -2005,7 +2157,9 @@ async function processBatch(
           entityType: target.entityType,
           ...(target.entityType === 'account'
             ? { accountState: target.accountState }
-            : { campaignState: target.campaignState ?? EMPTY_CAMPAIGN_STATE }),
+            : target.entityType === 'piece'
+              ? { pieceFields: { Name: target.entityName, Campaign: target.pieceCampaignName ?? '—' } }
+              : { campaignState: target.campaignState ?? EMPTY_CAMPAIGN_STATE }),
         });
         synthesizedMarkdown = assembleStatusMarkdown({
           editedAt,
@@ -2063,9 +2217,72 @@ async function processBatch(
         synthesizedSensitiveMarkdown,
         synthesisMs,
       };
-    });
+    };
 
-    synthesized.push(...workerResults);
+    // ── Two-phase walk: pieces FIRST, then account/campaigns ─────────────
+    // A piece's high-level rolls up into its owning campaign's synthesis in
+    // the SAME scan (absorb-up), so pieces must finish before campaigns start.
+    const pieceTargets = targets.filter((t) => t.entityType === 'piece');
+    const mainTargets = targets.filter((t) => t.entityType !== 'piece');
+
+    const pieceResults =
+      pieceTargets.length > 0
+        ? await runWithConcurrency(pieceTargets, config.SYNTH_CONCURRENCY, synthesizeTarget)
+        : [];
+
+    // Absorb-up: one rollup bullet per piece, injected into the owning
+    // campaign target through the SAME channel as any approved bullet — the
+    // campaign synthesis dedupes/supersedes it like everything else. The
+    // stable source id `piece:<id>` keys supersession across re-runs.
+    // When the campaign has no direct obs this scan (piece-only day), a
+    // campaign target is CREATED so the rollup merges into the campaign's
+    // prior markdown NOW — a later scan won't have this piece's synthesis
+    // in hand, so deferring would drop the rollup.
+    for (let i = 0; i < pieceTargets.length; i++) {
+      const pt = pieceTargets[i]!;
+      const pr = pieceResults[i];
+      if (!pr || !pt.pieceCampaignId) continue;
+      const contextLines = (extractContextSection(pr.synthesizedMarkdown) ?? '')
+        .split('\n')
+        .map((l) => l.replace(/^-\s?/, '').trim())
+        .filter(Boolean);
+      const lead = contextLines[0];
+      if (!lead) continue;
+      let campaignTarget = mainTargets.find(
+        (t) => t.entityType === 'campaign' && t.entityId === pt.pieceCampaignId,
+      );
+      if (!campaignTarget) {
+        const row = await prisma.campaign.findUnique({ where: { id: pt.pieceCampaignId } });
+        if (!row) continue;
+        campaignTarget = {
+          entityType: 'campaign',
+          entityName: row.name,
+          entityStatus: 'existing',
+          entityId: row.id,
+          campaignFolderId: row.driveFolderId,
+          campaignFolderPath: null,
+          accountState: ctx.accountState,
+          campaignState: buildCampaignCurrentState(row),
+          priorStatusMarkdown: row.statusMarkdown ?? null,
+          priorSensitiveMarkdown: row.statusSensitiveMarkdown ?? null,
+          observations: [],
+          fileIds: new Set(),
+        };
+        mainTargets.push(campaignTarget);
+      }
+      campaignTarget.observations.push({
+        observation: { text: `Piece "${pt.entityName}": ${lead}` } as CampaignObservation,
+        sourceFileId: `piece:${pt.entityId}`,
+      });
+      log(`  ↑ absorb-up: piece "${pt.entityName}" → campaign "${campaignTarget.entityName}"`);
+    }
+
+    const mainResults =
+      mainTargets.length > 0
+        ? await runWithConcurrency(mainTargets, config.SYNTH_CONCURRENCY, synthesizeTarget)
+        : [];
+
+    synthesized.push(...pieceResults, ...mainResults);
   }
 
   return {
@@ -2257,6 +2474,27 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   log(`  Entity: ${ctx.type}: ${ctx.name}  (${ctx.id})`);
   log(`  Folder: ${ctx.folderId}`);
 
+  // Pieces of the scanned campaign (campaign scans only). Their folders are
+  // part of the campaign's content — often SIBLINGS of the campaign root
+  // (merged-variant folders) — so discovery gathers them too, tagging each
+  // file with its piece. Account scans resolve pieces via the attributor's
+  // piece-anchor overlay instead.
+  const ctxPieceRows =
+    ctx.type === 'campaign'
+      ? await prisma.campaignPiece.findMany({
+          where: { campaignId: ctx.id },
+          select: { id: true, name: true, driveFolderId: true },
+        })
+      : [];
+  const piecesById = new Map(
+    ctxPieceRows
+      .filter((p): p is typeof p & { driveFolderId: string } => !!p.driveFolderId)
+      .map((p) => [p.id, { name: p.name, driveFolderId: p.driveFolderId }]),
+  );
+  if (piecesById.size > 0) {
+    log(`  Pieces: ${piecesById.size} (folders gathered with the campaign)`);
+  }
+
   // ── Stage 1: structure-only mode ──────────────────────────────────────────
   // Resolve + print the entity map, then exit. No file extraction. This is
   // the isolated validation surface for the structure read — eyeball the
@@ -2369,6 +2607,8 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     const pieceRows = await prisma.campaignPiece.findMany({
       where: { campaign: { accountId: ctx.id } },
       select: {
+        id: true,
+        name: true,
         driveFolderId: true,
         campaignId: true,
         campaign: { select: { name: true } },
@@ -2380,6 +2620,8 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
         driveFolderId: p.driveFolderId,
         campaignId: p.campaignId,
         campaignName: p.campaign.name,
+        pieceId: p.id,
+        pieceName: p.name,
       }));
     if (pieceAnchors.length > 0) {
       entityMap = overlayPieceAnchors(entityMap, pieceAnchors);
@@ -2388,7 +2630,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     }
 
     folderPathById = new Map(entityMap.allFolders.map((f) => [f.id, f.path]));
-    attributor = buildAttributor(entityMap);
+    attributor = buildAttributor(entityMap, pieceAnchors);
     nameDirectory = buildCampaignNameDirectory(entityMap, existingCampaigns);
     log(
       `  Known-campaign vocabulary for per-file LLM: ${nameDirectory.knownCampaignNames.length} name${nameDirectory.knownCampaignNames.length === 1 ? '' : 's'}`,
@@ -2415,6 +2657,20 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     allFiles = await timed('file_discovery', () =>
       gatherFilesAuto(ctx.folderId, ctx.name, args.newestFirst),
     );
+    // Campaign scans also gather each piece's folder, tagging files with
+    // their piece. Piece-tagged copies WIN on id collision (a piece folder
+    // nested inside the campaign root would otherwise double-count).
+    if (piecesById.size > 0) {
+      const byId = new Map(allFiles.map((f) => [f.id, f]));
+      for (const [pieceId, info] of piecesById) {
+        const pieceFiles = await timed('file_discovery', () =>
+          gatherFilesRecursive(info.driveFolderId, `${ctx.name} · ${info.name}`, args.newestFirst),
+        );
+        for (const f of pieceFiles) byId.set(f.id, { ...f, pieceId });
+      }
+      allFiles = Array.from(byId.values());
+      log(`  + piece folders gathered (${piecesById.size}) → total ${allFiles.length} files`);
+    }
     log(`  Total files in folder: ${allFiles.length}`);
     if (allFiles.length === 0) {
       log('  Nothing to do. Exiting.');
@@ -2546,6 +2802,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       attributor,
       nameDirectory,
       folderPathById,
+      piecesById.size > 0 ? piecesById : null,
       !args.dryrun,
       nextDay.date,
     );
@@ -2562,9 +2819,11 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       const header =
         result.entityStatus === 'account'
           ? `Account: "${result.entityName}"`
-          : result.entityStatus === 'existing'
-            ? `Campaign (existing): "${result.entityName}"`
-            : `Campaign (NEW candidate): "${result.entityName}"`;
+          : result.entityStatus === 'piece'
+            ? `Piece: "${result.entityName}"`
+            : result.entityStatus === 'existing'
+              ? `Campaign (existing): "${result.entityName}"`
+              : `Campaign (NEW candidate): "${result.entityName}"`;
       log(`  ▸ ${header}`);
       log(
         `     ${result.observationsCount} obs / ${result.filesCount} file(s)  ·  synthesis ${fmtMs(result.synthesisMs)}`,

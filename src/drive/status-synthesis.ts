@@ -80,7 +80,7 @@ export const STATUS_SYNTHESIS_V1_VERSION = 'status-synthesis-v1';
 // ── Prompt template ─────────────────────────────────────────────────────────
 
 export interface StatusSynthesisV1Inputs {
-  entityType: 'campaign' | 'account';
+  entityType: 'campaign' | 'account' | 'piece';
   entityName: string;
   /** Short string describing the parent ("account: Acme Corp"), or null. */
   parentContext: string | null;
@@ -396,18 +396,22 @@ export function campaignFieldsAsMap(s: CampaignCurrentState): Record<string, str
  * above).
  */
 export function renderAtAGlanceBullets(args: {
-  entityType: 'account' | 'campaign';
+  entityType: 'account' | 'campaign' | 'piece';
   accountState?: AccountCurrentState | null;
   campaignState?: CampaignCurrentState | null;
+  /** Pieces have no structured columns; their at-a-glance is name + owner. */
+  pieceFields?: Record<string, string> | null;
 }): string {
   const map =
     args.entityType === 'account'
       ? accountFieldsAsMap(
           args.accountState ?? throwBadInput('accountState required for entityType=account'),
         )
-      : campaignFieldsAsMap(
-          args.campaignState ?? throwBadInput('campaignState required for entityType=campaign'),
-        );
+      : args.entityType === 'piece'
+        ? (args.pieceFields ?? throwBadInput('pieceFields required for entityType=piece'))
+        : campaignFieldsAsMap(
+            args.campaignState ?? throwBadInput('campaignState required for entityType=campaign'),
+          );
   return Object.entries(map)
     .map(([label, value]) => `- ${label}: ${value}`)
     .join('\n');

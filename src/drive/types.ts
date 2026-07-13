@@ -31,6 +31,13 @@ export interface TraversedFile {
   /** True when this file is itself a folder (children were walked). */
   isFolder: boolean;
   /**
+   * Set by campaign-scoped backfill discovery when the file was gathered
+   * from a campaign_piece's folder: the piece's row id. Files with this tag
+   * bucket to the PIECE (fine detail) instead of the campaign's flat bucket.
+   * Serializes with the bootstrap files cache, so chunks 2..N keep it.
+   */
+  pieceId?: string;
+  /**
    * For files with mimeType='application/vnd.google-apps.shortcut':
    * the target the shortcut points to. The extractor follows this
    * (single-level) to extract from the actual file. Null for non-

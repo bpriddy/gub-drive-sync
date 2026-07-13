@@ -86,17 +86,23 @@ const before = buildAttributor(map)('f-13-decks');
 check('without overlay: re-split (new campaign)', { owner: before.ownerType, status: before.campaignStatus }, { owner: 'campaign', status: 'new' });
 
 // WITH overlay: folder 13 is a piece of camp-bhac → routes to the EXISTING campaign.
-const overlaid = overlayPieceAnchors(map, [
-  { driveFolderId: 'f-13', campaignId: 'camp-bhac', campaignName: '02. Chevy | BHAC' },
-]);
-const after = buildAttributor(overlaid)('f-13-decks');
+const anchors = [
+  { driveFolderId: 'f-13', campaignId: 'camp-bhac', campaignName: '02. Chevy | BHAC', pieceId: 'piece-13', pieceName: '13. Chevy | BHAC AI + LMA Tool' },
+];
+const overlaid = overlayPieceAnchors(map, anchors);
+const after = buildAttributor(overlaid, anchors)('f-13-decks');
 check('with overlay: routes to owning campaign', { owner: after.ownerType, status: after.campaignStatus, id: after.matchedCampaignId }, { owner: 'campaign', status: 'existing', id: 'camp-bhac' });
+check('attribution carries the PIECE identity', { pieceId: after.pieceId, pieceName: after.pieceName, folder: after.pieceFolderId }, { pieceId: 'piece-13', pieceName: '13. Chevy | BHAC AI + LMA Tool', folder: 'f-13' });
+
+// A file under the campaign's OWN root gets campaign attribution, no piece.
+const campaignRootFile = buildAttributor(overlaid, anchors)('f-02');
+check('campaign-root file has NO piece identity', { id: campaignRootFile.matchedCampaignId, pieceId: campaignRootFile.pieceId }, { id: 'camp-bhac', pieceId: null });
 
 // The LLM's stale new_campaign classification for f-13 is dropped.
 check('LLM classification for piece folder dropped', overlaid.classified.filter((c) => c.folderId === 'f-13').map((c) => c.classification), ['existing_campaign']);
 
 // A piece folder NOT in this tree injects nothing.
-const foreign = overlayPieceAnchors(map, [{ driveFolderId: 'f-elsewhere', campaignId: 'x', campaignName: 'X' }]);
+const foreign = overlayPieceAnchors(map, [{ driveFolderId: 'f-elsewhere', campaignId: 'x', campaignName: 'X', pieceId: 'p-x', pieceName: 'X piece' }]);
 check('foreign piece folder ignored', foreign.classified.length, map.classified.length);
 
 console.log(failures === 0 ? '\n🎯 ALL PASS' : `\n⚠ ${failures} failure(s)`);
