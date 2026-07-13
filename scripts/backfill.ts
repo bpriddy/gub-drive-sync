@@ -1616,6 +1616,14 @@ async function processBatch(
         // Regime 1 — piece-tagged files (gathered from a piece's folder in a
         // campaign-scoped scan) bucket to the piece; the rest to the campaign.
         for (const obs of res.campaign) {
+          if (file.pieceId && !piecesById?.has(file.pieceId)) {
+            // Cached piece tag no longer matches a piece of THIS campaign
+            // (piece re-owned/deleted mid-chain). No wrong writes: drop the
+            // obs rather than synthesize foreign content into the scanned
+            // campaign. The piece's new owner picks it up on its own scan.
+            campaignObsDiscarded += 1;
+            continue;
+          }
           if (file.pieceId && piecesById?.has(file.pieceId)) {
             const info = piecesById.get(file.pieceId)!;
             let pb = pieceBuckets.get(file.pieceId);
@@ -1644,9 +1652,21 @@ async function processBatch(
           // names a DIFFERENT campaign than the piece's owner (genuine
           // cross-reference → subject routing wins below).
           if (attribution.pieceId && attribution.matchedCampaignId) {
-            const tag = (obs.entity_campaign_name ?? '').trim().toLowerCase();
-            const ownerName = (attribution.campaignName ?? '').trim().toLowerCase();
-            const tagIsForeign = tag !== '' && tag !== ownerName;
+            // Foreign only when the tag RESOLVES (same fuzzy matcher the
+            // fall-through routing uses) to a known campaign other than the
+            // piece's owner. A tag that resolves to the owner — or to nothing
+            // known — stays at the piece: byte-level name drift must never
+            // bounce piece detail to the campaign tier or mint a phantom.
+            const tagRaw = (obs.entity_campaign_name ?? '').trim();
+            let tagIsForeign = false;
+            if (tagRaw !== '' && nameDirectory) {
+              const m = matchCampaignName(tagRaw, nameDirectory.knownCampaignNames);
+              if (m) {
+                const resolved = m.matched.trim().toLowerCase();
+                const ownerName = (attribution.campaignName ?? '').trim().toLowerCase();
+                tagIsForeign = resolved !== ownerName;
+              }
+            }
             if (!tagIsForeign) {
               let pb = pieceBuckets.get(attribution.pieceId);
               if (!pb) {

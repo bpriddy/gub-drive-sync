@@ -565,7 +565,14 @@ export async function runCampaignMerge(
   if (opts.apply && variantsMergedCount > 0) {
     await prisma.account.update({
       where: { id: account.id },
-      data: { driveStructureClassification: Prisma.JsonNull },
+      data: {
+        driveStructureClassification: Prisma.JsonNull,
+        // Files cache too: a mid-chain merge mints piece rows whose folders
+        // aren't in the cached file list — a later chunk cache-HIT would
+        // never gather them (and the chain would then mark bootstrap
+        // complete with the piece's files never scanned).
+        driveBootstrapFiles: Prisma.JsonNull,
+      },
     });
     logger.info(
       { accountId: account.id },
