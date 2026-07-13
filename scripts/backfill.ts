@@ -115,11 +115,13 @@ import {
   buildAttributor,
   classifyFolders,
   gatherFolders,
+  overlayPieceAnchors,
   type Attributor,
   type ClassifiedFolder,
   type EntityAttribution,
   type EntityMap,
   type FolderNode,
+  type PieceAnchor,
 } from '../src/drive/structure';
 import { matchCampaignName } from '../src/drive/name-similarity';
 import type { TraversedFile } from '../src/drive/types';
@@ -982,6 +984,13 @@ interface PersistTarget {
   entityStatus: 'account' | 'existing' | 'new';
   entityId: string | null;
   campaignFolderId: string | null;
+  /**
+   * Deterministic folder breadcrumb (FolderNode.path) for folder-backed
+   * campaign targets; null for account / phantom targets. Persisted to
+   * campaign.drive_folder_path so the merge's year gate can read the
+   * structural year (the "… / 2026 / …" segment).
+   */
+  campaignFolderPath: string | null;
 }
 
 // ── Apply (persist) a single target's distilled + synthesized result ────────
@@ -1010,12 +1019,31 @@ async function persistTarget(args: {
       validatedChanges,
       synthesizedMarkdown,
       synthesizedSensitiveMarkdown,
+      target.campaignFolderPath,
     );
     return;
   }
   if (target.entityType === 'campaign' && target.entityStatus === 'new') {
     if (ctx.type !== 'account') {
       throw new Error('new campaign candidate requires account ctx');
+    }
+    // Guard: a folder that is already a PIECE of a merged campaign must never
+    // be re-created as a campaign (the re-split bug). The piece-anchor overlay
+    // routes these upstream, so this firing means attribution missed — prefer
+    // NO write over a WRONG one: this target's synthesis was built with a null
+    // prior, so writing it onto the owning campaign would clobber the
+    // canonical's markdown. Skip and let the next scan route it correctly.
+    if (target.campaignFolderId) {
+      const piece = await prisma.campaignPiece.findFirst({
+        where: { driveFolderId: target.campaignFolderId },
+        select: { id: true, campaignId: true },
+      });
+      if (piece) {
+        log(
+          `      ⚠ folder ${target.campaignFolderId} is already piece ${piece.id} of campaign ${piece.campaignId} — skipping campaign create (overlay should have routed this)`,
+        );
+        return;
+      }
     }
     // Idempotency: a campaign may already exist for this candidate. Two
     // dedup keys depending on bucket source:
@@ -1044,6 +1072,7 @@ async function persistTarget(args: {
         validatedChanges,
         synthesizedMarkdown,
         synthesizedSensitiveMarkdown,
+        target.campaignFolderPath,
       );
       return;
     }
@@ -1051,6 +1080,7 @@ async function persistTarget(args: {
       accountId: ctx.id,
       campaignName: target.entityName,
       driveFolderId: target.campaignFolderId,
+      driveFolderPath: target.campaignFolderPath,
       validatedChanges,
       synthesizedMarkdown,
       synthesizedSensitiveMarkdown,
@@ -1121,6 +1151,9 @@ async function persistExistingCampaignTarget(
   validatedChanges: ValidatedChange[],
   synthesizedMarkdown: string,
   synthesizedSensitiveMarkdown: string | null,
+  /** Heals drive_folder_path on rows created before path plumbing existed.
+   *  Only written when non-null — never clobbers a real path with null. */
+  driveFolderPath?: string | null,
 ): Promise<void> {
   const columnUpdates: Record<string, unknown> = {};
   for (const vc of validatedChanges) {
@@ -1129,6 +1162,9 @@ async function persistExistingCampaignTarget(
   columnUpdates['statusMarkdown'] = synthesizedMarkdown;
   if (synthesizedSensitiveMarkdown !== null) {
     columnUpdates['statusSensitiveMarkdown'] = synthesizedSensitiveMarkdown;
+  }
+  if (driveFolderPath) {
+    columnUpdates['driveFolderPath'] = driveFolderPath;
   }
 
   await prisma.$transaction(async (tx) => {
@@ -1180,6 +1216,12 @@ async function persistNewCampaignTarget(args: {
    * folder later if structure resolution discovers one matching by name.
    */
   driveFolderId: string | null;
+  /**
+   * Deterministic folder breadcrumb (FolderNode.path). Persisted so the
+   * merge's year gate can read the structural year folder ("… / 2026 / …").
+   * Null for phantom candidates.
+   */
+  driveFolderPath: string | null;
   validatedChanges: ValidatedChange[];
   synthesizedMarkdown: string;
   synthesizedSensitiveMarkdown: string | null;
@@ -1188,6 +1230,7 @@ async function persistNewCampaignTarget(args: {
     accountId,
     campaignName,
     driveFolderId,
+    driveFolderPath,
     validatedChanges,
     synthesizedMarkdown,
     synthesizedSensitiveMarkdown,
@@ -1208,6 +1251,7 @@ async function persistNewCampaignTarget(args: {
         accountId,
         createdBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
         driveFolderId,
+        driveFolderPath,
         statusMarkdown: synthesizedMarkdown,
         ...(synthesizedSensitiveMarkdown !== null
           ? { statusSensitiveMarkdown: synthesizedSensitiveMarkdown }
@@ -1391,6 +1435,12 @@ async function processBatch(
    * key (existing campaignId or structure-discovered folderId).
    */
   nameDirectory: CampaignNameDirectory | null,
+  /**
+   * FolderNode.path by folder id (deterministic breadcrumb), from the
+   * structure walk. Null when attributor is null. Used to stamp
+   * campaign.drive_folder_path on newly created campaigns.
+   */
+  folderPathById: Map<string, string> | null,
   applyToDb: boolean,
   /**
    * The "as-of" date for this scan in YYYY-MM-DD form. Used to stamp the
@@ -1641,6 +1691,8 @@ async function processBatch(
     entityId: string | null; // null for new candidates; otherwise account or campaign id
     /** Campaign-root folder id. Set for both existing + new candidate targets. */
     campaignFolderId: string | null;
+    /** Deterministic breadcrumb for the folder (see PersistTarget). */
+    campaignFolderPath: string | null;
     accountState: AccountCurrentState;
     campaignState: CampaignCurrentState | null;
     /** Prior persisted status_markdown (general) — merge base for general tier. */
@@ -1663,6 +1715,7 @@ async function processBatch(
       entityStatus: 'account',
       entityId: ctx.type === 'account' ? ctx.id : null,
       campaignFolderId: null,
+      campaignFolderPath: null,
       accountState: ctx.accountState,
       campaignState: null,
       priorStatusMarkdown: ctx.statusMarkdown,
@@ -1718,6 +1771,10 @@ async function processBatch(
         entityStatus: bucket.campaignStatus,
         entityId: bucket.matchedCampaignId,
         campaignFolderId: bucket.campaignFolderId,
+        campaignFolderPath:
+          bucket.campaignFolderId !== null
+            ? folderPathById?.get(bucket.campaignFolderId) ?? null
+            : null,
         accountState: ctx.accountState,
         campaignState,
         priorStatusMarkdown,
@@ -1734,6 +1791,7 @@ async function processBatch(
       entityStatus: 'existing',
       entityId: ctx.id,
       campaignFolderId: ctx.folderId,
+      campaignFolderPath: null,
       accountState: ctx.accountState,
       campaignState: ctx.campaignState ?? EMPTY_CAMPAIGN_STATE,
       priorStatusMarkdown: ctx.statusMarkdown,
@@ -2221,6 +2279,10 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   // and don't need cross-campaign attribution.
   let attributor: Attributor | null = null;
   let nameDirectory: CampaignNameDirectory | null = null;
+  /** FolderNode.path by folder id — the deterministic breadcrumb (NOT the
+   *  LLM-echoed folder_path). Used to persist campaign.driveFolderPath at
+   *  creation so the merge's year gate has a structural year to read. */
+  let folderPathById: Map<string, string> | null = null;
   if (ctx.type === 'account') {
     log(rule('Resolve structure (Stage 2 — file→entity attribution)'));
     // existingCampaigns is read fresh every chunk — auto-created
@@ -2298,6 +2360,34 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       `  Classified: ${classifiedCounts.existing} existing campaigns, ${classifiedCounts.fresh} new candidates, ${classifiedCounts.acct} account-level  [${entityMap.driver}]`,
     );
     log('');
+
+    // ── Piece-anchor overlay — fresh from the DB every chunk, NEVER cached.
+    // Folders that belong to a campaign via campaign_pieces (merged-variant
+    // folders) are pinned to their owning campaign, overriding whatever the
+    // LLM classified them as. This is what makes a merge STICK: without it
+    // the next scan re-creates the merged folder as a new campaign.
+    const pieceRows = await prisma.campaignPiece.findMany({
+      where: { campaign: { accountId: ctx.id } },
+      select: {
+        driveFolderId: true,
+        campaignId: true,
+        campaign: { select: { name: true } },
+      },
+    });
+    const pieceAnchors: PieceAnchor[] = pieceRows
+      .filter((p): p is typeof p & { driveFolderId: string } => !!p.driveFolderId)
+      .map((p) => ({
+        driveFolderId: p.driveFolderId,
+        campaignId: p.campaignId,
+        campaignName: p.campaign.name,
+      }));
+    if (pieceAnchors.length > 0) {
+      entityMap = overlayPieceAnchors(entityMap, pieceAnchors);
+      log(`  Piece anchors: ${pieceAnchors.length} folder(s) pinned to their owning campaign`);
+      log('');
+    }
+
+    folderPathById = new Map(entityMap.allFolders.map((f) => [f.id, f.path]));
     attributor = buildAttributor(entityMap);
     nameDirectory = buildCampaignNameDirectory(entityMap, existingCampaigns);
     log(
@@ -2455,6 +2545,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       ctx,
       attributor,
       nameDirectory,
+      folderPathById,
       !args.dryrun,
       nextDay.date,
     );

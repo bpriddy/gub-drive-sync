@@ -125,7 +125,103 @@ export interface RunCampaignMergeOptions {
   voteThreshold?: number;
 }
 
-type ClusterOutcome = 'merged' | 'would-merge' | 'skipped' | 'failed' | 'below-confidence';
+type ClusterOutcome =
+  | 'merged'
+  | 'would-merge'
+  | 'skipped'
+  | 'failed'
+  | 'below-confidence'
+  | 'year-blocked';
+
+// ── Year gate ────────────────────────────────────────────────────────────────
+//
+// A campaign = a name + a year. "Truck Season 2025" and a Truck Season under
+// the 2024 folder are TWO campaigns. The year is STRUCTURAL: project folders
+// live under year folders (… / 2026 / 13. Chevy | BHAC …), captured in
+// campaign.drive_folder_path at creation. The detector clusters by name
+// meaning only; this gate then keeps together only same-year members.
+//
+// Policy (locked): unknown year never merges — not with a known year, not
+// with another unknown. Conservative: we can't verify "same year", so we
+// don't collapse. Folder-less (phantom) campaigns therefore never merge here.
+
+/**
+ * Extract the year from a folder breadcrumb path. Only an EXACT 4-digit
+ * segment counts (the year FOLDER, e.g. "… / 2026 / …") — a year embedded in
+ * a title ("Holiday 2026") is the campaign's name, not its shelf location.
+ * Deepest matching segment wins. Null = no structural year.
+ */
+export function extractYearFromPath(path: string | null): number | null {
+  if (!path) return null;
+  let year: number | null = null;
+  for (const seg of path.split(' / ')) {
+    if (/^(19|20)\d{2}$/.test(seg.trim())) year = Number(seg.trim());
+  }
+  return year;
+}
+
+export interface YearPartition {
+  /** Same-year sub-clusters (size >= 2) that may proceed to merge. */
+  subClusters: Array<DetectedCluster & { year: number }>;
+  /** Member ids excluded: no structural year on their folder path. */
+  droppedUnknownYear: string[];
+  /** Member ids excluded: alone in their year after partitioning. */
+  droppedSingleton: string[];
+}
+
+/**
+ * Partition a detected cluster by member year. The detector judged the NAMES
+ * to be one campaign; this decides which members share the YEAR and may
+ * actually collapse. Keeps the original canonical when it lands in a
+ * sub-cluster; otherwise the sub-cluster's first member (roster order —
+ * detectCampaignClustersWindowed already re-derived canonicals code-side)
+ * becomes canonical.
+ */
+export function partitionClusterByYear(
+  cluster: DetectedCluster,
+  yearOf: Map<string, number | null>,
+): YearPartition {
+  const nameOf = new Map<string, string>([
+    [cluster.canonicalId, cluster.canonicalName],
+    ...cluster.variantIds.map((id, i) => [id, cluster.variantNames[i] ?? '(unknown)'] as const),
+  ]);
+  const memberIds = [cluster.canonicalId, ...cluster.variantIds];
+
+  const byYear = new Map<number, string[]>();
+  const droppedUnknownYear: string[] = [];
+  for (const id of memberIds) {
+    const year = yearOf.get(id) ?? null;
+    if (year === null) {
+      droppedUnknownYear.push(id);
+      continue;
+    }
+    const arr = byYear.get(year) ?? [];
+    arr.push(id);
+    byYear.set(year, arr);
+  }
+
+  const subClusters: Array<DetectedCluster & { year: number }> = [];
+  const droppedSingleton: string[] = [];
+  for (const [year, ids] of byYear) {
+    if (ids.length < 2) {
+      droppedSingleton.push(...ids);
+      continue;
+    }
+    const canonicalId = ids.includes(cluster.canonicalId) ? cluster.canonicalId : ids[0]!;
+    const variantIds = ids.filter((id) => id !== canonicalId);
+    subClusters.push({
+      canonicalId,
+      canonicalName: nameOf.get(canonicalId)!,
+      variantIds,
+      variantNames: variantIds.map((id) => nameOf.get(id)!),
+      confidence: cluster.confidence,
+      reasoning: `${cluster.reasoning} [year-gate: ${year}]`,
+      year,
+    });
+  }
+
+  return { subClusters, droppedUnknownYear, droppedSingleton };
+}
 
 export interface ClusterReport {
   canonicalId: string;
@@ -199,6 +295,9 @@ async function applyCluster(
       endsAt: true,
       statusMarkdown: true,
       statusSensitiveMarkdown: true,
+      driveFolderId: true,
+      driveFolderUrl: true,
+      driveFolderPath: true,
     },
   });
 
@@ -265,10 +364,42 @@ async function applyCluster(
     // collisions instead of a blind redirect (see redirectAccessGrants).
     await redirectAccessGrants(tx, cluster.canonicalId, variantIds);
 
-    // 3. Delete variant rows.
+    // 3. Variant folders become PIECES of the canonical. The merge collapses
+    //    campaign IDENTITY, never content: each variant's populated directory
+    //    holds distinct material and must keep being scanned — as a
+    //    campaign_piece owned by the canonical. Must point at the CANONICAL:
+    //    campaign_pieces.campaign_id is ON DELETE CASCADE, so a piece pointed
+    //    at the variant would be silently destroyed by step 4's delete.
+    //    Runs BEFORE the delete so a mid-tx failure can't lose the folder.
+    //    findFirst guard: driveFolderId has no unique constraint; a re-merged
+    //    folder must not mint a duplicate piece.
+    const piecesMinted: Record<string, string> = {}; // variantId → pieceId
+    for (const v of variantRows) {
+      if (!v.driveFolderId) continue; // phantom (folder-less) variant — nothing to preserve
+      const existing = await tx.campaignPiece.findFirst({
+        where: { driveFolderId: v.driveFolderId },
+        select: { id: true },
+      });
+      if (existing) {
+        piecesMinted[v.id] = existing.id;
+        continue;
+      }
+      const piece = await tx.campaignPiece.create({
+        data: {
+          campaignId: cluster.canonicalId,
+          name: v.name,
+          driveFolderId: v.driveFolderId,
+          driveFolderUrl: v.driveFolderUrl,
+          driveFolderPath: v.driveFolderPath,
+        },
+      });
+      piecesMinted[v.id] = piece.id;
+    }
+
+    // 4. Delete variant rows.
     await tx.campaign.deleteMany({ where: { id: { in: variantIds } } });
 
-    // 4. Audit log — one entry per merged variant.
+    // 5. Audit log — one entry per merged variant.
     for (const v of variantRows) {
       await tx.auditLog.create({
         data: {
@@ -290,6 +421,7 @@ async function applyCluster(
             canonicalName: cluster.canonicalName,
             confidence: cluster.confidence,
             reasoning: cluster.reasoning,
+            ...(piecesMinted[v.id] ? { pieceId: piecesMinted[v.id] } : {}),
           } as Prisma.InputJsonValue,
         },
       });
@@ -312,11 +444,18 @@ export async function runCampaignMerge(
       name: true,
       status: true,
       driveFolderId: true,
+      driveFolderPath: true,
       statusMarkdown: true,
       createdAt: true,
     },
     orderBy: { createdAt: 'asc' },
   });
+
+  // Year per campaign, from the structural folder path (persisted at
+  // creation). Null = no year folder in the path (or path never persisted).
+  const yearOf = new Map<string, number | null>(
+    campaigns.map((c) => [c.id, extractYearFromPath(c.driveFolderPath)]),
+  );
 
   logger.info(
     { accountId: account.id, accountName: account.name, campaignCount: campaigns.length, apply: opts.apply },
@@ -351,36 +490,87 @@ export async function runCampaignMerge(
       continue;
     }
 
-    if (!opts.apply) {
-      clusterReports.push({ ...base, outcome: 'would-merge' });
+    // ── Year gate: the detector matched the NAMES; only same-year members
+    // may actually collapse. Unknown-year members never merge (policy).
+    const partition = partitionClusterByYear(cluster, yearOf);
+    if (partition.droppedUnknownYear.length > 0 || partition.droppedSingleton.length > 0) {
       logger.info(
         {
           canonicalName: cluster.canonicalName,
-          canonicalId: cluster.canonicalId,
-          variants: cluster.variantNames,
-          confidence: cluster.confidence,
+          droppedUnknownYear: partition.droppedUnknownYear,
+          droppedSingleton: partition.droppedSingleton,
+          subClusters: partition.subClusters.map((s) => ({ year: s.year, size: s.variantIds.length + 1 })),
         },
-        '[campaign-merge] DRY-RUN would merge',
+        '[campaign-merge] year gate partitioned cluster',
       );
+    }
+    if (partition.subClusters.length === 0) {
+      clusterReports.push({
+        ...base,
+        outcome: 'year-blocked',
+        reason: `no two members share a known year (unknown: ${partition.droppedUnknownYear.length}, singleton: ${partition.droppedSingleton.length})`,
+      });
       continue;
     }
 
-    try {
-      const mergedCount = await applyCluster(cluster, account);
-      variantsMergedCount += mergedCount;
-      clusterReports.push({ ...base, outcome: 'merged' });
-      logger.info(
-        { canonicalName: cluster.canonicalName, mergedCount },
-        '[campaign-merge] merged cluster',
-      );
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      clusterReports.push({ ...base, outcome: 'failed', reason });
-      logger.error(
-        { err, canonicalName: cluster.canonicalName },
-        '[campaign-merge] cluster merge failed — skipped, continuing',
-      );
+    for (const sub of partition.subClusters) {
+      const subBase = {
+        canonicalId: sub.canonicalId,
+        canonicalName: sub.canonicalName,
+        variantCount: sub.variantIds.length,
+        confidence: sub.confidence,
+        reasoning: sub.reasoning,
+      };
+
+      if (!opts.apply) {
+        clusterReports.push({ ...subBase, outcome: 'would-merge' });
+        logger.info(
+          {
+            canonicalName: sub.canonicalName,
+            canonicalId: sub.canonicalId,
+            variants: sub.variantNames,
+            confidence: sub.confidence,
+            year: sub.year,
+          },
+          '[campaign-merge] DRY-RUN would merge',
+        );
+        continue;
+      }
+
+      try {
+        const mergedCount = await applyCluster(sub, account);
+        variantsMergedCount += mergedCount;
+        clusterReports.push({ ...subBase, outcome: 'merged' });
+        logger.info(
+          { canonicalName: sub.canonicalName, mergedCount, year: sub.year },
+          '[campaign-merge] merged cluster',
+        );
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        clusterReports.push({ ...subBase, outcome: 'failed', reason });
+        logger.error(
+          { err, canonicalName: sub.canonicalName },
+          '[campaign-merge] cluster merge failed — skipped, continuing',
+        );
+      }
     }
+  }
+
+  // ── Invalidate the structure cache after any applied merge. The cached
+  // entityMap still classifies merged variants' folders as campaigns pointing
+  // at DELETED campaign ids; a later bootstrap chunk reusing it would
+  // attribute files to nonexistent campaigns. Piece anchors are overlaid
+  // fresh from the DB each run, so dropping the cache is safe — the next
+  // chunk re-gathers + re-classifies and picks the pieces up as anchors.
+  if (opts.apply && variantsMergedCount > 0) {
+    await prisma.account.update({
+      where: { id: account.id },
+      data: { driveStructureClassification: Prisma.JsonNull },
+    });
+    logger.info(
+      { accountId: account.id },
+      '[campaign-merge] structure classification cache invalidated',
+    );
   }
 
   return {

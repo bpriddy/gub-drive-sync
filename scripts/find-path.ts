@@ -9,7 +9,11 @@ async function main(): Promise<void> {
   const DRIVE_ROOT = '0AOr-kVmmASVYUk9PVA';
   for (let i = 0; id && i < 20; i++) {
     if (id === DRIVE_ROOT) { chain.unshift('[SHARED DRIVE ROOT]'); break; }
-    const meta = await drive.files.get({ fileId: id, fields: 'id,name,parents', supportsAllDrives: true });
+    const meta: { data: { name?: string | null; parents?: string[] | null } } = await drive.files.get({
+      fileId: id,
+      fields: 'id,name,parents',
+      supportsAllDrives: true,
+    });
     chain.unshift(`${meta.data.name}`);
     id = meta.data.parents?.[0];
   }

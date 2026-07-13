@@ -442,6 +442,48 @@ export type Attributor = (
  * subtree the gather skipped) safely default to account-level — we'd
  * rather over-attribute to account than mis-attribute to a campaign.
  */
+// ── Piece anchors: pin merged-variant folders to their owning campaign ──────
+//
+// When the campaign merge collapses a duplicate, the variant's folder becomes
+// a campaign_piece of the canonical — the folder keeps being scanned; only the
+// campaign identity collapsed. But the structure classifier anchors ONLY on
+// live campaign rows, so a merged variant's folder would be re-classified as a
+// fresh new_campaign on the next scan (the re-split bug). This overlay pins
+// piece folders deterministically from DB truth: drop whatever the LLM said
+// about them and inject an existing_campaign classification pointing at the
+// OWNING campaign, so attribution routes their files into the canonical.
+//
+// Applied at attributor-build time, NOT persisted into the structure cache —
+// pieces change between runs (new merges), so each run overlays fresh.
+
+export interface PieceAnchor {
+  driveFolderId: string;
+  campaignId: string;
+  campaignName: string;
+}
+
+export function overlayPieceAnchors(map: EntityMap, pieces: PieceAnchor[]): EntityMap {
+  if (pieces.length === 0) return map;
+  const pieceByFolderId = new Map(pieces.map((p) => [p.driveFolderId, p]));
+  const pathByFolderId = new Map(map.allFolders.map((f) => [f.id, f.path]));
+
+  const kept = map.classified.filter((c) => !pieceByFolderId.has(c.folderId));
+  const injected: ClassifiedFolder[] = pieces
+    // Only anchor folders that exist in this walked tree (a piece folder from
+    // another account/subtree shouldn't inject a dangling classification).
+    .filter((p) => pathByFolderId.has(p.driveFolderId))
+    .map((p) => ({
+      folderId: p.driveFolderId,
+      folderPath: pathByFolderId.get(p.driveFolderId)!,
+      classification: 'existing_campaign' as const,
+      campaignName: p.campaignName,
+      matchedCampaignId: p.campaignId,
+      reasoning: 'piece anchor — folder owned by this campaign via campaign_pieces',
+    }));
+
+  return { ...map, classified: [...kept, ...injected] };
+}
+
 export function buildAttributor(map: EntityMap): Attributor {
   const folderById = new Map<string, FolderNode>();
   for (const f of map.allFolders) folderById.set(f.id, f);
