@@ -1,8 +1,11 @@
 /**
  * campaign-cluster-detector.ts — Gemini-backed clustering for an account's
- * Campaign roster. Identifies duplicate Campaign rows that represent the SAME
- * real-world campaign (year-drift variants, suffix noise, separator drift,
- * surface punctuation, date qualifiers).
+ * Campaign roster. Groups Campaign rows that refer to the SAME real-world
+ * campaign — judged by campaign IDENTITY (the initiative each name points to),
+ * NOT by name-string similarity. Two projects can be one campaign under
+ * different deliverable names; two near-identical strings can be different
+ * campaigns. Names-only by design — the humans naming campaigns carry the
+ * accountability; the model's job is to UNDERSTAND the names, not to add data.
  *
  * Output is a merge proposal: per cluster, a canonical id to KEEP and a list
  * of variant ids that should be merged into the canonical and deleted.
@@ -106,43 +109,25 @@ function buildPrompt(args: {
     2,
   );
 
-  return `You are reviewing the campaign roster for an agency account. The roster may contain duplicate rows that were created during automated content extraction — surface variations of the same campaign name (year drift, suffix noise, separator drift, surface punctuation) were each treated as a distinct campaign.
+  return `You are in charge of organizing an ad agency's data. I'm giving you an account (the client) and a list of titles of work done for that account, each with an id. These may be campaigns. They may be executions within a campaign. They may be something else entirely.
 
 ACCOUNT: ${args.accountName}
 
-CAMPAIGNS (id, name):
+TITLES (id, name):
 ${campaignsJson}
 
-TASK
-Group campaigns that represent the SAME real-world campaign. For each cluster of duplicates, return:
-- canonicalId: any one member id of the cluster (the orchestrator re-derives which row to keep — just pick any member)
-- canonicalName: a representative name, verbatim from one of the input "name" fields
-- variantIds: the OTHER member ids of the cluster
-- confidence: 0.0–1.0 — how sure you are these are the same campaign
-- reasoning: one sentence explaining the grouping
+Use your best judgement to reduce the list to a clean, non-duplicate list of campaigns, against a few predictable scenarios:
+- Executions of one campaign are often filed as separate campaigns. This is easiest to spot when non-standard language is reused across multiple titles — a slogan, or an acronym that is not attributable to a generic concept. Do NOT merge titles that only reuse generic or standard domain language (e.g. "chocolate" for a candy company).
+- An acronym is sometimes a clear compression of another title's words — treat those as the same campaign, but only at high confidence.
 
-WHAT COUNTS AS A DUPLICATE (collapse these)
-- Year variants: "Truck Season" / "Truck Season 2025" / "Truck Season '25"
-- Suffix noise: "Truck Season" / "Truck Season Campaign"
-- Separator drift: "Army/Navy" / "Army Navy"
-- Surface punctuation / casing: "ARMY NAVY GAME" / "Army Navy Game"
-- Date qualifiers for the same event: "Army Navy Game" / "Army/Navy (Dec 14th)"
+For each set of titles that are the same campaign, return:
+- canonicalId: the title that most clearly names the campaign
+- canonicalName: that name, verbatim
+- variantIds: the others in the set
+- confidence: 0.0–1.0
+- reasoning: one sentence
 
-WHAT IS NOT A DUPLICATE (keep distinct)
-- Campaigns that share a theme but are different programs: "Truck Day" (one-day promo) vs "Truck Season" (Q4 retail push) are distinct.
-- Different annual editions: "Holiday 2023" vs "Holiday 2024" — both real, both kept.
-- Different waves/phases: "Wave 2" vs "Wave 3"; "T1-1" vs "T1-2" — kept distinct.
-- Brief vs Pitch concept ideas vs final campaign — keep distinct unless the names truly converge.
-
-Use real-world knowledge: Army-Navy is the annual college football game in December; a "truck season" is the auto-industry's Q4 retail push; "Heartbeat of America" is a Chevy slogan from 1986 (not a live campaign).
-
-HARD RULES
-- Every id in your output must appear in the INPUT campaigns. No invented ids.
-- No id may appear in more than one cluster (canonical or variant).
-- A canonicalId must NOT also appear in its own variantIds.
-- OMIT any cluster where your confidence < ${CONFIDENCE_FLOOR}. Better to leave a duplicate than to wrongly merge two distinct campaigns.
-- OMIT any cluster of size 1 (a campaign alone is not a duplicate).
-- Standalone campaigns (no duplicates found): just omit them entirely from the output.`;
+Only return sets of two or more, and only above ${CONFIDENCE_FLOOR} confidence. When unsure, leave titles separate.`;
 }
 
 function validateClusters(
