@@ -41,9 +41,15 @@ const ObservationSchema = z.object({
 });
 
 const PerFileResponseSchema = z.object({
+  // Whole-file classification gating the downstream idea-extraction call.
+  // .catch('other') — a missing/invalid value must never fail the file;
+  // it just means no idea extraction for it.
+  deck_type: z.enum(['pitch', 'creative_review', 'other']).catch('other').default('other'),
   account: z.array(ObservationSchema).default([]),
   campaign: z.array(ObservationSchema).default([]),
 });
+
+export type PerFileDeckType = 'pitch' | 'creative_review' | 'other';
 
 export type AccountObservation = z.infer<typeof ObservationSchema>;
 export type CampaignObservation = z.infer<typeof ObservationSchema>;
@@ -82,6 +88,9 @@ export interface InterpretFileInput {
 export interface InterpretFileOutput {
   account: AccountObservation[];
   campaign: CampaignObservation[];
+  /** Whole-file gate for the ideas tier: only pitch / creative_review files
+   *  fire the focused idea-extraction call. */
+  deckType: PerFileDeckType;
   truncated: boolean;
   driver: string;
 }
@@ -113,6 +122,7 @@ export async function interpretFile(input: InterpretFileInput): Promise<Interpre
     return {
       account: validated.account,
       campaign: validated.campaign,
+      deckType: validated.deck_type,
       truncated,
       driver: result.driver,
     };

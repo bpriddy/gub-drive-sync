@@ -124,6 +124,7 @@ import {
   type PieceAnchor,
 } from '../src/drive/structure';
 import { matchCampaignName } from '../src/drive/name-similarity';
+import { createIdeaScanContext, processFileIdeas, type IdeaScanStats } from '../src/drive/idea-scan';
 import type { TraversedFile } from '../src/drive/types';
 import { config } from '../src/config';
 
@@ -580,6 +581,8 @@ interface EntityCtx {
    * is account-scoped regardless of which entity drove the chunk.
    */
   accountId: string;
+  /** Account ROOT folder id — the org-scope external key on idea rows. */
+  accountFolderId: string | null;
   accountState: AccountCurrentState;
   accountName: string;
   campaignName: string | null;
@@ -623,6 +626,7 @@ async function loadEntity(args: Args): Promise<EntityCtx> {
       name: a.name,
       folderId: a.driveFolderId,
       accountId: a.id,
+      accountFolderId: a.driveFolderId,
       accountState: buildAccountCurrentState(a),
       accountName: a.name,
       campaignName: null,
@@ -647,6 +651,7 @@ async function loadEntity(args: Args): Promise<EntityCtx> {
     name: c.name,
     folderId: c.driveFolderId,
     accountId: c.account.id,
+    accountFolderId: c.account.driveFolderId ?? null,
     accountState: buildAccountCurrentState(c.account),
     accountName: c.account.name,
     campaignName: c.name,
@@ -840,6 +845,8 @@ interface BatchOutcome {
   campaignObsDiscarded: number;
   /** Stage 3: one entry per entity that got distill+synth. */
   synthesized: EntitySynthesisResult[];
+  /** Ideas tier: deck-gated extraction stats (null when account folder unknown). */
+  ideaStats: IdeaScanStats | null;
 }
 
 // ── Dry-run distillation helper (for new candidates) ────────────────────────
@@ -1509,6 +1516,18 @@ async function processBatch(
   }
   const pieceBuckets = new Map<string, PieceBucket>();
 
+  // Ideas tier — per-scan context (lazy known-set cache). Only files the
+  // per-file extractor classified pitch/creative_review fire the focused
+  // idea call, so cost scales with decks, not with files. Requires the
+  // account root folder id (the org-scope key on idea rows).
+  const ideaCtx = ctx.accountFolderId
+    ? createIdeaScanContext({
+        accountExternalId: ctx.accountFolderId,
+        accountName: ctx.accountName,
+        apply: applyToDb,
+      })
+    : null;
+
   const editors = new Map<string, number>();
 
   let filesExtracted = 0;
@@ -1711,6 +1730,24 @@ async function processBatch(
         if (attribution.ownerType !== 'campaign') accountLevelFiles += 1;
       }
 
+      // Ideas tier: deck-gated. Runs after routing so an idea failure can
+      // never affect the observation flow (it also never throws).
+      if (ideaCtx && res.deckType !== 'other') {
+        const ideaCampaignExternalId =
+          attribution.ownerType === 'campaign'
+            ? ctx.type === 'campaign'
+              ? ctx.folderId // owning campaign root (covers piece-tagged files)
+              : attribution.campaignFolderId
+            : null;
+        log(`      ◆ ${res.deckType} deck — extracting ideas…`);
+        await processFileIdeas(ideaCtx, {
+          file,
+          text: extraction.text,
+          deckType: res.deckType,
+          campaignExternalId: ideaCampaignExternalId,
+        });
+      }
+
       filesExtracted++;
     } catch (err) {
       log(`    ✗ ${file.name}  ERROR: ${summarizeError(err)}`);
@@ -1764,6 +1801,12 @@ async function processBatch(
 
   for (const pb of pieceBuckets.values()) {
     log(`    Piece "${pb.pieceName}" (campaign "${pb.campaignName}")  ·  ${pb.observations.length} obs`);
+  }
+  if (ideaCtx && ideaCtx.stats.deckFiles > 0) {
+    const i = ideaCtx.stats;
+    log(
+      `    Ideas: ${i.deckFiles} deck file(s) → ${i.ideasCreated} created, ${i.ideasUpdated} updated, ${i.ideasUnchanged} unchanged${i.ideaErrors > 0 ? `, ${i.ideaErrors} error(s)` : ''}${applyToDb ? '' : ' (dryrun — not persisted)'}`,
+    );
   }
   if (legacyCampaignBucket.length > 0 && !attributor) {
     // Campaign scan: report the single bucket plainly.
@@ -2290,6 +2333,12 @@ async function processBatch(
         };
         mainTargets.push(campaignTarget);
       }
+      // Deterministic dedupe: if the campaign's prior markdown already carries
+      // this exact rollup line, don't re-inject — the synthesis LLM does not
+      // reliably collapse identical bullets, and re-runs would stack copies.
+      if (campaignTarget.priorStatusMarkdown?.includes(lead)) {
+        continue;
+      }
       campaignTarget.observations.push({
         observation: { text: `Piece "${pt.entityName}": ${lead}` } as CampaignObservation,
         sourceFileId: `piece:${pt.entityId}`,
@@ -2317,6 +2366,7 @@ async function processBatch(
     accountLevelFiles,
     campaignObsDiscarded,
     synthesized,
+    ideaStats: ideaCtx?.stats ?? null,
   };
 }
 

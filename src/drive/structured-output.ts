@@ -58,6 +58,13 @@ export function perFileResponseSchema(): Schema {
   return {
     type: SchemaType.OBJECT,
     properties: {
+      deck_type: {
+        type: SchemaType.STRING,
+        format: 'enum',
+        enum: ['pitch', 'creative_review', 'other'],
+        description:
+          'Classify THIS FILE: "pitch" (creative concepts proposed to win/answer a brief), "creative_review" (creative presented for feedback/approval during development), or "other" (everything else). Gates downstream idea extraction — when unsure, "other".',
+      },
       account: {
         type: SchemaType.ARRAY,
         description:
@@ -71,7 +78,7 @@ export function perFileResponseSchema(): Schema {
         items: observationItemSchema(),
       },
     },
-    required: ['account', 'campaign'],
+    required: ['deck_type', 'account', 'campaign'],
   };
 }
 

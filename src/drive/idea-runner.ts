@@ -92,12 +92,12 @@ interface PlannedEvent {
   sourceFileId: string;
 }
 
-function renderFacets(facets: string[]): string {
+export function renderFacets(facets: string[]): string {
   return facets.map((f) => `- ${f}`).join('\n');
 }
 
 /** Order-insensitive set equality — skip no-op updates so re-runs don't churn. */
-function facetsEqual(a: string[], b: string[]): boolean {
+export function facetsEqual(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
   const norm = (xs: string[]) => new Set(xs.map((x) => x.trim().toLowerCase()));
   const sa = norm(a);
