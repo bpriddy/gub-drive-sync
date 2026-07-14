@@ -136,20 +136,25 @@ import { config } from '../src/config';
  * The reviewer step will eventually adjudicate these; for now the loss is
  * accepted by design.
  *
- * Foreignness is judged against the ONE scanned campaign name: no tag = not
- * foreign (folder-scope default); a tag that the fuzzy matcher accepts OR
- * that is contained in / contains the scanned name (normalized) = this
- * campaign ("BHAC" must match "02. Chevy | BHAC [GMCHV…]"); anything else
- * is foreign.
+ * Foreignness is judged against the campaign's IDENTITY FAMILY — the
+ * scanned campaign's name AND its pieces' names (a merge collapses identity,
+ * so "13. Chevy | BHAC AI + LMA Tool" is THIS campaign, not a foreign one).
+ * No tag = not foreign (folder-scope default); a tag the fuzzy matcher
+ * accepts OR that is contained in / contains any family name (normalized)
+ * = ours ("BHAC" must match "02. Chevy | BHAC [GMCHV…]"); anything else is
+ * foreign.
  */
-export function isForeignCampaignTag(tagRaw: string, scannedCampaignName: string): boolean {
+export function isForeignCampaignTag(tagRaw: string, ownNames: string[]): boolean {
   const tag = tagRaw.trim();
   if (!tag) return false;
-  if (matchCampaignName(tag, [scannedCampaignName])) return false;
+  if (matchCampaignName(tag, ownNames)) return false;
   const norm = (x: string) => x.toLowerCase().replace(/\s+/g, ' ').trim();
   const a = norm(tag);
-  const b = norm(scannedCampaignName);
-  if (a.length >= 3 && (b.includes(a) || a.includes(b))) return false;
+  if (a.length < 3) return false;
+  for (const name of ownNames) {
+    const b = norm(name);
+    if (b.includes(a) || a.includes(b)) return false;
+  }
   return true;
 }
 
@@ -1560,6 +1565,14 @@ async function processBatch(
       })
     : null;
 
+  // The scanned campaign's identity family: its own name + its pieces'
+  // names. A subject tag matching ANY of these is ours — two folders, one
+  // campaign (BHAC's piece folder must never be treated as foreign).
+  const ownIdentityNames: string[] =
+    ctx.type === 'campaign'
+      ? [ctx.name, ...(piecesById ? Array.from(piecesById.values()).map((p) => p.name) : [])]
+      : [ctx.name];
+
   const editors = new Map<string, number>();
 
   let filesExtracted = 0;
@@ -1634,7 +1647,7 @@ async function processBatch(
           // prefers exact KNOWN_CAMPAIGNS matches); foreign subjects stay
           // free-form and are dropped below.
           knownCampaigns:
-            nameDirectory?.knownCampaignNames ?? (ctx.type === 'campaign' ? [ctx.name] : []),
+            nameDirectory?.knownCampaignNames ?? (ctx.type === 'campaign' ? ownIdentityNames : []),
         }),
       );
 
@@ -1676,7 +1689,7 @@ async function processBatch(
         // count, never absorb. Piece-tagged files bucket to the piece; the
         // rest to the campaign.
         for (const obs of res.campaign) {
-          if (isForeignCampaignTag(obs.entity_campaign_name ?? '', ctx.name)) {
+          if (isForeignCampaignTag(obs.entity_campaign_name ?? '', ownIdentityNames)) {
             foreignObsDropped += 1;
             log(`      ⊘ foreign-campaign obs dropped ("${(obs.entity_campaign_name ?? '').slice(0, 60)}")`);
             continue;

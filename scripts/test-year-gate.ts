@@ -108,13 +108,19 @@ check('foreign piece folder ignored', foreign.classified.length, map.classified.
 
 // ── 4. isForeignCampaignTag (campaign scans write only this campaign) ──────
 console.log('\nisForeignCampaignTag');
-const SCANNED = '02. Chevy | BHAC [GMCHV55000216]';
-check('no tag → not foreign', isForeignCampaignTag('', SCANNED), false);
-check('verbatim scanned name → not foreign', isForeignCampaignTag(SCANNED, SCANNED), false);
-check('short containment ("BHAC") → not foreign', isForeignCampaignTag('BHAC', SCANNED), false);
-check('containment with case drift → not foreign', isForeignCampaignTag('chevy | bhac', SCANNED), false);
-check('different campaign → FOREIGN', isForeignCampaignTag('Super Cruise with Heather Dubrow', SCANNED), true);
-check('different campaign, same brand → FOREIGN', isForeignCampaignTag('Chevy Racing', SCANNED), true);
+// The identity FAMILY: campaign + its pieces (two folders, one campaign).
+const FAMILY = [
+  '02. Chevy | BHAC [GMCHV55000216]',
+  '13. Chevy | BHAC AI + LMA Tool [GMCHV550002340]',
+];
+check('no tag → not foreign', isForeignCampaignTag('', FAMILY), false);
+check('verbatim campaign name → not foreign', isForeignCampaignTag(FAMILY[0]!, FAMILY), false);
+check('short containment ("BHAC") → not foreign', isForeignCampaignTag('BHAC', FAMILY), false);
+check('containment with case drift → not foreign', isForeignCampaignTag('chevy | bhac', FAMILY), false);
+check('PIECE name → not foreign (identity family)', isForeignCampaignTag('BHAC AI + LMA Tool', FAMILY), false);
+check('verbatim piece title → not foreign', isForeignCampaignTag(FAMILY[1]!, FAMILY), false);
+check('different campaign → FOREIGN', isForeignCampaignTag('Super Cruise with Heather Dubrow', FAMILY), true);
+check('different campaign, same brand → FOREIGN', isForeignCampaignTag('Chevy Racing', FAMILY), true);
 
 console.log(failures === 0 ? '\n🎯 ALL PASS' : `\n⚠ ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);
