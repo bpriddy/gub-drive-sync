@@ -18,7 +18,7 @@
  *     / notes / ambiguous and culls no-ops.
  */
 
-import { SchemaType, type Schema } from '@google/generative-ai';
+import { SchemaType, type Schema } from '../ai';
 import { ACCOUNT_WRITABLE_FIELDS, CAMPAIGN_WRITABLE_FIELDS } from './schema';
 
 /**

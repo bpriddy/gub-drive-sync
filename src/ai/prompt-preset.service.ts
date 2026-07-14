@@ -9,7 +9,7 @@
  * the prompt contract, not the caller.
  */
 
-import type { ResponseSchema } from '@google/generative-ai';
+import type { Schema } from '@google/genai';
 import { prisma } from '../prisma';
 import { logger } from '../logger';
 import { defaultLlm } from './gemini.client';
@@ -22,7 +22,7 @@ export interface RunPresetOptions {
   modelOverride?: string;
   temperatureOverride?: number;
   /** Optional Gemini structured-output schema — forces JSON responses. */
-  responseSchema?: ResponseSchema;
+  responseSchema?: Schema;
 }
 
 const PLACEHOLDER = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;

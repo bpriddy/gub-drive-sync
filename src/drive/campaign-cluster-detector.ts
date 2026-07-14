@@ -19,7 +19,7 @@
  */
 
 import { z } from 'zod';
-import { SchemaType, type ResponseSchema } from '@google/generative-ai';
+import { SchemaType, type ResponseSchema } from '../ai';
 import { defaultLlm } from '../ai';
 import { parseLlmJson } from '../ai/prompt-preset.service';
 import { logger } from '../logger';

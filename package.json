@@ -23,6 +23,7 @@
     "probe-revision-content": "tsx -r dotenv/config scripts/probe-revision-content.ts"
   },
   "dependencies": {
+    "@google/genai": "^2.11.0",
     "@google/generative-ai": "^0.21.0",
     "@prisma/client": "^5.22.0",
     "dotenv": "^16.4.7",

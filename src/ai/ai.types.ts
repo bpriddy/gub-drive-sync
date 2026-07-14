@@ -2,7 +2,7 @@
  * ai.types.ts — Shared AI module types.
  */
 
-import type { ResponseSchema } from '@google/generative-ai';
+import type { Schema } from '@google/genai';
 
 export interface LlmCompletionRequest {
   model: string;
@@ -16,7 +16,7 @@ export interface LlmCompletionRequest {
    * reads the schema to fabricate minimally-valid responses so the rest of
    * the pipeline keeps running when no API key is set.
    */
-  responseSchema?: ResponseSchema;
+  responseSchema?: Schema;
   /**
    * Cap on generated tokens. Omit to inherit the model default. Set high
    * for calls whose JSON response scales with input size (e.g. clustering a
@@ -24,6 +24,25 @@ export interface LlmCompletionRequest {
    * the caller's parse.
    */
   maxOutputTokens?: number;
+  /**
+   * Cap on Gemini reasoning ("thinking") tokens (the 2.5-series knob;
+   * 0 = disabled, -1 = automatic). Omit to let the model decide. A latency
+   * lever — tune empirically; too low degrades quality.
+   */
+  thinkingBudget?: number;
+  /**
+   * Thinking level (the 3-series knob per the SDK's recommended practice):
+   * 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH'. Mutually exclusive with
+   * thinkingBudget — set at most one.
+   */
+  thinkingLevel?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH';
+}
+
+export interface LlmUsage {
+  promptTokens: number | null;
+  thoughtsTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
 }
 
 export interface LlmCompletionResult {
@@ -33,6 +52,8 @@ export interface LlmCompletionResult {
   model: string;
   /** Raw response for debugging. Not persisted. */
   raw?: unknown;
+  /** Token accounting from the provider (prompt / thoughts / output). */
+  usage?: LlmUsage;
 }
 
 export interface LlmDriver {

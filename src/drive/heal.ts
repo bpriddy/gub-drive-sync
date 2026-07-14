@@ -40,7 +40,7 @@ import { z } from 'zod';
 import { prisma } from '../prisma';
 import { logger } from '../logger';
 import { runPreset, parseLlmJson } from '../ai';
-import { SchemaType, type Schema } from '@google/generative-ai';
+import { SchemaType, type Schema } from '../ai';
 import {
   ACCOUNT_WRITABLE_FIELDS,
   CAMPAIGN_WRITABLE_FIELDS,

@@ -2,24 +2,35 @@
  * gemini.client.ts — Gemini-backed LlmDriver with mock fallback.
  *
  * Driver selection:
- *   - GEMINI_API_KEY set → real Gemini via @google/generative-ai
+ *   - GEMINI_API_KEY set → real Gemini via @google/genai (the supported SDK;
+ *     @google/generative-ai is deprecated and was migrated off 2026-07-14)
  *   - unset             → MockLlmDriver returns a schema-shaped empty response
  *                         so the pipeline still runs end-to-end in dev.
  *
  * When a `responseSchema` is provided, we set responseMimeType=application/json
  * and Gemini guarantees the response conforms. The caller still runs its Zod
  * validation on top for type-narrowing + defense in depth.
+ *
+ * The new SDK exposes two things the old one couldn't:
+ *   - thinkingConfig — callers may control reasoning via
+ *     LlmCompletionRequest.thinkingLevel (the 3-series knob per the SDK's
+ *     recommended practice: MINIMAL/LOW/MEDIUM/HIGH) or thinkingBudget (the
+ *     2.5-series token cap; 0 disables). Latency levers; tune empirically —
+ *     too little thinking can degrade extraction quality.
+ *   - usageMetadata — prompt/thoughts/output token counts, returned on every
+ *     completion (LlmCompletionResult.usage) and logged at debug, so latency
+ *     work is measured rather than guessed.
  */
 
-import {
-  GoogleGenerativeAI,
-  SchemaType,
-  type ResponseSchema,
-  type Schema,
-} from '@google/generative-ai';
+import { ApiError, GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google/genai';
 import { config } from '../config';
 import { logger } from '../logger';
-import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver } from './ai.types';
+import type {
+  LlmCompletionRequest,
+  LlmCompletionResult,
+  LlmDriver,
+  LlmUsage,
+} from './ai.types';
 
 /**
  * Retry posture for Gemini calls.
@@ -30,28 +41,29 @@ import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver } from './ai.
  * auth issues, malformed prompts) throw immediately — retrying those
  * just wastes time.
  *
- * Detection is heuristic: the GoogleGenerativeAI SDK wraps fetch errors
- * into `GoogleGenerativeAIError` with the underlying cause in the
- * message. We string-match on the most common transient patterns.
+ * Detection: API-level errors are typed (ApiError.status — the SDK's
+ * recommended handling); network-level transport errors never reach
+ * ApiError, so those are string-matched.
  */
 const MAX_ATTEMPTS = 3;
 const BASE_BACKOFF_MS = 1000; // 1s → 3s → 9s (3^attempt)
 
 function isRetryable(err: unknown): boolean {
   if (!err) return false;
+  // API-level errors carry a typed HTTP status (SDK-recommended handling):
+  // retry rate limits + server-side failures, never other 4xx.
+  if (err instanceof ApiError) {
+    return err.status === 429 || (err.status >= 500 && err.status <= 599);
+  }
+  // Network-level failures never reach ApiError (they surface as fetch/socket
+  // errors from the transport) — string-match those.
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (msg.includes('fetch failed')) return true;
   if (msg.includes('econnreset')) return true;
   if (msg.includes('etimedout')) return true;
   if (msg.includes('econnrefused')) return true;
   if (msg.includes('socket hang up')) return true;
-  if (msg.includes('rate limit') || msg.includes('429')) return true;
-  if (msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('504')) {
-    return true;
-  }
-  // Gemini-specific: "deadline exceeded", "internal" surface as retryable.
   if (msg.includes('deadline exceeded')) return true;
-  if (msg.includes('internal error')) return true;
   return false;
 }
 
@@ -61,38 +73,68 @@ function sleep(ms: number): Promise<void> {
 
 class GeminiLlmDriver implements LlmDriver {
   readonly name = 'gemini';
-  private client: GoogleGenerativeAI;
+  private client: GoogleGenAI;
 
   constructor(apiKey: string) {
-    this.client = new GoogleGenerativeAI(apiKey);
+    // retryOptions.attempts=1: OUR loop below owns retries (logging +
+    // backoff); pinning the SDK's built-in retry off prevents the two
+    // from stacking (SDK default is 5 attempts when retryOptions is set,
+    // and unspecified behavior otherwise — explicit is deterministic).
+    this.client = new GoogleGenAI({
+      apiKey,
+      httpOptions: { retryOptions: { attempts: 1 } },
+    });
   }
 
   async complete(req: LlmCompletionRequest): Promise<LlmCompletionResult> {
-    const generationConfig: Record<string, unknown> = { temperature: req.temperature };
-    if (req.responseSchema) {
-      generationConfig.responseMimeType = 'application/json';
-      generationConfig.responseSchema = req.responseSchema;
-    }
-    if (req.maxOutputTokens) {
-      generationConfig.maxOutputTokens = req.maxOutputTokens;
-    }
-    const model = this.client.getGenerativeModel({
-      model: req.model,
-      generationConfig: generationConfig as never,
-    });
-
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const res = await model.generateContent(req.prompt);
-        const text = res.response.text();
+        const res = await this.client.models.generateContent({
+          model: req.model,
+          contents: req.prompt,
+          config: {
+            temperature: req.temperature,
+            ...(req.responseSchema
+              ? { responseMimeType: 'application/json', responseSchema: req.responseSchema }
+              : {}),
+            ...(req.maxOutputTokens ? { maxOutputTokens: req.maxOutputTokens } : {}),
+            ...(req.thinkingBudget !== undefined
+              ? { thinkingConfig: { thinkingBudget: req.thinkingBudget } }
+              : req.thinkingLevel !== undefined
+                ? { thinkingConfig: { thinkingLevel: req.thinkingLevel as ThinkingLevel } }
+                : {}),
+          },
+        });
+        const text = res.text ?? '';
+        const u = res.usageMetadata;
+        const usage: LlmUsage | undefined = u
+          ? {
+              promptTokens: u.promptTokenCount ?? null,
+              thoughtsTokens: u.thoughtsTokenCount ?? null,
+              outputTokens: u.candidatesTokenCount ?? null,
+              totalTokens: u.totalTokenCount ?? null,
+            }
+          : undefined;
+        if (usage) {
+          logger.debug(
+            { model: req.model, tag: req.tag, ...usage },
+            '[gemini] usage',
+          );
+        }
         if (attempt > 1) {
           logger.info(
             { model: req.model, tag: req.tag, attempt },
             '[gemini] generateContent succeeded after retry',
           );
         }
-        return { text, driver: this.name, model: req.model, raw: res };
+        return {
+          text,
+          driver: this.name,
+          model: req.model,
+          raw: res,
+          ...(usage ? { usage } : {}),
+        };
       } catch (err) {
         lastErr = err;
         const retryable = isRetryable(err);
@@ -129,11 +171,11 @@ class MockLlmDriver implements LlmDriver {
  * Build a minimally-valid instance of a responseSchema so mock responses
  * parse cleanly against caller Zod validators.
  */
-function emptyInstance(schema: Schema | ResponseSchema): unknown {
+function emptyInstance(schema: Schema): unknown {
   switch (schema.type) {
-    case SchemaType.ARRAY:
+    case Type.ARRAY:
       return [];
-    case SchemaType.OBJECT: {
+    case Type.OBJECT: {
       const out: Record<string, unknown> = {};
       const props = (schema.properties ?? {}) as Record<string, Schema>;
       for (const key of schema.required ?? []) {
@@ -142,12 +184,12 @@ function emptyInstance(schema: Schema | ResponseSchema): unknown {
       }
       return out;
     }
-    case SchemaType.STRING:
+    case Type.STRING:
       return '';
-    case SchemaType.NUMBER:
-    case SchemaType.INTEGER:
+    case Type.NUMBER:
+    case Type.INTEGER:
       return 0;
-    case SchemaType.BOOLEAN:
+    case Type.BOOLEAN:
       return false;
     default:
       return null;

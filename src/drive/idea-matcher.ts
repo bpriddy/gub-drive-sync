@@ -20,7 +20,7 @@
  */
 
 import { z } from 'zod';
-import { SchemaType, type ResponseSchema } from '@google/generative-ai';
+import { SchemaType, type ResponseSchema } from '../ai';
 import { defaultLlm, parseLlmJson } from '../ai';
 import { logger } from '../logger';
 
