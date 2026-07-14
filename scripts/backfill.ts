@@ -1516,6 +1516,12 @@ async function processBatch(
    * (file.pieceId, set at discovery) to their piece.
    */
   piecesById: Map<string, { name: string; driveFolderId: string }> | null,
+  /**
+   * Identity family per existing campaign (campaign name + its pieces'
+   * names). Account scans use it to (a) lock campaign-zone files to their
+   * family and (b) hand the family to the per-file call as the vocabulary.
+   */
+  familyByCampaignId: Map<string, string[]> | null,
   applyToDb: boolean,
   /**
    * The "as-of" date for this scan in YYYY-MM-DD form. Used to stamp the
@@ -1581,10 +1587,10 @@ async function processBatch(
   let filesZeroObs = 0;
   let accountLevelFiles = 0;
   let campaignObsDiscarded = 0;
-  /** Tagged campaign obs whose name didn't match anything known → routed into phantom buckets. */
-  let phantomObsRouted = 0;
-  /** Campaign scans only: obs about a DIFFERENT campaign — misfiled content, dropped. */
+  /** Obs about a DIFFERENT campaign found inside a campaign zone — misfiled content, dropped. */
   let foreignObsDropped = 0;
+  /** Account-zone obs naming an UNKNOWN campaign → converted to account observations (no phantoms). */
+  let unknownCampaignToAccount = 0;
   /** Tagged campaign obs whose name fuzzy-matched (Levenshtein) to a known campaign — logged for visibility. */
   let fuzzyMatchedObs = 0;
 
@@ -1621,6 +1627,16 @@ async function processBatch(
     const perFileCampaignName =
       attribution.ownerType === 'campaign' ? attribution.campaignName : null;
 
+    const interpretVocabulary: string[] = nameDirectory
+      ? attribution.ownerType === 'campaign'
+        ? ((attribution.matchedCampaignId
+            ? familyByCampaignId?.get(attribution.matchedCampaignId)
+            : undefined) ?? (attribution.campaignName ? [attribution.campaignName] : []))
+        : nameDirectory.knownCampaignNames
+      : ctx.type === 'campaign'
+        ? ownIdentityNames
+        : [];
+
     try {
       const extraction = await timed('extract_text', () => extractText(file));
       if (extraction.kind !== 'ok') {
@@ -1642,12 +1658,12 @@ async function processBatch(
           // from this list when an obs's subject is a specific campaign;
           // a free-form name signals an unknown campaign to the
           // orchestrator's phantom bucket.
-          // Campaign scans get the scanned campaign's own name as the
-          // vocabulary so this-campaign tags come back verbatim (the prompt
-          // prefers exact KNOWN_CAMPAIGNS matches); foreign subjects stay
-          // free-form and are dropped below.
-          knownCampaigns:
-            nameDirectory?.knownCampaignNames ?? (ctx.type === 'campaign' ? ownIdentityNames : []),
+          // Zone-conditional vocabulary: campaign-zone files get their
+          // campaign's identity family (this-campaign/piece tags come back
+          // verbatim; foreign subjects stay free-form → dropped). Account-
+          // zone files get the full known roster — the addressing directory
+          // is welcome only there.
+          knownCampaigns: interpretVocabulary,
         }),
       );
 
@@ -1725,27 +1741,22 @@ async function processBatch(
         }
       } else {
         for (const obs of res.campaign) {
-          // Piece routing (account scans): the file lives under a piece's
-          // folder. Fine detail buckets to the piece — UNLESS the obs's tag
-          // names a DIFFERENT campaign than the piece's owner (genuine
-          // cross-reference → subject routing wins below).
-          if (attribution.pieceId && attribution.matchedCampaignId) {
-            // Foreign only when the tag RESOLVES (same fuzzy matcher the
-            // fall-through routing uses) to a known campaign other than the
-            // piece's owner. A tag that resolves to the owner — or to nothing
-            // known — stays at the piece: byte-level name drift must never
-            // bounce piece detail to the campaign tier or mint a phantom.
-            const tagRaw = (obs.entity_campaign_name ?? '').trim();
-            let tagIsForeign = false;
-            if (tagRaw !== '' && nameDirectory) {
-              const m = matchCampaignName(tagRaw, nameDirectory.knownCampaignNames);
-              if (m) {
-                const resolved = m.matched.trim().toLowerCase();
-                const ownerName = (attribution.campaignName ?? '').trim().toLowerCase();
-                tagIsForeign = resolved !== ownerName;
-              }
+          // ── ZONE MODEL ──────────────────────────────────────────────
+          // CAMPAIGN ZONE: at/below a campaign root the campaign is LOCKED.
+          // Observations belong to that campaign's identity family (the
+          // campaign, its pieces) or roll up to the account — content never
+          // re-routes them. A foreign subject is misfiled content: drop.
+          if (attribution.ownerType === 'campaign') {
+            const family =
+              (attribution.matchedCampaignId
+                ? familyByCampaignId?.get(attribution.matchedCampaignId)
+                : undefined) ?? (attribution.campaignName ? [attribution.campaignName] : []);
+            if (isForeignCampaignTag(obs.entity_campaign_name ?? '', family)) {
+              foreignObsDropped += 1;
+              log(`      ⊘ foreign-campaign obs dropped ("${(obs.entity_campaign_name ?? '').slice(0, 60)}")`);
+              continue;
             }
-            if (!tagIsForeign) {
+            if (attribution.pieceId && attribution.matchedCampaignId) {
               let pb = pieceBuckets.get(attribution.pieceId);
               if (!pb) {
                 pb = {
@@ -1763,13 +1774,44 @@ async function processBatch(
               pb.fileIds.add(file.id);
               continue;
             }
+            const key =
+              attribution.campaignStatus === 'existing' && attribution.matchedCampaignId
+                ? `existing:${attribution.matchedCampaignId}`
+                : `new:${attribution.campaignFolderId}`;
+            let bucket = campaignBuckets.get(key);
+            if (!bucket) {
+              bucket = {
+                campaignName: attribution.campaignName ?? '(unnamed campaign)',
+                campaignFolderId: attribution.campaignFolderId,
+                campaignStatus: attribution.campaignStatus ?? 'new',
+                matchedCampaignId: attribution.matchedCampaignId,
+                bucketSource: 'folder',
+                observations: [],
+                fileIds: new Set(),
+              };
+              campaignBuckets.set(key, bucket);
+            }
+            bucket.observations.push({ observation: obs, sourceFileId: file.id });
+            bucket.fileIds.add(file.id);
+            continue;
           }
+
+          // ACCOUNT ZONE: above the campaign roots we scan at account level
+          // AND known-campaign level — this is where the known-campaign list
+          // is welcome. A tag matching a KNOWN campaign is addressed to it.
+          // A named-but-UNKNOWN campaign becomes an ACCOUNT observation
+          // (brand pipeline/history) — campaigns are born from folders or
+          // merges, never from stray mentions (no phantoms).
           const routed = routeCampaignObs(obs, attribution, nameDirectory);
           if (routed.kind === 'discard') {
             campaignObsDiscarded += 1;
             continue;
           }
-          if (routed.kind === 'phantom') phantomObsRouted += 1;
+          if (routed.kind === 'phantom') {
+            unknownCampaignToAccount += 1;
+            accountBucket.push({ observation: obs, sourceFileId: file.id });
+            continue;
+          }
           if (routed.kind === 'matched' && routed.via === 'levenshtein') {
             fuzzyMatchedObs += 1;
             log(
@@ -1850,9 +1892,6 @@ async function processBatch(
         `    Account-level files: ${accountLevelFiles}  ·  untagged campaign obs discarded: ${campaignObsDiscarded}`,
       );
     }
-    if (phantomObsRouted > 0) {
-      log(`    Phantom-name obs routed to new-candidate buckets: ${phantomObsRouted}`);
-    }
     if (fuzzyMatchedObs > 0) {
       log(`    Fuzzy-matched obs (typo-corrected): ${fuzzyMatchedObs}`);
     }
@@ -1862,7 +1901,10 @@ async function processBatch(
     log(`    Piece "${pb.pieceName}" (campaign "${pb.campaignName}")  ·  ${pb.observations.length} obs`);
   }
   if (foreignObsDropped > 0) {
-    log(`    ⚠ ${foreignObsDropped} foreign-campaign obs dropped (misfiled content — campaign scans write only this campaign + account)`);
+    log(`    ⚠ ${foreignObsDropped} foreign-campaign obs dropped (misfiled content — the campaign zone is locked)`);
+  }
+  if (unknownCampaignToAccount > 0) {
+    log(`    ↑ ${unknownCampaignToAccount} unknown-campaign obs converted to account observations (no phantoms)`);
   }
   if (ideaCtx && ideaCtx.stats.deckFiles > 0) {
     const i = ideaCtx.stats;
@@ -2649,6 +2691,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   // and don't need cross-campaign attribution.
   let attributor: Attributor | null = null;
   let nameDirectory: CampaignNameDirectory | null = null;
+  let familyByCampaignId: Map<string, string[]> | null = null;
   /** FolderNode.path by folder id — the deterministic breadcrumb (NOT the
    *  LLM-echoed folder_path). Used to persist campaign.driveFolderPath at
    *  creation so the merge's year gate has a structural year to read. */
@@ -2763,6 +2806,12 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
 
     folderPathById = new Map(entityMap.allFolders.map((f) => [f.id, f.path]));
     attributor = buildAttributor(entityMap, pieceAnchors);
+    familyByCampaignId = new Map(existingCampaigns.map((c) => [c.id, [c.name]]));
+    for (const a of pieceAnchors) {
+      const fam = familyByCampaignId.get(a.campaignId);
+      if (fam) fam.push(a.pieceName);
+      else familyByCampaignId.set(a.campaignId, [a.campaignName, a.pieceName]);
+    }
     nameDirectory = buildCampaignNameDirectory(entityMap, existingCampaigns);
     log(
       `  Known-campaign vocabulary for per-file LLM: ${nameDirectory.knownCampaignNames.length} name${nameDirectory.knownCampaignNames.length === 1 ? '' : 's'}`,
@@ -2939,6 +2988,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       nameDirectory,
       folderPathById,
       piecesById.size > 0 ? piecesById : null,
+      familyByCampaignId,
       !args.dryrun,
       nextDay.date,
     );
