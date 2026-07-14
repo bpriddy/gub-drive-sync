@@ -8,6 +8,7 @@
  *   npx tsx scripts/test-year-gate.ts
  */
 import { extractYearFromPath, partitionClusterByYear } from '../src/drive/campaign-merge';
+import { isForeignCampaignTag } from './backfill';
 import { buildAttributor, overlayPieceAnchors, type EntityMap } from '../src/drive/structure';
 
 let failures = 0;
@@ -104,6 +105,16 @@ check('LLM classification for piece folder dropped', overlaid.classified.filter(
 // A piece folder NOT in this tree injects nothing.
 const foreign = overlayPieceAnchors(map, [{ driveFolderId: 'f-elsewhere', campaignId: 'x', campaignName: 'X', pieceId: 'p-x', pieceName: 'X piece' }]);
 check('foreign piece folder ignored', foreign.classified.length, map.classified.length);
+
+// ── 4. isForeignCampaignTag (campaign scans write only this campaign) ──────
+console.log('\nisForeignCampaignTag');
+const SCANNED = '02. Chevy | BHAC [GMCHV55000216]';
+check('no tag → not foreign', isForeignCampaignTag('', SCANNED), false);
+check('verbatim scanned name → not foreign', isForeignCampaignTag(SCANNED, SCANNED), false);
+check('short containment ("BHAC") → not foreign', isForeignCampaignTag('BHAC', SCANNED), false);
+check('containment with case drift → not foreign', isForeignCampaignTag('chevy | bhac', SCANNED), false);
+check('different campaign → FOREIGN', isForeignCampaignTag('Super Cruise with Heather Dubrow', SCANNED), true);
+check('different campaign, same brand → FOREIGN', isForeignCampaignTag('Chevy Racing', SCANNED), true);
 
 console.log(failures === 0 ? '\n🎯 ALL PASS' : `\n⚠ ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);

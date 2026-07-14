@@ -129,6 +129,31 @@ import type { TraversedFile } from '../src/drive/types';
 import { config } from '../src/config';
 
 /**
+ * Campaign-scoped scans write ONLY the scanned campaign + its account. An
+ * observation whose subject tag resolves to a DIFFERENT campaign is misfiled
+ * content (human error — e.g. another project's notes living in this folder);
+ * it is DROPPED, not absorbed, so it can't pollute this campaign's dossier.
+ * The reviewer step will eventually adjudicate these; for now the loss is
+ * accepted by design.
+ *
+ * Foreignness is judged against the ONE scanned campaign name: no tag = not
+ * foreign (folder-scope default); a tag that the fuzzy matcher accepts OR
+ * that is contained in / contains the scanned name (normalized) = this
+ * campaign ("BHAC" must match "02. Chevy | BHAC [GMCHV…]"); anything else
+ * is foreign.
+ */
+export function isForeignCampaignTag(tagRaw: string, scannedCampaignName: string): boolean {
+  const tag = tagRaw.trim();
+  if (!tag) return false;
+  if (matchCampaignName(tag, [scannedCampaignName])) return false;
+  const norm = (x: string) => x.toLowerCase().replace(/\s+/g, ' ').trim();
+  const a = norm(tag);
+  const b = norm(scannedCampaignName);
+  if (a.length >= 3 && (b.includes(a) || a.includes(b))) return false;
+  return true;
+}
+
+/**
  * System-staff UUID used as `changed_by` on every *_changes row written
  * during --apply mode. Seeded by migration 20260525100000. Same staff
  * used by the heal pipeline — backfill and heal share the "auto-applied
@@ -1545,6 +1570,8 @@ async function processBatch(
   let campaignObsDiscarded = 0;
   /** Tagged campaign obs whose name didn't match anything known → routed into phantom buckets. */
   let phantomObsRouted = 0;
+  /** Campaign scans only: obs about a DIFFERENT campaign — misfiled content, dropped. */
+  let foreignObsDropped = 0;
   /** Tagged campaign obs whose name fuzzy-matched (Levenshtein) to a known campaign — logged for visibility. */
   let fuzzyMatchedObs = 0;
 
@@ -1602,7 +1629,12 @@ async function processBatch(
           // from this list when an obs's subject is a specific campaign;
           // a free-form name signals an unknown campaign to the
           // orchestrator's phantom bucket.
-          knownCampaigns: nameDirectory?.knownCampaignNames ?? [],
+          // Campaign scans get the scanned campaign's own name as the
+          // vocabulary so this-campaign tags come back verbatim (the prompt
+          // prefers exact KNOWN_CAMPAIGNS matches); foreign subjects stay
+          // free-form and are dropped below.
+          knownCampaigns:
+            nameDirectory?.knownCampaignNames ?? (ctx.type === 'campaign' ? [ctx.name] : []),
         }),
       );
 
@@ -1639,9 +1671,16 @@ async function processBatch(
       //     in campaign folders nest under that campaign. Account-level
       //     files have no owner; campaign obs are discarded (counted).
       if (!attributor) {
-        // Regime 1 — piece-tagged files (gathered from a piece's folder in a
-        // campaign-scoped scan) bucket to the piece; the rest to the campaign.
+        // Regime 1 — campaign scans write ONLY this campaign (+ account).
+        // A foreign-subject obs is misfiled content (human error): drop +
+        // count, never absorb. Piece-tagged files bucket to the piece; the
+        // rest to the campaign.
         for (const obs of res.campaign) {
+          if (isForeignCampaignTag(obs.entity_campaign_name ?? '', ctx.name)) {
+            foreignObsDropped += 1;
+            log(`      ⊘ foreign-campaign obs dropped ("${(obs.entity_campaign_name ?? '').slice(0, 60)}")`);
+            continue;
+          }
           if (file.pieceId && !piecesById?.has(file.pieceId)) {
             // Cached piece tag no longer matches a piece of THIS campaign
             // (piece re-owned/deleted mid-chain). No wrong writes: drop the
@@ -1808,6 +1847,9 @@ async function processBatch(
 
   for (const pb of pieceBuckets.values()) {
     log(`    Piece "${pb.pieceName}" (campaign "${pb.campaignName}")  ·  ${pb.observations.length} obs`);
+  }
+  if (foreignObsDropped > 0) {
+    log(`    ⚠ ${foreignObsDropped} foreign-campaign obs dropped (misfiled content — campaign scans write only this campaign + account)`);
   }
   if (ideaCtx && ideaCtx.stats.deckFiles > 0) {
     const i = ideaCtx.stats;
