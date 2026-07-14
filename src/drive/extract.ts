@@ -390,6 +390,12 @@ export async function extractGoogleSlides(presentationId: string): Promise<strin
   if (pres.title) parts.push(`# ${pres.title}\n\n`);
 
   for (const [i, slide] of (pres.slides ?? []).entries()) {
+    // Skipped slides (slideProperties.isSkipped) are deliberately hidden by
+    // the deck's authors — killed concepts, old rounds, appendix. They never
+    // enter the pipeline: what the team cut must not feed interpretation,
+    // dossiers, or idea extraction. Numbering keeps the original slide index
+    // so extracted text cross-references the real deck.
+    if (slide.slideProperties?.isSkipped) continue;
     parts.push(`## Slide ${i + 1}\n\n`);
 
     // Slide body: walk page elements in declared order.
