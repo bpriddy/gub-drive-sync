@@ -72,18 +72,30 @@ function sleep(ms: number): Promise<void> {
 }
 
 class GeminiLlmDriver implements LlmDriver {
-  readonly name = 'gemini';
+  readonly name: string;
   private client: GoogleGenAI;
 
-  constructor(apiKey: string) {
+  constructor(init: { project: string; location: string } | { apiKey: string }) {
     // retryOptions.attempts=1: OUR loop below owns retries (logging +
     // backoff); pinning the SDK's built-in retry off prevents the two
     // from stacking (SDK default is 5 attempts when retryOptions is set,
     // and unspecified behavior otherwise — explicit is deterministic).
-    this.client = new GoogleGenAI({
-      apiKey,
-      httpOptions: { retryOptions: { attempts: 1 } },
-    });
+    const httpOptions = { retryOptions: { attempts: 1 } };
+    if ('project' in init) {
+      // Gemini Enterprise Agent Platform: auth via ADC (the Cloud Run job's
+      // service account in deploy; gcloud ADC locally) — no API key. The
+      // location must be 'global' for gemini-3.5-flash (global-endpoint-only).
+      this.name = 'gemini-enterprise';
+      this.client = new GoogleGenAI({
+        enterprise: true,
+        project: init.project,
+        location: init.location,
+        httpOptions,
+      });
+    } else {
+      this.name = 'gemini';
+      this.client = new GoogleGenAI({ apiKey: init.apiKey, httpOptions });
+    }
   }
 
   async complete(req: LlmCompletionRequest): Promise<LlmCompletionResult> {
@@ -197,11 +209,23 @@ function emptyInstance(schema: Schema): unknown {
 }
 
 function createDriver(): LlmDriver {
-  if (!config.GEMINI_API_KEY) {
-    logger.warn('[llm] GEMINI_API_KEY unset — using mock driver. LLM interpretation will return empty results.');
-    return new MockLlmDriver();
+  if (config.GEMINI_USE_ENTERPRISE && config.GCP_PROJECT_ID) {
+    logger.info(
+      { project: config.GCP_PROJECT_ID, location: config.GEMINI_LOCATION },
+      '[llm] Gemini Enterprise Agent Platform (ADC auth)',
+    );
+    return new GeminiLlmDriver({
+      project: config.GCP_PROJECT_ID,
+      location: config.GEMINI_LOCATION,
+    });
   }
-  return new GeminiLlmDriver(config.GEMINI_API_KEY);
+  if (config.GEMINI_API_KEY) {
+    return new GeminiLlmDriver({ apiKey: config.GEMINI_API_KEY });
+  }
+  logger.warn(
+    '[llm] no Gemini config (GEMINI_USE_ENTERPRISE+GCP_PROJECT_ID or GEMINI_API_KEY) — using mock driver. LLM interpretation will return empty results.',
+  );
+  return new MockLlmDriver();
 }
 
 export const defaultLlm: LlmDriver = createDriver();

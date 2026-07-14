@@ -37,6 +37,23 @@ const EnvSchema = z.object({
 
   // ── AI / Gemini ──────────────────────────────────────────────────────────
   GEMINI_API_KEY: z.string().optional(),
+  /**
+   * Route Gemini calls through the Gemini Enterprise Agent Platform (the
+   * GCP-project surface: SA/ADC auth, project quotas + billing, enterprise
+   * data terms) instead of the consumer Developer API. Requires
+   * GCP_PROJECT_ID; auth is ADC (job SA in Cloud Run, gcloud ADC locally).
+   * 'false' falls back to the consumer API key path.
+   */
+  GEMINI_USE_ENTERPRISE: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  /**
+   * Model location for the enterprise surface. gemini-3.5-flash is served
+   * from the GLOBAL endpoint only — not a region. Distinct from GCP_REGION
+   * (where our infra lives).
+   */
+  GEMINI_LOCATION: z.string().default('global'),
   GEMINI_MAX_INPUT_CHARS: z.string().default('40000').transform(Number),
   /**
    * Worker-pool concurrency for the per-entity distill+synth+write loop
