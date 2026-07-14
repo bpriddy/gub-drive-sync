@@ -158,6 +158,12 @@ export interface Args {
   /** Stage 1: resolve + print the structure entity map, then exit. */
   structureOnly: boolean;
   /**
+   * --flat: process EVERY file in ONE scan stamped with today's date —
+   * no day-by-day historical replay, no cursor gating. For dev snapshots
+   * ("just scan everything as of now"). Marks bootstrap completed.
+   */
+  flat?: boolean;
+  /**
    * --dryrun: preview only. Skip all DB writes; print what WOULD be
    * persisted. The default (no flag) is to actually run the backfill:
    * field_changes → entity columns, *_changes audit rows, status_markdown,
@@ -224,6 +230,7 @@ function parseArgs(argv: string[]): Args {
     outputPath: get('--output') ?? null,
     structureOnly: has('--structure'),
     dryrun: has('--dryrun'),
+    flat: has('--flat'),
   };
   if (accountId) out.accountId = accountId;
   if (campaignId) out.campaignId = campaignId;
@@ -2797,7 +2804,11 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
 
   let finalCursor: string | null = effectiveCursor;
   let bootstrapCompleted = false;
-  const nextDay = activeDates.find((d) => !effectiveCursor || d.date > effectiveCursor);
+  // --flat: one scan over EVERYTHING, stamped today. Ignores the cursor,
+  // skips the historical day-walk entirely.
+  const nextDay = args.flat
+    ? { date: new Date().toISOString().slice(0, 10), files: activeDates.flatMap((d) => d.files) }
+    : activeDates.find((d) => !effectiveCursor || d.date > effectiveCursor);
   if (!nextDay) {
     log(rule(`No active days past ${effectiveCursor ?? '(start)'} — bootstrap caught up`));
     bootstrapCompleted = true;

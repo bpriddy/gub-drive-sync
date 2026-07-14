@@ -47,6 +47,7 @@ import { processBackfillQueue } from './drive/backfill-queue';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
 import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
+import { derivePiecesForAccount } from './drive/piece-derive';
 
 type Mode =
   | 'poll'
@@ -58,7 +59,8 @@ type Mode =
   | 'backfill-pending'
   | 'merge-campaign-dupes'
   | 'clear-account'
-  | 'extract-ideas';
+  | 'extract-ideas'
+  | 'derive-pieces';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -71,6 +73,7 @@ const ALL_MODES: readonly Mode[] = [
   'merge-campaign-dupes',
   'clear-account',
   'extract-ideas',
+  'derive-pieces',
 ];
 
 interface ParsedArgs {
@@ -217,6 +220,22 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
+  if (mode === 'derive-pieces') {
+    // --account-name X (or --account-id)
+    // --confirm  (create pieces; absent = dry-run report)
+    for (let i = 1; i < positional.length; i++) {
+      const arg = positional[i]!;
+      if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
+      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
+      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
+      else if (arg === '--confirm') out.confirm = true;
+    }
+    if (!out.accountId && !out.accountName) {
+      throw new Error('mode=derive-pieces requires --account-name <fragment> (or --account-id)');
+    }
+  }
+
   return out;
 }
 
@@ -324,6 +343,21 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
         apply: args.confirm ?? false,
       });
       return result as unknown as Record<string, unknown>;
+    }
+
+    case 'derive-pieces': {
+      // Pieces the PRIMARY way: identified executions from each campaign's
+      // dossier (content-born), reconciled against folder-born pieces.
+      // No --confirm = dry-run report; --confirm creates folder-less rows.
+      const account = args.accountId
+        ? await prisma.account.findUnique({ where: { id: args.accountId }, select: { id: true, name: true } })
+        : await prisma.account.findFirst({
+            where: { name: { contains: args.accountName!, mode: 'insensitive' } },
+            select: { id: true, name: true },
+          });
+      if (!account) throw new Error('account not found');
+      const results = await derivePiecesForAccount({ accountId: account.id, apply: args.confirm ?? false });
+      return { accountName: account.name, apply: args.confirm ?? false, campaigns: results } as unknown as Record<string, unknown>;
     }
 
     case 'extract-ideas': {
