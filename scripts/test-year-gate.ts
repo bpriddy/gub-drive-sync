@@ -7,6 +7,7 @@
  *
  *   npx tsx scripts/test-year-gate.ts
  */
+import { extractJobNumber } from '../src/drive/job-number';
 import { extractYearFromPath, partitionClusterByYear } from '../src/drive/campaign-merge';
 import { isForeignCampaignTag } from './backfill';
 import { buildAttributor, overlayPieceAnchors, type EntityMap } from '../src/drive/structure';
@@ -121,6 +122,15 @@ check('PIECE name → not foreign (identity family)', isForeignCampaignTag('BHAC
 check('verbatim piece title → not foreign', isForeignCampaignTag(FAMILY[1]!, FAMILY), false);
 check('different campaign → FOREIGN', isForeignCampaignTag('Super Cruise with Heather Dubrow', FAMILY), true);
 check('different campaign, same brand → FOREIGN', isForeignCampaignTag('Chevy Racing', FAMILY), true);
+
+// ── 5. extractJobNumber (HARD piece identity from bracket codes) ───────────
+console.log('\nextractJobNumber');
+check('campaign folder code', extractJobNumber('02. Chevy | BHAC [GMCHV55000216]'), 'GMCHV55000216');
+check('variant folder code', extractJobNumber('13. Chevy | BHAC AI + LMA Tool [GMCHV550002340]'), 'GMCHV550002340');
+check('no bracket → null', extractJobNumber('Truck Season 2025'), null);
+check('year-only bracket → null (needs letter prefix)', extractJobNumber('Archive [2026]'), null);
+check('lowercase code → null (convention is uppercase)', extractJobNumber('thing [gmchv55000216]'), null);
+check('bracket words → null', extractJobNumber('[EXT] BHAC | R4'), null);
 
 console.log(failures === 0 ? '\n🎯 ALL PASS' : `\n⚠ ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);

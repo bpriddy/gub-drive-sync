@@ -116,6 +116,7 @@ Weight the FILE NAME and FOLDER PATH heavily — agency naming is dense with int
 STEP 2 — EXTRACT IDEAS  (only when deck_type is "pitch" or "creative_review")
 Extract ONLY things the deck itself PRESENTS AS an idea — a named creative concept, territory, route, or an explicit "here's our idea." These are the distinct creative directions the deck frames as ideas.
 Do NOT infer ideas from: the brief, the strategy, the insight, the background, the media plan, or execution/production notes. If it isn't presented as a creative idea, it is not one.
+An idea is ONE discrete concept. Never emit the campaign's overall platform, approach, or creative direction as an idea — "the illustration-led storytelling platform" is the campaign itself, not an idea. When a deck presents an umbrella with distinct concepts inside it, extract the concepts, not the umbrella.
 
 For each idea:
   - name: the idea's handle/title as the deck calls it (verbatim when it has one; a short faithful label otherwise).

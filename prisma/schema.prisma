@@ -313,6 +313,7 @@ model Account {
   driveScanLogs      DriveScanLog[]
   driveProposals     DriveChangeProposal[]
   driveSyncRuns       DriveSyncRun[]
+  driveRestrictedFiles DriveRestrictedFile[]
 
   @@index([ownerStaffId])
   @@index([accountExecStaffId])
@@ -417,6 +418,7 @@ model Campaign {
   driveFileSnapshots DriveFileSnapshot[]
   driveScanLogs      DriveScanLog[]
   driveProposals     DriveChangeProposal[]
+  driveRestrictedFiles DriveRestrictedFile[]
   pieces             CampaignPiece[]
 
   @@index([accountId])
@@ -796,6 +798,34 @@ model SyncRun {
 //      poll catches it, clears pageToken, sets lastOutcome='bootstrap_required',
 //      returns 503. Same recovery path as initial bootstrap.
 
+/// Restricted-file worklist: files visible in listings but 403 on content
+/// export (shortcuts to unshared personal-drive docs, download-restricted
+/// files). Re-probed each scan until resolved or human-ignored in gub-admin.
+/// Migration owned by gcp-universal-backend (20260715000000_drive_restricted_files).
+model DriveRestrictedFile {
+  id             String    @id @default(uuid()) @db.Uuid
+  accountId      String    @map("account_id") @db.Uuid
+  campaignId     String?   @map("campaign_id") @db.Uuid
+  fileId         String    @map("file_id")
+  name           String
+  path           String?
+  mimeType       String?   @map("mime_type")
+  parentFolderId String?   @map("parent_folder_id")
+  /// restricted | ignored | resolved (CHECK-enforced)
+  status         String    @default("restricted")
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz
+  lastProbedAt   DateTime  @default(now()) @map("last_probed_at") @db.Timestamptz
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz
+  ignoredBy      String?   @map("ignored_by") @db.Uuid
+
+  account  Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  @@unique([accountId, fileId])
+  @@index([accountId, status])
+  @@map("drive_restricted_files")
+}
+
 model DriveSyncState {
   id                Int       @id @default(1)
   pageToken         String?   @map("page_token") @db.Text
@@ -1096,6 +1126,10 @@ model CampaignPiece {
   /// synthesis targets; the quad-output prompt always emits a sensitive tier.
   statusSensitiveMarkdown String? @map("status_sensitive_markdown") @db.Text
   driveFolderId   String?   @map("drive_folder_id") @unique
+  /// HARD piece identity: agency job number (bracket code on project folders,
+  /// e.g. GMCHV550002340). Outranks name matching — same number = same piece,
+  /// always. NULL for content-born pieces with no surfaced number (name-keyed).
+  jobNumber       String?   @map("job_number") @unique
   driveFolderUrl  String?   @map("drive_folder_url")
   driveFolderPath String?   @map("drive_folder_path")
   driveLastRunAt  DateTime? @map("drive_last_run_at") @db.Timestamptz

@@ -96,14 +96,15 @@ STEP 1 — SAME IDEA?
 Return the INDEX (the [n]) of the on-file idea that is the SAME underlying creative concept as the new one — the same core device / territory / mechanic — even if the name differs, the wording differs, or it is a later refinement round. If none is the same idea, return 0.
   - SAME: "LMA Character Generator" vs "AI Character Web Experience" vs "American Favorites Dealer Kit" when all describe one AI tool that generates local dealer characters. Renames and reworded rounds of one concept are the same idea.
   - NOT SAME: two genuinely distinct concepts that merely share a campaign, a theme, or a season. When unsure, prefer 0 (a wrong merge silently destroys a real idea; a missed merge only leaves a duplicate we can catch later).
+  - NOT SAME: a discrete concept vs a platform/umbrella-level description (an overall creative approach, a campaign's storytelling platform). Never merge a specific concept into an umbrella idea or an umbrella into a concept — an idea that keeps absorbing everything has stopped being an idea.
 
 STEP 2 — MERGE (only if match_index > 0)
-Produce merged_facets = the unified facet set to REPLACE the matched idea's facets:
-  - Keep every distinct facet from BOTH the on-file idea and the new one.
-  - Where a new facet REFINES or EXPANDS an on-file one (more outputs, a sharper mechanic, an added platform), keep the fuller/newer row and DROP the stale one it supersedes — do not keep both.
-  - Deduplicate rows that say the same thing.
+Compose merged_facets FRESH — the on-file rows and the new rows are raw material, not a base to append to. State the idea in the FEWEST right-sized rows that carry all of its distinct, current meaning; the result REPLACES the matched idea's facets:
+  - SUPERSEDE FIRST, keep second. Where a new facet REFINES, EXPANDS, or OUTDATES an on-file one (more outputs, a sharper mechanic, an added platform, a proposal that has since happened), keep ONE row — the fuller or newer — and DROP the one it supersedes. An outcome row replaces its proposal row ("launched on MLB Opening Day" replaces "planned TV spot for MLB Opening Day").
+  - Keep a facet from either side only when it is genuinely distinct AND still current after the rule above.
+  - Apply these rules across the ENTIRE combined set, including rows that were already on file against each other — the merged set is a cleanup, not an append. Rows that say the same thing (including near-rephrasings) collapse to one.
   - Keep each row right-sized (the words that carry its meaning) — do not pad to prose, do not compress to a bare keyword.
-  - This is the on-file idea moving FORWARD; preserve what's still true, absorb what's new.
+  - This is the on-file idea moving FORWARD; preserve what's still true, absorb what's new. If the set grows merge after merge, you are keeping rows you should be superseding.
 If match_index = 0, set merged_facets to the new idea's facets unchanged.`;
 }
 

@@ -73,6 +73,7 @@ import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../src/prisma';
 import {
+  driveClient,
   listRevisions,
   listSharedDriveFiles,
   probeFolder,
@@ -80,7 +81,13 @@ import {
 } from '../src/drive/client';
 import { traverseFolder } from '../src/drive/traversal';
 import { extractText, predictExtractionSkip } from '../src/drive/extract';
-import { interpretFile, type AccountObservation, type CampaignObservation } from '../src/drive/interpret';
+import { interpretAssetFolder } from '../src/drive/asset-folder';
+import {
+  interpretFile,
+  type AccountObservation,
+  type CampaignObservation,
+  type InterpretFileOutput,
+} from '../src/drive/interpret';
 import {
   ACCOUNT_FIELD_WRITE,
   ACCOUNT_WRITABLE_FIELDS,
@@ -124,7 +131,13 @@ import {
   type PieceAnchor,
 } from '../src/drive/structure';
 import { matchCampaignName } from '../src/drive/name-similarity';
-import { createIdeaScanContext, processFileIdeas, type IdeaScanStats } from '../src/drive/idea-scan';
+import {
+  createIdeaScanContext,
+  extractIdeaCandidates,
+  mergeIdeaCandidates,
+  type IdeaScanStats,
+} from '../src/drive/idea-scan';
+import type { ExtractedIdea } from '../src/drive/idea-extraction';
 import type { TraversedFile } from '../src/drive/types';
 import { config } from '../src/config';
 
@@ -212,7 +225,19 @@ export interface Args {
    * Not set from argv — populated by the caller.
    */
   captureLog?: string[];
+  /**
+   * --concurrency N: per-file worker count WITHIN one day's batch (extract
+   * → interpret → idea extraction run in parallel; all routing, counters,
+   * and the idea match/merge ratchet stay serial in file-index order).
+   * PARALLELISM NEVER CROSSES DAYS — days are a serial read-modify-write
+   * chain over entity state. 1 = fully serial (the debugging escape hatch).
+   * Default: DEFAULT_CONCURRENCY.
+   */
+  concurrency?: number;
 }
+
+/** Within-day per-file worker count when --concurrency isn't passed. */
+const DEFAULT_CONCURRENCY = 4;
 
 export interface BackfillRunResult {
   /**
@@ -264,6 +289,15 @@ function parseArgs(argv: string[]): Args {
   };
   if (accountId) out.accountId = accountId;
   if (campaignId) out.campaignId = campaignId;
+
+  const concurrencyRaw = get('--concurrency');
+  if (concurrencyRaw !== undefined) {
+    const n = Number(concurrencyRaw);
+    if (!Number.isInteger(n) || n < 1 || n > 16) {
+      throw new Error('--concurrency must be an integer between 1 and 16');
+    }
+    out.concurrency = n;
+  }
 
   if (out.structureOnly && !accountId) {
     throw new Error('--structure requires --account-id (structure resolution is account-rooted)');
@@ -353,6 +387,9 @@ const PHASE_LABELS: Record<string, string> = {
   revisions_fetch: 'Revisions fetch (Drive)',
   extract_text: 'Extract text (per-file)',
   interpret_file: 'Interpret file (per-file LLM)',
+  idea_extract: 'Idea extraction (per-deck LLM)',
+  idea_merge: 'Idea match/merge (serial LLM+DB)',
+  interpret_asset_folder: 'Asset folders (name-only LLM)',
   distill: 'Distill (per-entity LLM)',
   synthesis: 'Synthesize (per-entity LLM)',
   db_writes: 'DB writes (persistTarget)',
@@ -1491,6 +1528,18 @@ function routeCampaignObs(
   return { kind: 'discard' };
 }
 
+/**
+ * Drive returned 403 for a file's CONTENT while its metadata was listable —
+ * the restricted-file condition (shortcut to an unshared personal-drive doc,
+ * or download-restricted file), distinct from transient errors. These become
+ * worklist rows re-probed every scan; see the drive_restricted_files model.
+ */
+function isDrivePermissionError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { code?: number | string; response?: { status?: number } };
+  return e.code === 403 || e.code === '403' || e.response?.status === 403;
+}
+
 async function processBatch(
   batch: FileWithRevisions[],
   ctx: EntityCtx,
@@ -1530,6 +1579,11 @@ async function processBatch(
    * future forward-sync callers it'd be today's date.
    */
   editedAt: string,
+  /**
+   * Per-file worker count WITHIN this one batch (= one day). See the
+   * scan-parallelism doctrine at the pool below: days never overlap.
+   */
+  concurrency: number,
 ): Promise<BatchOutcome> {
   log(`  Extracting + interpreting ${batch.length} file(s)…`);
 
@@ -1579,11 +1633,105 @@ async function processBatch(
       ? [ctx.name, ...(piecesById ? Array.from(piecesById.values()).map((p) => p.name) : [])]
       : [ctx.name];
 
+  // ── Restricted-file re-probe ─────────────────────────────────────────────
+  // A sharing fix does NOT bump modifiedTime, so delta gating would never
+  // retry a restricted file on its own. Append every still-'restricted'
+  // worklist row for this entity to the batch (skipping ids already
+  // present) — the normal worker probes it: still 403 → lastProbedAt
+  // advances; readable → the content flows through the full pipeline and
+  // the row resolves. 'ignored' rows (human action in gub-admin) are never
+  // probed. Cost: one Drive call per still-restricted file per scan.
+  const probeCandidates = await prisma.driveRestrictedFile.findMany({
+    where: {
+      accountId: ctx.accountId,
+      status: 'restricted',
+      ...(ctx.type === 'campaign' ? { campaignId: ctx.id } : {}),
+    },
+  });
+  const probedFileIds = new Set<string>();
+  if (probeCandidates.length > 0) {
+    log(`  Re-probing ${probeCandidates.length} restricted file(s)…`);
+    const inBatch = new Set(batch.map((b) => b.file.id));
+    const drive = await driveClient();
+    for (const r of probeCandidates) {
+      probedFileIds.add(r.fileId);
+      if (inBatch.has(r.fileId)) continue;
+      // Fresh metadata fetch: shortcuts need shortcutDetails (targetId +
+      // targetMimeType) for extractText to follow them — the worklist row
+      // doesn't carry that, and it can change (someone may replace the
+      // shortcut's target). Metadata access can itself 403 on some
+      // restricted shapes — treat that as "still restricted".
+      let meta: {
+        name?: string | null;
+        mimeType?: string | null;
+        parents?: string[] | null;
+        size?: string | null;
+        shortcutDetails?: { targetId?: string | null; targetMimeType?: string | null } | null;
+      };
+      try {
+        const res = await drive.files.get({
+          fileId: r.fileId,
+          fields: 'id,name,mimeType,parents,size,shortcutDetails(targetId,targetMimeType)',
+          supportsAllDrives: true,
+        });
+        meta = res.data;
+      } catch (err) {
+        if (isDrivePermissionError(err)) {
+          batch.push({
+            file: {
+              id: r.fileId,
+              name: r.name,
+              mimeType: r.mimeType ?? 'application/octet-stream',
+              parents: r.parentFolderId ? [r.parentFolderId] : [],
+              path: r.path ?? r.name,
+              modifiedTime: null,
+              modifiedByEmail: null,
+              createdTime: null,
+              size: null,
+              isFolder: false,
+            },
+            revisions: [],
+          });
+          continue;
+        }
+        log(`  ⚠ re-probe metadata fetch failed for "${r.name}": ${summarizeError(err)}`);
+        continue;
+      }
+      batch.push({
+        file: {
+          id: r.fileId,
+          name: meta.name ?? r.name,
+          mimeType: meta.mimeType ?? r.mimeType ?? 'application/octet-stream',
+          parents: meta.parents ?? (r.parentFolderId ? [r.parentFolderId] : []),
+          path: r.path ?? r.name,
+          modifiedTime: null,
+          modifiedByEmail: null,
+          createdTime: null,
+          size: meta.size ? Number(meta.size) : null,
+          isFolder: false,
+          ...(meta.shortcutDetails?.targetId && meta.shortcutDetails?.targetMimeType
+            ? {
+                shortcutTarget: {
+                  id: meta.shortcutDetails.targetId,
+                  mimeType: meta.shortcutDetails.targetMimeType,
+                },
+              }
+            : {}),
+        },
+        revisions: [],
+      });
+    }
+  }
+
   const editors = new Map<string, number>();
 
   let filesExtracted = 0;
   let filesSkipped = 0;
   let filesErrored = 0;
+  /** Files visible in listings but 403 on content export → worklist rows. */
+  let filesRestricted = 0;
+  /** Previously restricted files that became readable this scan (rows resolved). */
+  let filesRestored = 0;
   let filesZeroObs = 0;
   let accountLevelFiles = 0;
   let campaignObsDiscarded = 0;
@@ -1594,57 +1742,143 @@ async function processBatch(
   /** Tagged campaign obs whose name fuzzy-matched (Levenshtein) to a known campaign — logged for visibility. */
   let fuzzyMatchedObs = 0;
 
-  for (const { file, revisions } of batch) {
-    // Tally editors from revisions metadata (works even if extraction fails)
-    for (const r of revisions) {
-      const e = r.editorEmail ?? '(unknown)';
-      editors.set(e, (editors.get(e) ?? 0) + 1);
-    }
+  // Binaries-only folders: when EVERY file in a folder skips extraction on
+  // mime (fonts, images, video), the per-file prompt never sees the folder
+  // — but path + file names are still evidence ("Fonts/Louis-Bold.ttf"
+  // establishes the typeface). Collect unsupported-mime skips per parent
+  // folder during the loop; folders that also produced readable text are
+  // excluded afterwards (their extractable files already carry the
+  // location context).
+  const parentPathOf = (f: { path: string }): string => {
+    const i = f.path.lastIndexOf(' / ');
+    return i > 0 ? f.path.slice(0, i) : f.path;
+  };
+  const binaryOnlyFolders = new Map<
+    string,
+    { folderPath: string; fileNames: string[]; firstFileId: string; attribution: EntityAttribution }
+  >();
+  const foldersWithText = new Set<string>();
 
-    // Resolve attribution from the file's immediate parent folder.
-    // Without structure (attributor=null), every file is attributed to the
-    // scanned entity itself — preserves the legacy campaign-scan behavior.
-    let attribution: EntityAttribution;
-    if (attributor) {
-      attribution = attributor(file.parents?.[0] ?? null);
-    } else {
-      attribution = {
-        ownerType: ctx.type,
-        campaignFolderId: ctx.type === 'campaign' ? ctx.folderId : null,
-        campaignName: ctx.campaignName,
-        matchedCampaignId: null,
-        campaignStatus: ctx.type === 'campaign' ? 'existing' : null,
-        pieceId: null,
-        pieceName: null,
-        pieceFolderId: null,
+  /**
+   * Route a synthetic (non-LLM-tagged) observation by folder attribution:
+   * campaign zone → that campaign's bucket (legacy bucket on campaign
+   * scans), account zone → the account bucket. Used by the asset-folder
+   * pass and restricted-file sightings — deterministic routing, no tags.
+   */
+  function pushRoutedObs(
+    obs: { text: string; reasoning: string; confidence: number },
+    sourceFileId: string,
+    attribution: EntityAttribution,
+  ): void {
+    if (attribution.ownerType !== 'campaign') {
+      accountBucket.push({ observation: obs, sourceFileId });
+      return;
+    }
+    if (!attributor) {
+      legacyCampaignBucket.push({ observation: obs, sourceFileId });
+      return;
+    }
+    const bucketKey =
+      attribution.campaignStatus === 'existing' && attribution.matchedCampaignId
+        ? `existing:${attribution.matchedCampaignId}`
+        : `new:${attribution.campaignFolderId}`;
+    let bucket = campaignBuckets.get(bucketKey);
+    if (!bucket) {
+      bucket = {
+        campaignName: attribution.campaignName ?? '(unnamed campaign)',
+        campaignFolderId: attribution.campaignFolderId,
+        campaignStatus: attribution.campaignStatus ?? 'new',
+        matchedCampaignId: attribution.matchedCampaignId,
+        bucketSource: 'folder',
+        observations: [],
+        fileIds: new Set(),
       };
+      campaignBuckets.set(bucketKey, bucket);
     }
+    bucket.observations.push({ observation: obs, sourceFileId });
+    bucket.fileIds.add(sourceFileId);
+  }
 
-    // The per-file LLM gets the campaign context that owns THIS file (or
-    // null for account-level files). This is the structural fix for the
-    // attribution leakage — every campaign observation is now framed
-    // against the right campaign name.
-    const perFileCampaignName =
-      attribution.ownerType === 'campaign' ? attribution.campaignName : null;
+  // ── Within-day parallel pool ────────────────────────────────────────────
+  // PARALLELISM IS SCOPED TO THIS ONE BATCH (= one day). Days are a serial
+  // read-modify-write chain over entity state — distillation reads what the
+  // previous day's synthesis wrote, and supersede order IS day order — so
+  // days must never overlap (scan-parallelism doctrine, locked 2026-07-15).
+  //
+  // Split of responsibilities:
+  //   runFileWorker (parallel): the expensive independent I/O — extract →
+  //     interpret → deck-gated idea EXTRACTION. Touches no shared state.
+  //   applyOutcome (serial, strict file-index order): everything that
+  //     mutates shared state — bucket routing, counters, logging, and the
+  //     idea match/merge ratchet. Because application is index-ordered, a
+  //     parallel run hands distillation byte-identical buckets to a serial
+  //     run, and the ideas ratchet keeps its deterministic chronology.
 
-    const interpretVocabulary: string[] = nameDirectory
-      ? attribution.ownerType === 'campaign'
-        ? ((attribution.matchedCampaignId
-            ? familyByCampaignId?.get(attribution.matchedCampaignId)
-            : undefined) ?? (attribution.campaignName ? [attribution.campaignName] : []))
-        : nameDirectory.knownCampaignNames
-      : ctx.type === 'campaign'
-        ? ownIdentityNames
-        : [];
+  interface WorkerOutcome {
+    file: TraversedFile;
+    revisions: DriveRevisionMeta[];
+    attribution: EntityAttribution;
+    kind: 'skip' | 'error' | 'restricted' | 'ok';
+    skipReason?: string;
+    skipDetail?: string;
+    error?: unknown;
+    extractor?: string;
+    textLength?: number;
+    res?: InterpretFileOutput;
+    /** Deck-gated candidates from the worker; null = not a deck (or no idea
+     *  context); 'failed' = extraction errored (already counted). */
+    ideaCandidates?: ExtractedIdea[] | 'failed' | null;
+  }
 
+  // Resolve attribution from the file's immediate parent folder.
+  // Without structure (attributor=null), every file is attributed to the
+  // scanned entity itself — preserves the legacy campaign-scan behavior.
+  function resolveAttribution(file: TraversedFile): EntityAttribution {
+    if (attributor) return attributor(file.parents?.[0] ?? null);
+    return {
+      ownerType: ctx.type,
+      campaignFolderId: ctx.type === 'campaign' ? ctx.folderId : null,
+      campaignName: ctx.campaignName,
+      matchedCampaignId: null,
+      campaignStatus: ctx.type === 'campaign' ? 'existing' : null,
+      pieceId: null,
+      pieceName: null,
+      pieceFolderId: null,
+    };
+  }
+
+  async function runFileWorker(item: FileWithRevisions): Promise<WorkerOutcome> {
+    const { file, revisions } = item;
+    const attribution = resolveAttribution(file);
     try {
       const extraction = await timed('extract_text', () => extractText(file));
       if (extraction.kind !== 'ok') {
-        const detail = extraction.detail ? ` (${extraction.detail})` : '';
-        log(`    ⊘ ${file.name}  [${file.mimeType}]  skip: ${extraction.reason}${detail}`);
-        filesSkipped++;
-        continue;
+        return {
+          file,
+          revisions,
+          attribution,
+          kind: 'skip',
+          skipReason: extraction.reason,
+          ...(extraction.detail ? { skipDetail: extraction.detail } : {}),
+        };
       }
+
+      // The per-file LLM gets the campaign context that owns THIS file (or
+      // null for account-level files). This is the structural fix for the
+      // attribution leakage — every campaign observation is now framed
+      // against the right campaign name.
+      const perFileCampaignName =
+        attribution.ownerType === 'campaign' ? attribution.campaignName : null;
+
+      const interpretVocabulary: string[] = nameDirectory
+        ? attribution.ownerType === 'campaign'
+          ? ((attribution.matchedCampaignId
+              ? familyByCampaignId?.get(attribution.matchedCampaignId)
+              : undefined) ?? (attribution.campaignName ? [attribution.campaignName] : []))
+          : nameDirectory.knownCampaignNames
+        : ctx.type === 'campaign'
+          ? ownIdentityNames
+          : [];
 
       const res = await timed('interpret_file', () =>
         interpretFile({
@@ -1654,19 +1888,137 @@ async function processBatch(
           accountCurrentState: ctx.accountState,
           campaignName: perFileCampaignName,
           campaignCurrentState: attribution.ownerType === 'campaign' ? ctx.campaignState : null,
-          // Subject-routing vocabulary. The LLM picks entity_campaign_name
-          // from this list when an obs's subject is a specific campaign;
-          // a free-form name signals an unknown campaign to the
-          // orchestrator's phantom bucket.
           // Zone-conditional vocabulary: campaign-zone files get their
           // campaign's identity family (this-campaign/piece tags come back
-          // verbatim; foreign subjects stay free-form → dropped). Account-
-          // zone files get the full known roster — the addressing directory
-          // is welcome only there.
+          // verbatim; foreign subjects are dropped at source or by the
+          // family check). Account-zone files get the full known roster —
+          // the addressing directory is welcome only there.
           knownCampaigns: interpretVocabulary,
         }),
       );
 
+      // Deck-gated idea EXTRACTION runs here (a pure LLM call over text the
+      // worker already holds — parallel-safe). The order-sensitive
+      // match/merge half runs in applyOutcome.
+      let ideaCandidates: ExtractedIdea[] | 'failed' | null = null;
+      if (ideaCtx && res.deckType !== 'other') {
+        ideaCandidates = await timed('idea_extract', () =>
+          extractIdeaCandidates(ideaCtx, { file, text: extraction.text, deckType: res.deckType }),
+        );
+      }
+
+      return {
+        file,
+        revisions,
+        attribution,
+        kind: 'ok',
+        extractor: extraction.extractor,
+        textLength: extraction.text.length,
+        res,
+        ideaCandidates,
+      };
+    } catch (err) {
+      if (isDrivePermissionError(err)) {
+        return { file, revisions, attribution, kind: 'restricted' };
+      }
+      return { file, revisions, attribution, kind: 'error', error: err };
+    }
+  }
+
+  async function applyOutcome(o: WorkerOutcome): Promise<void> {
+    const { file, revisions, attribution } = o;
+    // Tally editors from revisions metadata (works even if extraction fails)
+    for (const r of revisions) {
+      const e = r.editorEmail ?? '(unknown)';
+      editors.set(e, (editors.get(e) ?? 0) + 1);
+    }
+
+    if (o.kind === 'skip') {
+      const detail = o.skipDetail ? ` (${o.skipDetail})` : '';
+      log(`    ⊘ ${file.name}  [${file.mimeType}]  skip: ${o.skipReason}${detail}`);
+      filesSkipped++;
+      if (o.skipReason === 'unsupported_mime') {
+        const folderKey = file.parents?.[0] ?? parentPathOf(file);
+        const rec = binaryOnlyFolders.get(folderKey);
+        if (rec) {
+          rec.fileNames.push(file.name);
+        } else {
+          binaryOnlyFolders.set(folderKey, {
+            folderPath: parentPathOf(file),
+            fileNames: [file.name],
+            firstFileId: file.id,
+            attribution,
+          });
+        }
+      }
+      // A probed file that skips on 'empty' had its content READ (the
+      // extractor ran and found no text) — readable again, resolve the row.
+      // Metadata-only skips (unsupported_mime, shortcut_unverified_size,
+      // oversized) prove nothing about content access: leave the row
+      // restricted — probing is cheap and the operator can Ignore it.
+      if (o.skipReason === 'empty' && probedFileIds.has(file.id)) {
+        filesRestored++;
+        log(`      🔓 previously restricted — now reachable (no extractable text); worklist row resolved`);
+        if (applyToDb) {
+          await prisma.driveRestrictedFile.updateMany({
+            where: { accountId: ctx.accountId, fileId: file.id },
+            data: { status: 'resolved', resolvedAt: new Date(), lastProbedAt: new Date() },
+          });
+        }
+      }
+      return;
+    }
+    if (o.kind === 'restricted') {
+      log(`    ⛔ ${file.name}  RESTRICTED (403 — visible in listings, content not readable)`);
+      filesRestricted++;
+      if (applyToDb) {
+        const existing = await prisma.driveRestrictedFile.findUnique({
+          where: { accountId_fileId: { accountId: ctx.accountId, fileId: file.id } },
+        });
+        if (existing) {
+          await prisma.driveRestrictedFile.update({
+            where: { id: existing.id },
+            data: { lastProbedAt: new Date() },
+          });
+        } else {
+          await prisma.driveRestrictedFile.create({
+            data: {
+              accountId: ctx.accountId,
+              campaignId:
+                attribution.matchedCampaignId ?? (ctx.type === 'campaign' ? ctx.id : null),
+              fileId: file.id,
+              name: file.name,
+              path: file.path,
+              mimeType: file.mimeType,
+              parentFolderId: file.parents?.[0] ?? null,
+            },
+          });
+          // First sighting: the dossier should KNOW the file exists — a
+          // hole you can see beats one you can't (restriction correlates
+          // with value: briefs, budgets, recaps).
+          pushRoutedObs(
+            {
+              text: `A file named "${file.name}" exists at ${file.path} but its content is access-restricted — the sync bot cannot read it.`,
+              reasoning:
+                'Drive returned 403 for content export; the file is visible in folder listings only.',
+              confidence: 1,
+            },
+            file.id,
+            attribution,
+          );
+        }
+      }
+      return;
+    }
+    if (o.kind === 'error') {
+      log(`    ✗ ${file.name}  ERROR: ${summarizeError(o.error)}`);
+      filesErrored++;
+      return;
+    }
+    foldersWithText.add(file.parents?.[0] ?? parentPathOf(file));
+    const res = o.res!;
+
+    try {
       const totalObs = res.account.length + res.campaign.length;
       const symbol = totalObs > 0 ? '✓' : '○';
       const attrLabel =
@@ -1674,7 +2026,7 @@ async function processBatch(
           ? `→ "${attribution.campaignName ?? '(unnamed)'}"${attribution.campaignStatus === 'new' ? ' [NEW candidate]' : ''}`
           : '→ account-level';
       log(
-        `    ${symbol} ${file.name}  [${extraction.extractor}, ${fmtBytes(extraction.text.length)}]  ${attrLabel}  → ${res.account.length} account + ${res.campaign.length} campaign obs  [${res.driver}]`,
+        `    ${symbol} ${file.name}  [${o.extractor}, ${fmtBytes(o.textLength ?? 0)}]  ${attrLabel}  → ${res.account.length} account + ${res.campaign.length} campaign obs  [${res.driver}]`,
       );
       if (totalObs === 0) filesZeroObs++;
 
@@ -1831,28 +2183,115 @@ async function processBatch(
         if (attribution.ownerType !== 'campaign') accountLevelFiles += 1;
       }
 
-      // Ideas tier: deck-gated. Runs after routing so an idea failure can
-      // never affect the observation flow (it also never throws).
-      if (ideaCtx && res.deckType !== 'other') {
+      // Ideas tier — the ordered half of the ratchet. Candidates were
+      // extracted in the worker; match/merge/persist happens HERE, serially
+      // and in file order (concurrent merges would double-create or
+      // interleave the add-and-overwrite log).
+      if (ideaCtx && Array.isArray(o.ideaCandidates) && o.ideaCandidates.length > 0) {
+        const ideas = o.ideaCandidates;
         const ideaCampaignExternalId =
           attribution.ownerType === 'campaign'
             ? ctx.type === 'campaign'
               ? ctx.folderId // owning campaign root (covers piece-tagged files)
               : attribution.campaignFolderId
             : null;
-        log(`      ◆ ${res.deckType} deck — extracting ideas…`);
-        await processFileIdeas(ideaCtx, {
-          file,
-          text: extraction.text,
-          deckType: res.deckType,
-          campaignExternalId: ideaCampaignExternalId,
-        });
+        log(`      ◆ ${res.deckType} deck — merging ${ideas.length} idea(s)…`);
+        await timed('idea_merge', () =>
+          mergeIdeaCandidates(ideaCtx, {
+            file,
+            campaignExternalId: ideaCampaignExternalId,
+            ideas,
+          }),
+        );
+      }
+
+      // A probed file that fully extracted is restored — resolve its
+      // worklist row; its observations just flowed through the normal
+      // pipeline above.
+      if (probedFileIds.has(file.id)) {
+        filesRestored++;
+        log(`      🔓 previously restricted — now readable; worklist row resolved`);
+        if (applyToDb) {
+          await prisma.driveRestrictedFile.updateMany({
+            where: { accountId: ctx.accountId, fileId: file.id },
+            data: { status: 'resolved', resolvedAt: new Date(), lastProbedAt: new Date() },
+          });
+        }
       }
 
       filesExtracted++;
     } catch (err) {
       log(`    ✗ ${file.name}  ERROR: ${summarizeError(err)}`);
       filesErrored++;
+    }
+  }
+
+  // Pool driver: N workers pull files by index; results are applied
+  // strictly in file-index order through a serialized promise chain, so
+  // every shared-state mutation happens in the same order as a serial run.
+  if (concurrency > 1 && batch.length > 1) {
+    log(`  (pool: ${Math.min(concurrency, batch.length)} workers within this day's batch — days stay serial)`);
+  }
+  const outcomes: Array<WorkerOutcome | undefined> = new Array(batch.length);
+  let nextIssue = 0;
+  let nextApply = 0;
+  let applyChain: Promise<void> = Promise.resolve();
+  const enqueueDrain = (): Promise<void> => {
+    applyChain = applyChain.then(async () => {
+      while (nextApply < batch.length && outcomes[nextApply] !== undefined) {
+        const o = outcomes[nextApply]!;
+        outcomes[nextApply] = undefined; // claimed — release for GC
+        nextApply++;
+        await applyOutcome(o);
+      }
+    });
+    return applyChain;
+  };
+  const workerLoop = async (): Promise<void> => {
+    while (true) {
+      const i = nextIssue++;
+      if (i >= batch.length) return;
+      outcomes[i] = await runFileWorker(batch[i]!);
+      void enqueueDrain();
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(concurrency, batch.length || 1)) }, () => workerLoop()),
+  );
+  await enqueueDrain();
+
+  // ── Binaries-only folders → asset observations ─────────────────────────
+  // One name-only LLM call per folder whose every file skipped extraction
+  // on mime. The model judges whether it's a meaningful asset collection
+  // (Fonts, Logos, Brand Assets…) and emits the location fact + any asset
+  // facts the names establish; non-collections return empty. Routing is
+  // deterministic from the folder's attribution — campaign zone to the
+  // campaign's bucket, account zone to the account bucket.
+  let assetFoldersChecked = 0;
+  let assetFolderObs = 0;
+  for (const [folderKey, bf] of binaryOnlyFolders) {
+    if (foldersWithText.has(folderKey)) continue;
+    assetFoldersChecked++;
+    try {
+      const res = await timed('interpret_asset_folder', () =>
+        interpretAssetFolder({
+          accountName: ctx.accountName,
+          campaignName:
+            bf.attribution.ownerType === 'campaign' ? bf.attribution.campaignName : null,
+          folderPath: bf.folderPath,
+          fileNames: bf.fileNames,
+        }),
+      );
+      if (res.observations.length === 0) continue;
+      log(
+        `    ◈ ${bf.folderPath}  (${bf.fileNames.length} binaries) → ${res.observations.length} asset obs  [${res.driver}]`,
+      );
+      for (const obs of res.observations) {
+        pushRoutedObs(obs, bf.firstFileId, bf.attribution);
+        assetFolderObs++;
+      }
+    } catch (err) {
+      log(`    ✗ asset-folder interpret failed for ${bf.folderPath}: ${summarizeError(err)}`);
     }
   }
 
@@ -1865,8 +2304,16 @@ async function processBatch(
     legacyCampaignBucket.length;
 
   log(
-    `  → Extracted OK: ${filesExtracted}  Skipped: ${filesSkipped}  Errored: ${filesErrored}  Zero obs: ${filesZeroObs}`,
+    `  → Extracted OK: ${filesExtracted}  Skipped: ${filesSkipped}  Errored: ${filesErrored}  Restricted: ${filesRestricted}  Zero obs: ${filesZeroObs}`,
   );
+  if (filesRestricted > 0) {
+    log(
+      `  ⛔ ${filesRestricted} restricted file(s) on the worklist — re-probed each scan; fix sharing or mark Ignore in gub-admin`,
+    );
+  }
+  if (filesRestored > 0) {
+    log(`  🔓 ${filesRestored} previously restricted file(s) restored this scan`);
+  }
   log('');
 
   // ── Per-entity observation breakdown ───────────────────────────────────
@@ -1905,6 +2352,9 @@ async function processBatch(
   }
   if (unknownCampaignToAccount > 0) {
     log(`    ↑ ${unknownCampaignToAccount} unknown-campaign obs converted to account observations (no phantoms)`);
+  }
+  if (assetFoldersChecked > 0) {
+    log(`    ◈ Binaries-only folders: ${assetFoldersChecked} checked → ${assetFolderObs} asset obs`);
   }
   if (ideaCtx && ideaCtx.stats.deckFiles > 0) {
     const i = ideaCtx.stats;
@@ -2938,20 +3388,21 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     // we know the file is going to be ⊘'d in processBatch anyway. Log it
     // the same way processBatch would, then short-circuit.
     const extractable: TraversedFile[] = [];
-    let preFilterSkipped = 0;
+    // Predicted skips still flow into the batch (with empty revisions) so
+    // processBatch can log the ⊘ and collect binaries-only asset folders —
+    // the pre-filter only saves the revisions.list call, not extraction
+    // (extractText's metadata check short-circuits before any download).
+    const preFiltered: TraversedFile[] = [];
     for (const file of nextDay.files) {
-      const predicted = predictExtractionSkip(file);
-      if (predicted) {
-        const detail = predicted.detail ? ` (${predicted.detail})` : '';
-        log(`    ⊘ ${file.name}  [${file.mimeType}]  skip: ${predicted.reason}${detail}  (pre-filtered, no revisions fetch)`);
-        preFilterSkipped++;
+      if (predictExtractionSkip(file)) {
+        preFiltered.push(file);
       } else {
         extractable.push(file);
       }
     }
-    if (preFilterSkipped > 0) {
+    if (preFiltered.length > 0) {
       log(
-        `  Pre-filter: ${extractable.length} extractable / ${preFilterSkipped} skipped on mime/size; saving ${preFilterSkipped} revisions.list calls`,
+        `  Pre-filter: ${extractable.length} extractable / ${preFiltered.length} skipped on mime/size; saving ${preFiltered.length} revisions.list calls`,
       );
     }
 
@@ -2978,6 +3429,9 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     }
     if (isTTY) process.stdout.write('\r' + ' '.repeat(100) + '\r');
     if (revFailures > 0) log(`  ⚠ ${revFailures} file(s) failed revisions.list`);
+    for (const file of preFiltered) {
+      withRevisions.push({ file, revisions: [] });
+    }
     log('');
 
     const scanStart = Date.now();
@@ -2991,6 +3445,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       familyByCampaignId,
       !args.dryrun,
       nextDay.date,
+      args.concurrency ?? DEFAULT_CONCURRENCY,
     );
     const scanMs = Date.now() - scanStart;
 

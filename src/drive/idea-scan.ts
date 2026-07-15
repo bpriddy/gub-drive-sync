@@ -22,7 +22,7 @@
 
 import { prisma } from '../prisma';
 import { logger } from '../logger';
-import { extractIdeasFromFile } from './idea-extraction';
+import { extractIdeasFromFile, type ExtractedIdea } from './idea-extraction';
 import { matchAndMergeIdea, type KnownIdea } from './idea-matcher';
 import { facetsEqual, renderFacets } from './idea-runner';
 import { DRIVE_SYNC_SYSTEM_STAFF_ID } from './heal';
@@ -66,31 +66,60 @@ export function createIdeaScanContext(args: {
 }
 
 /**
- * Run idea extraction + match/merge/persist for one file. No-op unless the
- * per-file extractor classified it as a pitch / creative-review deck.
- * Never throws — idea failures must not fail the file's observation flow.
+ * Deck-gated idea EXTRACTION — the parallel-safe half of the ideas flow.
+ * A pure LLM call over the file text: no known-cache reads, no DB writes,
+ * so it may run concurrently across files inside one day's batch (its only
+ * shared touches are stats counters, atomic on Node's single thread).
+ * Returns null unless the file is a pitch / creative-review deck; 'failed'
+ * when extraction errored (counted, never thrown — idea failures must not
+ * fail the file's observation flow).
  */
-export async function processFileIdeas(
+export async function extractIdeaCandidates(
   ctx: IdeaScanContext,
   args: {
     file: TraversedFile;
     text: string;
     deckType: PerFileDeckType;
-    /** Folder id of the owning campaign (external ref on the idea row). */
-    campaignExternalId: string | null;
   },
-): Promise<void> {
-  if (args.deckType === 'other') return;
+): Promise<ExtractedIdea[] | 'failed' | null> {
+  if (args.deckType === 'other') return null;
   ctx.stats.deckFiles += 1;
-
   try {
     const res = await extractIdeasFromFile({
       file: args.file,
       text: args.text,
       accountName: ctx.accountName,
     });
-    if (res.ideas.length === 0) return;
+    return res.ideas;
+  } catch (err) {
+    ctx.stats.ideaErrors += 1;
+    logger.warn(
+      { err, fileId: args.file.id, fileName: args.file.name },
+      '[drive.idea-scan] idea extraction failed for file — observations unaffected',
+    );
+    return 'failed';
+  }
+}
 
+/**
+ * Match/merge/persist for one file's extracted candidates — the ORDER-
+ * SENSITIVE half. It reads and advances the known-ideas cache and writes
+ * the idea/idea_changes ratchet, so it must run serially, in file order
+ * (see the scan-parallelism doctrine: concurrent merges double-create or
+ * interleave the add-and-overwrite log). Never throws.
+ */
+export async function mergeIdeaCandidates(
+  ctx: IdeaScanContext,
+  args: {
+    file: TraversedFile;
+    /** Folder id of the owning campaign (external ref on the idea row). */
+    campaignExternalId: string | null;
+    ideas: ExtractedIdea[];
+  },
+): Promise<void> {
+  if (args.ideas.length === 0) return;
+
+  try {
     if (ctx.known === null) {
       ctx.known = (
         await prisma.idea.findMany({
@@ -101,7 +130,7 @@ export async function processFileIdeas(
       ).map((k) => ({ id: k.id, name: k.name, facets: k.facets }));
     }
 
-    for (const idea of res.ideas) {
+    for (const idea of args.ideas) {
       let matchId: string | null;
       let mergedFacets: string[];
       try {
@@ -173,7 +202,7 @@ export async function processFileIdeas(
     ctx.stats.ideaErrors += 1;
     logger.warn(
       { err, fileId: args.file.id, fileName: args.file.name },
-      '[drive.idea-scan] idea work failed for file — observations unaffected',
+      '[drive.idea-scan] idea merge failed for file — observations unaffected',
     );
   }
 }

@@ -36,6 +36,7 @@ import {
   type DetectedCluster,
 } from './campaign-cluster-detector';
 import { mergeCampaignMarkdowns, type VariantMarkdown } from './campaign-merge-synthesizer';
+import { extractJobNumber } from './job-number';
 
 /**
  * System staff attributed as the actor on merge audit-log entries. Same
@@ -384,6 +385,13 @@ async function applyCluster(
         piecesMinted[v.id] = existing.id;
         continue;
       }
+      // The variant folder's bracket code is the piece's job number — HARD
+      // identity (doctrine 2026-07-15). Guarded against a duplicate holder:
+      // the global unique index would abort the whole merge tx otherwise.
+      const variantJobNumber = extractJobNumber(v.name);
+      const jobNumberTaken = variantJobNumber
+        ? await tx.campaignPiece.findFirst({ where: { jobNumber: variantJobNumber }, select: { id: true } })
+        : null;
       const piece = await tx.campaignPiece.create({
         data: {
           campaignId: cluster.canonicalId,
@@ -391,6 +399,7 @@ async function applyCluster(
           driveFolderId: v.driveFolderId,
           driveFolderUrl: v.driveFolderUrl,
           driveFolderPath: v.driveFolderPath,
+          ...(variantJobNumber && !jobNumberTaken ? { jobNumber: variantJobNumber } : {}),
         },
       });
       piecesMinted[v.id] = piece.id;
