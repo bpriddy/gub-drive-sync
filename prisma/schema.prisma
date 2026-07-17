@@ -847,7 +847,7 @@ model PromptPreset {
   description String?
   template    String   @db.Text
   variables   Json     @default("[]")
-  model       String   @default("gemini-2.5-pro")
+  model       String   @default("gemini-3.5-flash")
   temperature Decimal  @default(0.20) @db.Decimal(3, 2)
   isActive    Boolean  @default(true) @map("is_active")
   updatedBy   String?  @map("updated_by") @db.Uuid

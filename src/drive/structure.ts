@@ -39,6 +39,10 @@ const MAX_DEPTH = 100;
 
 const STRUCTURE_MODEL = 'gemini-3.5-flash';
 const STRUCTURE_TEMPERATURE = 0.2;
+// gemini-3.5-flash thinking tokens count against maxOutputTokens; too low a cap
+// truncates the structured-output JSON before it closes. 16384 matches the floor
+// used at every other structured-output call site.
+const MAX_OUTPUT_TOKENS = 16384;
 export const STRUCTURE_RESOLUTION_VERSION = 'drive.structure_resolution.v1-inline';
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -342,6 +346,7 @@ export async function classifyFolders(args: {
     prompt,
     tag: STRUCTURE_RESOLUTION_VERSION,
     responseSchema: structureResolutionResponseSchema(),
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
   });
 
   let parsed: z.infer<typeof StructureResponseSchema>;
