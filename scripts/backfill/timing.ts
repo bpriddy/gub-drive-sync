@@ -44,7 +44,6 @@ const PHASE_LABELS: Record<string, string> = {
   structure_walk: 'Drive walk (folders)',
   structure_classify: 'Classify folders (LLM)',
   file_discovery: 'Discover files (Drive)',
-  revisions_fetch: 'Revisions fetch (Drive)',
   extract_text: 'Extract text (per-file)',
   interpret_file: 'Interpret file (per-file LLM)',
   idea_extract: 'Idea extraction (per-deck LLM)',

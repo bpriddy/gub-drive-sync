@@ -396,57 +396,6 @@ export async function listSharedDriveFiles(
 }
 
 /**
- * List the revision metadata for a file.
- *
- * Returns one entry per revision: id, modifiedTime, lastModifyingUser
- * (email + displayName), and size. NO content fetching — purely
- * attribution-and-timestamps for the editor-telemetry use case.
- *
- * Notes:
- * - For Google-native files (Docs/Sheets/Slides), full revision history
- *   is preserved by Drive — every saved edit shows up.
- * - For binary files (PDF/DOCX/text), Drive prunes revisions after ~30
- *   days unless `keepForever=true` was explicitly set per-revision
- *   (almost never in practice). So binary files only show recent
- *   revisions; older history is gone from Drive's side.
- * - Paginates internally; revisions.list returns up to pageSize per call.
- */
-export interface DriveRevisionMeta {
-  revisionId: string;
-  modifiedTime: string;
-  editorEmail: string | null;
-  editorName: string | null;
-  sizeBytes: number | null;
-}
-
-export async function listRevisions(fileId: string): Promise<DriveRevisionMeta[]> {
-  const client = await driveClient();
-  const out: DriveRevisionMeta[] = [];
-  let pageToken: string | undefined;
-  do {
-    const res = await client.revisions.list({
-      fileId,
-      fields:
-        'nextPageToken, revisions(id, modifiedTime, lastModifyingUser(emailAddress,displayName), size)',
-      pageSize: 1000,
-      ...(pageToken ? { pageToken } : {}),
-    });
-    for (const r of res.data.revisions ?? []) {
-      if (!r.id || !r.modifiedTime) continue;
-      out.push({
-        revisionId: r.id,
-        modifiedTime: r.modifiedTime,
-        editorEmail: r.lastModifyingUser?.emailAddress ?? null,
-        editorName: r.lastModifyingUser?.displayName ?? null,
-        sizeBytes: r.size ? Number(r.size) : null,
-      });
-    }
-    pageToken = res.data.nextPageToken ?? undefined;
-  } while (pageToken);
-  return out;
-}
-
-/**
  * Download file bytes via `files.get(alt=media)`.
  * Use `exportMedia` instead for Google-native docs (Docs/Sheets/Slides).
  */

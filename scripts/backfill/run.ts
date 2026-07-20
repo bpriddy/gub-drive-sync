@@ -2,8 +2,6 @@
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { writeFileSync } from 'node:fs';
 import { prisma } from '../../src/prisma';
-import { listRevisions } from '../../src/drive/client';
-import { predictExtractionSkip } from '../../src/drive/extract';
 import {
   buildAttributor,
   classifyFolders,
@@ -29,7 +27,7 @@ import {
   type StructureCache,
   type BootstrapFilesCache,
 } from './days';
-import { buildCampaignNameDirectory, type CampaignNameDirectory, type FileWithRevisions } from './batch-types';
+import { buildCampaignNameDirectory, type CampaignNameDirectory } from './batch-types';
 import { processBatch } from './process-batch';
 import { runStructureOnly } from './structure-mode';
 
@@ -390,65 +388,11 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log(rule(`Scan: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`));
     filesProcessed = nextDay.files.length;
 
-    // ── Pre-filter: skip-able files don't need revision metadata ─────────
-    //
-    // The revisions fetch below is one Drive API call per file. Under the
-    // 4/s rate limiter that adds up — a day with 350 files (most of them
-    // PNG/JPEG that extractText would skip on mime alone) was eating ~80s
-    // here for no downstream benefit. predictExtractionSkip is the same
-    // metadata-only check extractText runs first; if it returns a skip,
-    // we know the file is going to be ⊘'d in processBatch anyway. Log it
-    // the same way processBatch would, then short-circuit.
-    const extractable: TraversedFile[] = [];
-    // Predicted skips still flow into the batch (with empty revisions) so
-    // processBatch can log the ⊘ and collect binaries-only asset folders —
-    // the pre-filter only saves the revisions.list call, not extraction
-    // (extractText's metadata check short-circuits before any download).
-    const preFiltered: TraversedFile[] = [];
-    for (const file of nextDay.files) {
-      if (predictExtractionSkip(file)) {
-        preFiltered.push(file);
-      } else {
-        extractable.push(file);
-      }
-    }
-    if (preFiltered.length > 0) {
-      log(
-        `  Pre-filter: ${extractable.length} extractable / ${preFiltered.length} skipped on mime/size; saving ${preFiltered.length} revisions.list calls`,
-      );
-    }
-
-    // Fetch revisions only for files that will actually be extracted.
-    log('  Fetching revision metadata…');
-    const withRevisions: FileWithRevisions[] = [];
-    let revFailures = 0;
-    const isTTY = process.stdout.isTTY === true;
-    let lastTick = Date.now();
-    for (let i = 0; i < extractable.length; i++) {
-      const file = extractable[i]!;
-      if (isTTY && Date.now() - lastTick > 250) {
-        lastTick = Date.now();
-        const nameTail = file.name.length > 40 ? '…' + file.name.slice(-40) : file.name;
-        process.stdout.write('\r' + `    ${i + 1}/${extractable.length}  ${nameTail}`.padEnd(100).slice(0, 100));
-      }
-      try {
-        const revs = await timed('revisions_fetch', () => listRevisions(file.id));
-        withRevisions.push({ file, revisions: revs });
-      } catch {
-        revFailures++;
-        withRevisions.push({ file, revisions: [] });
-      }
-    }
-    if (isTTY) process.stdout.write('\r' + ' '.repeat(100) + '\r');
-    if (revFailures > 0) log(`  ⚠ ${revFailures} file(s) failed revisions.list`);
-    for (const file of preFiltered) {
-      withRevisions.push({ file, revisions: [] });
-    }
     log('');
 
     const scanStart = Date.now();
     const outcome = await processBatch(
-      withRevisions,
+      nextDay.files,
       ctx,
       attributor,
       nameDirectory,

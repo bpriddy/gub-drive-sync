@@ -137,8 +137,8 @@ function tooLargeForBinaryDownload(file: TraversedFile): ExtractionSkip | null {
  * extraction-eligible (or would fail with a network/parse error, which
  * we can't predict).
  *
- * Mirrors the bail-outs in extractText so callers can pre-filter
- * before doing expensive setup work (per-file listRevisions, etc).
+ * Mirrors the bail-outs in extractText so callers can predict the
+ * outcome without any I/O.
  * Both predictExtractionSkip and extractText route through the same
  * decision tree — extractText calls this first, then proceeds to the
  * extraction switch only on null.
@@ -218,9 +218,7 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
 }
 
 export async function extractText(file: TraversedFile): Promise<ExtractionOutcome> {
-  // Single source of truth for skip-without-I/O decisions. Lets callers
-  // (e.g. the backfill scan loop) pre-filter to avoid wasted per-file
-  // listRevisions calls on files we'll just skip here anyway.
+  // Single source of truth for skip-without-I/O decisions.
   const predicted = predictExtractionSkip(file);
   if (predicted) return predicted;
 

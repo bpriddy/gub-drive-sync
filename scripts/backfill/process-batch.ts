@@ -1,7 +1,7 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { prisma } from '../../src/prisma';
-import { driveClient, type DriveRevisionMeta } from '../../src/drive/client';
+import { driveClient } from '../../src/drive/client';
 import { extractText } from '../../src/drive/extract';
 import { interpretAssetFolder } from '../../src/drive/asset-folder';
 import {
@@ -59,11 +59,10 @@ import type {
   CampaignBucket,
   CampaignNameDirectory,
   EntitySynthesisResult,
-  FileWithRevisions,
 } from './batch-types';
 
 export async function processBatch(
-  batch: FileWithRevisions[],
+  batch: TraversedFile[],
   ctx: EntityCtx,
   attributor: Attributor | null,
   /**
@@ -173,7 +172,7 @@ export async function processBatch(
   const probedFileIds = new Set<string>();
   if (probeCandidates.length > 0) {
     log(`  Re-probing ${probeCandidates.length} restricted file(s)…`);
-    const inBatch = new Set(batch.map((b) => b.file.id));
+    const inBatch = new Set(batch.map((b) => b.id));
     const drive = await driveClient();
     for (const r of probeCandidates) {
       probedFileIds.add(r.fileId);
@@ -200,19 +199,16 @@ export async function processBatch(
       } catch (err) {
         if (isDrivePermissionError(err)) {
           batch.push({
-            file: {
-              id: r.fileId,
-              name: r.name,
-              mimeType: r.mimeType ?? 'application/octet-stream',
-              parents: r.parentFolderId ? [r.parentFolderId] : [],
-              path: r.path ?? r.name,
-              modifiedTime: null,
-              modifiedByEmail: null,
-              createdTime: null,
-              size: null,
-              isFolder: false,
-            },
-            revisions: [],
+            id: r.fileId,
+            name: r.name,
+            mimeType: r.mimeType ?? 'application/octet-stream',
+            parents: r.parentFolderId ? [r.parentFolderId] : [],
+            path: r.path ?? r.name,
+            modifiedTime: null,
+            modifiedByEmail: null,
+            createdTime: null,
+            size: null,
+            isFolder: false,
           });
           continue;
         }
@@ -220,32 +216,27 @@ export async function processBatch(
         continue;
       }
       batch.push({
-        file: {
-          id: r.fileId,
-          name: meta.name ?? r.name,
-          mimeType: meta.mimeType ?? r.mimeType ?? 'application/octet-stream',
-          parents: meta.parents ?? (r.parentFolderId ? [r.parentFolderId] : []),
-          path: r.path ?? r.name,
-          modifiedTime: null,
-          modifiedByEmail: null,
-          createdTime: null,
-          size: meta.size ? Number(meta.size) : null,
-          isFolder: false,
-          ...(meta.shortcutDetails?.targetId && meta.shortcutDetails?.targetMimeType
-            ? {
-                shortcutTarget: {
-                  id: meta.shortcutDetails.targetId,
-                  mimeType: meta.shortcutDetails.targetMimeType,
-                },
-              }
-            : {}),
-        },
-        revisions: [],
+        id: r.fileId,
+        name: meta.name ?? r.name,
+        mimeType: meta.mimeType ?? r.mimeType ?? 'application/octet-stream',
+        parents: meta.parents ?? (r.parentFolderId ? [r.parentFolderId] : []),
+        path: r.path ?? r.name,
+        modifiedTime: null,
+        modifiedByEmail: null,
+        createdTime: null,
+        size: meta.size ? Number(meta.size) : null,
+        isFolder: false,
+        ...(meta.shortcutDetails?.targetId && meta.shortcutDetails?.targetMimeType
+          ? {
+              shortcutTarget: {
+                id: meta.shortcutDetails.targetId,
+                mimeType: meta.shortcutDetails.targetMimeType,
+              },
+            }
+          : {}),
       });
     }
   }
-
-  const editors = new Map<string, number>();
 
   let filesExtracted = 0;
   let filesSkipped = 0;
@@ -338,7 +329,6 @@ export async function processBatch(
 
   interface WorkerOutcome {
     file: TraversedFile;
-    revisions: DriveRevisionMeta[];
     attribution: EntityAttribution;
     kind: 'skip' | 'error' | 'restricted' | 'ok';
     skipReason?: string;
@@ -369,15 +359,13 @@ export async function processBatch(
     };
   }
 
-  async function runFileWorker(item: FileWithRevisions): Promise<WorkerOutcome> {
-    const { file, revisions } = item;
+  async function runFileWorker(file: TraversedFile): Promise<WorkerOutcome> {
     const attribution = resolveAttribution(file);
     try {
       const extraction = await timed('extract_text', () => extractText(file));
       if (extraction.kind !== 'ok') {
         return {
           file,
-          revisions,
           attribution,
           kind: 'skip',
           skipReason: extraction.reason,
@@ -431,7 +419,6 @@ export async function processBatch(
 
       return {
         file,
-        revisions,
         attribution,
         kind: 'ok',
         extractor: extraction.extractor,
@@ -441,19 +428,14 @@ export async function processBatch(
       };
     } catch (err) {
       if (isDrivePermissionError(err)) {
-        return { file, revisions, attribution, kind: 'restricted' };
+        return { file, attribution, kind: 'restricted' };
       }
-      return { file, revisions, attribution, kind: 'error', error: err };
+      return { file, attribution, kind: 'error', error: err };
     }
   }
 
   async function applyOutcome(o: WorkerOutcome): Promise<void> {
-    const { file, revisions, attribution } = o;
-    // Tally editors from revisions metadata (works even if extraction fails)
-    for (const r of revisions) {
-      const e = r.editorEmail ?? '(unknown)';
-      editors.set(e, (editors.get(e) ?? 0) + 1);
-    }
+    const { file, attribution } = o;
 
     if (o.kind === 'skip') {
       const detail = o.skipDetail ? ` (${o.skipDetail})` : '';
@@ -889,16 +871,6 @@ export async function processBatch(
     log(`    Campaign "${ctx.campaignName ?? ctx.name}"  ·  ${legacyCampaignBucket.length} obs`);
   }
   log('');
-
-  // Editor breakdown (top 8)
-  const sortedEditors = Array.from(editors.entries()).sort((a, b) => b[1] - a[1]);
-  if (sortedEditors.length > 0) {
-    log('  Editors (across all revisions of batch files):');
-    for (const [email, count] of sortedEditors.slice(0, 8)) {
-      log(`    ${email.padEnd(40)} ${count} rev${count === 1 ? '' : 's'}`);
-    }
-    if (sortedEditors.length > 8) log(`    … (+${sortedEditors.length - 8} more)`);
-  }
 
   // ── Distillation (calls real distill.ts which would normally write to DB,
   // but we want to capture results without persisting). Trade-off: distill

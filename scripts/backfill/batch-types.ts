@@ -1,17 +1,10 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
-import type { DriveRevisionMeta } from '../../src/drive/client';
-import type { TraversedFile } from '../../src/drive/types';
 import type { CampaignObservation } from '../../src/drive/interpret';
 import type { EntityMap } from '../../src/drive/structure';
 import type { IdeaScanStats } from '../../src/drive/idea-scan';
 
 // ── Per-batch processing ────────────────────────────────────────────────────
-
-export interface FileWithRevisions {
-  file: TraversedFile;
-  revisions: DriveRevisionMeta[];
-}
 
 export interface CampaignBucket {
   campaignName: string;
