@@ -86,7 +86,6 @@ For ONE chunk (one Cloud Run Job execution):
                                          │
                           ┌──────────────▼───────────────────────────┐
                           │ Per-file loop (the day's bucket):        │
-                          │   - pre-filter unsupported mimes         │
                           │   - extract content (Drive download +    │
                           │     parse, OR Workspace API for native)  │
                           │   - interpret (Gemini Pro per-file LLM)  │
@@ -177,7 +176,7 @@ Queue of bootstrap + forward runs.
 | `attempts` | INT | SKIP-LOCKED claim increments; terminal failure at MAX_ATTEMPTS=3 |
 | `next_attempt_at` | TIMESTAMPTZ | Earliest re-claim after transient failure (exponential backoff) |
 | `all_remaining` | BOOL | True → after this chunk, queue another in the same mode if work remains |
-| `files_processed` | INT | Files actually extracted in this chunk (post pre-filter) |
+| `files_processed` | INT | Files processed in this chunk |
 | `activity_page_token_in` | TEXT | Forward only: token handed to this chunk |
 | `activity_page_token_out` | TEXT | Forward only: token at chunk end |
 | `error_message` | TEXT | Terminal-failure detail |
@@ -261,9 +260,9 @@ For every file in the day's bucket:
      structured-but-flat text.
    - Binary (PDF/DOCX/PPTX/text/*): `downloadFileBuffer` + per-type
      parser. Size cap (`DRIVE_MAX_FILE_SIZE_BYTES`, default 300MB).
-   - `predictExtractionSkip` pre-filters skip-able files before the
-     `listRevisions` Drive API call so we don't waste rate-limited
-     quota on PNGs and oversize files.
+   - `predictExtractionSkip` is the metadata-only skip check
+     `extractText` runs first — unsupported mimes and oversize files
+     short-circuit without any I/O.
 
 2. **Interpret** (`src/drive/interpret.ts`): per-file LLM call via the
    preset `drive.file_extraction.v1`. Inputs: extracted text + account/
@@ -367,14 +366,13 @@ scripts/
 src/drive/
   client.ts                     Drive v3 API client. Includes:
                                 - driveLimiter (4 req/s, promise-chained)
-                                - listRevisions, downloadFileBuffer
+                                - downloadFileBuffer
                                 - retry-on-403-rate-limit
                                 Bot OAuth via buildBotOAuthClient.
   extract.ts                    extractText() — mime-dispatched content
                                 extraction. predictExtractionSkip() —
-                                metadata-only check used by the engine
-                                pre-filter and inside extractText to
-                                early-exit identically.
+                                metadata-only skip check extractText
+                                runs first.
   interpret.ts                  Per-file LLM call. Uses preset
                                 drive.file_extraction.v1.
   structure.ts                  gatherFolders, classifyFolders,

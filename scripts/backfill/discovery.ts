@@ -5,7 +5,7 @@ import { traverseFolder } from '../../src/drive/traversal';
 import { log } from './output';
 import type { TraversedFile } from '../../src/drive/types';
 
-// ── Phase 1: gather all files (no revisions yet) ────────────────────────────
+// ── Phase 1: gather all files ───────────────────────────────────────────────
 
 export async function gatherFilesAuto(
   folderId: string,
