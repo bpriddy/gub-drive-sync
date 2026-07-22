@@ -49,6 +49,10 @@ with the actual edit timestamps from the activity events.
 - Status: **stub today.** Forward mode runs through the same engine but
   doesn't yet poll Activity API — it walks `modifiedTime` buckets like
   bootstrap. Real Activity-driven forward sync is the next milestone.
+- **When building it, start from [edit-stats-decision.md](edit-stats-decision.md)**
+  — the per-editor edit-event stats (decided 2026-07-20) ride this build:
+  the same Activity event stream feeds both file re-processing and the
+  `drive_edit_stats` tally. Scope is already granted and probe-verified.
 
 ---
 
