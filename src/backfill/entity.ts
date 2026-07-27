@@ -1,12 +1,12 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
-import { prisma } from '../../src/prisma';
+import { prisma } from '../prisma';
 import {
   buildAccountCurrentState,
   buildCampaignCurrentState,
   type AccountCurrentState,
   type CampaignCurrentState,
-} from '../../src/drive/schema';
+} from '../drive/schema';
 import type { Args } from './args';
 import { ymdFromDate } from './days';
 

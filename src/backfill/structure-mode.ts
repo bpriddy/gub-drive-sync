@@ -1,10 +1,10 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
-import { prisma } from '../../src/prisma';
-import { classifyFolders, gatherFolders, type ClassifiedFolder } from '../../src/drive/structure';
+import { prisma } from '../prisma';
+import { classifyFolders, gatherFolders, type ClassifiedFolder } from '../drive/structure';
 import { log, rule, fmtMs } from './output';
 import type { EntityCtx } from './entity';
-import type { EntityMap, FolderNode } from '../../src/drive/structure';
+import type { EntityMap, FolderNode } from '../drive/structure';
 
 // ── Stage 1: structure-only ──────────────────────────────────────────────────
 

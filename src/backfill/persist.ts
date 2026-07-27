@@ -1,7 +1,7 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { z } from 'zod';
-import { prisma } from '../../src/prisma';
+import { prisma } from '../prisma';
 import {
   ACCOUNT_WRITABLE_FIELDS,
   CAMPAIGN_WRITABLE_FIELDS,
@@ -9,11 +9,11 @@ import {
   type CampaignCurrentState,
   type ChangeValueKind,
   type FieldWriteSpec,
-} from '../../src/drive/schema';
-import { distillationResponseSchema } from '../../src/drive/structured-output';
-import { parseLlmJson, runPreset } from '../../src/ai';
-import { DRIVE_SYNC_SYSTEM_STAFF_ID } from '../../src/drive/heal';
-import type { AccountObservation, CampaignObservation } from '../../src/drive/interpret';
+} from '../drive/schema';
+import { distillationResponseSchema } from '../drive/structured-output';
+import { parseLlmJson, runPreset } from '../ai';
+import { DRIVE_SYNC_SYSTEM_STAFF_ID } from '../drive/heal';
+import type { AccountObservation, CampaignObservation } from '../drive/interpret';
 import { log } from './output';
 import type { EntityCtx } from './entity';
 

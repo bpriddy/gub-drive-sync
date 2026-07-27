@@ -1,10 +1,10 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
-import { matchCampaignName } from '../../src/drive/name-similarity';
-import type { CampaignObservation } from '../../src/drive/interpret';
-import type { EntityAttribution } from '../../src/drive/structure';
+import { matchCampaignName } from '../drive/name-similarity';
+import type { CampaignObservation } from '../drive/interpret';
+import type { EntityAttribution } from '../drive/structure';
 import type { CampaignBucket, CampaignNameDirectory } from './batch-types';
-import type { CampaignCurrentState } from '../../src/drive/schema';
+import type { CampaignCurrentState } from '../drive/schema';
 
 /**
  * Campaign-scoped scans write ONLY the scanned campaign + its account. An

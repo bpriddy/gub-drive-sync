@@ -12,7 +12,7 @@
     "test": "vitest run",
     "seed:status": "tsx -r dotenv/config scripts/seed-status-proposal.ts",
     "seed:new-entity": "tsx -r dotenv/config scripts/seed-new-entity-proposal.ts",
-    "backfill": "tsx -r dotenv/config scripts/backfill/index.ts",
+    "backfill": "tsx -r dotenv/config src/backfill/index.ts",
     "clear": "tsx -r dotenv/config scripts/clear.ts",
     "merge-campaign-dupes": "tsx -r dotenv/config src/main.ts merge-campaign-dupes",
     "backfill-pending": "tsx -r dotenv/config src/main.ts backfill-pending",

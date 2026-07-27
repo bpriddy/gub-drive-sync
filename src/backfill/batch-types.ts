@@ -1,8 +1,8 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
-import type { CampaignObservation } from '../../src/drive/interpret';
-import type { EntityMap } from '../../src/drive/structure';
-import type { IdeaScanStats } from '../../src/drive/idea-scan';
+import type { CampaignObservation } from '../drive/interpret';
+import type { EntityMap } from '../drive/structure';
+import type { IdeaScanStats } from '../drive/idea-scan';
 
 // ── Per-batch processing ────────────────────────────────────────────────────
 

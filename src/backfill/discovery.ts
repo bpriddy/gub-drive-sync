@@ -1,9 +1,9 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
-import { listSharedDriveFiles, probeFolder } from '../../src/drive/client';
-import { traverseFolder } from '../../src/drive/traversal';
+import { listSharedDriveFiles, probeFolder } from '../drive/client';
+import { traverseFolder } from '../drive/traversal';
 import { log } from './output';
-import type { TraversedFile } from '../../src/drive/types';
+import type { TraversedFile } from '../drive/types';
 
 // ── Phase 1: gather all files ───────────────────────────────────────────────
 

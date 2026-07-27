@@ -36,9 +36,7 @@ import { GoogleAuth } from 'google-auth-library';
 import { config } from '../config';
 import { prisma } from '../prisma';
 import { summarizeError } from '../progress';
-// Engine lives in scripts/ today. Dockerfile copies scripts/ into the
-// build stage so dist/scripts/backfill.js exists in the runtime image.
-import { runBackfill } from '../../scripts/backfill';
+import { runBackfill } from '../backfill';
 
 /** Stale-running recovery threshold — see project_drive_sync_architecture.md "Self-healing reapers". */
 /**

@@ -1,7 +1,7 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { writeFileSync } from 'node:fs';
-import { prisma } from '../../src/prisma';
+import { prisma } from '../prisma';
 import {
   buildAttributor,
   classifyFolders,
@@ -10,8 +10,8 @@ import {
   type Attributor,
   type EntityMap,
   type PieceAnchor,
-} from '../../src/drive/structure';
-import type { TraversedFile } from '../../src/drive/types';
+} from '../drive/structure';
+import type { TraversedFile } from '../drive/types';
 import { parseArgs, DEFAULT_CONCURRENCY, type Args, type BackfillRunResult } from './args';
 import { log, rule, fmtMs, setOutputFile, getLogCapture, setLogCapture } from './output';
 import { resetPhaseTimer, printPhaseSummary, timed } from './timing';

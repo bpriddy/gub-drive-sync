@@ -67,10 +67,10 @@
  *   --dryrun             Skip DB writes — preview only. Default is to
  *                        persist (system-staff attribution).
  */
-// Public surface of the backfill engine. The former scripts/backfill.ts
-// monolith is split into logical modules; this index preserves the import
-// paths ('./backfill', '../../scripts/backfill') and the CLI entry.
-import { prisma } from '../../src/prisma';
+// Public surface of the backfill engine (formerly the scripts/backfill.ts
+// monolith, split into logical modules and later promoted into src/).
+// Imported as '../backfill' by the queue drainer; also the CLI entry.
+import { prisma } from '../prisma';
 import { main } from './run';
 
 export { runBackfill } from './run';

@@ -277,7 +277,7 @@ For every file in the day's bucket:
 
 ### Routing
 
-`routeCampaignObs` (in `scripts/backfill.ts`) places each campaign
+`routeCampaignObs` (in `src/backfill/routing.ts`) places each campaign
 observation into:
 - **`existing:<campaignId>`** — name matched a known campaign, or the
   file's folder is owned by an existing campaign

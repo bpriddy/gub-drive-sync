@@ -2,9 +2,9 @@
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../src/prisma';
+import { prisma } from '../prisma';
 import { log } from './output';
-import type { TraversedFile } from '../../src/drive/types';
+import type { TraversedFile } from '../drive/types';
 
 // ── Cursor + date-grouping helpers ───────────────────────────────────────────
 //

@@ -16,12 +16,9 @@ RUN npx prisma generate
 
 COPY tsconfig.json ./
 COPY src ./src
-# scripts/ contains the backfill engine (runBackfill) imported by
-# src/drive/backfill-queue.ts for the `backfill-pending` Job mode. The
-# tsconfig.json's `include` covers both src/ and scripts/, so tsc emits
-# both into dist/. The runtime image needs dist/scripts/backfill.js to
-# resolve that import.
-COPY scripts ./scripts
+# The backfill engine lives in src/backfill/ — everything the runtime
+# needs is under src/. scripts/ holds dev-only tools (probes, seeds)
+# and is deliberately NOT copied into the image.
 RUN npm run build
 
 # ── Runtime stage ────────────────────────────────────────────────────────────

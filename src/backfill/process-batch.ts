@@ -1,15 +1,15 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
-import { prisma } from '../../src/prisma';
-import { driveClient } from '../../src/drive/client';
-import { extractText } from '../../src/drive/extract';
-import { interpretAssetFolder } from '../../src/drive/asset-folder';
+import { prisma } from '../prisma';
+import { driveClient } from '../drive/client';
+import { extractText } from '../drive/extract';
+import { interpretAssetFolder } from '../drive/asset-folder';
 import {
   interpretFile,
   type AccountObservation,
   type CampaignObservation,
   type InterpretFileOutput,
-} from '../../src/drive/interpret';
+} from '../drive/interpret';
 import {
   ACCOUNT_FIELD_WRITE,
   CAMPAIGN_FIELD_WRITE,
@@ -19,9 +19,9 @@ import {
   type AccountCurrentState,
   type CampaignCurrentState,
   type FieldWriteSpec,
-} from '../../src/drive/schema';
-import { summarizeError } from '../../src/progress';
-import { defaultLlm } from '../../src/ai';
+} from '../drive/schema';
+import { summarizeError } from '../progress';
+import { defaultLlm } from '../ai';
 import {
   accountFieldsAsMap,
   assembleSensitiveStatusMarkdown,
@@ -34,16 +34,16 @@ import {
   renderAtAGlanceBullets,
   renderStatusSynthesisV1Prompt,
   STATUS_SYNTHESIS_V1_VERSION,
-} from '../../src/drive/status-synthesis';
-import type { Attributor, EntityAttribution } from '../../src/drive/structure';
+} from '../drive/status-synthesis';
+import type { Attributor, EntityAttribution } from '../drive/structure';
 import {
   createIdeaScanContext,
   extractIdeaCandidates,
   mergeIdeaCandidates,
-} from '../../src/drive/idea-scan';
-import type { ExtractedIdea } from '../../src/drive/idea-extraction';
-import type { TraversedFile } from '../../src/drive/types';
-import { config } from '../../src/config';
+} from '../drive/idea-scan';
+import type { ExtractedIdea } from '../drive/idea-extraction';
+import type { TraversedFile } from '../drive/types';
+import { config } from '../config';
 import { log, fmtBytes, fmtMs } from './output';
 import { timed } from './timing';
 import { runWithConcurrency } from './util';
