@@ -464,10 +464,18 @@ export async function processBatch(
         filesRestored++;
         log(`      🔓 previously restricted — now reachable (no extractable text); worklist row resolved`);
         if (applyToDb) {
-          await prisma.driveRestrictedFile.updateMany({
-            where: { accountId: ctx.accountId, fileId: file.id },
-            data: { status: 'resolved', resolvedAt: new Date(), lastProbedAt: new Date() },
-          });
+          // Guarded like the main body's writes: a transient DB error on
+          // one worklist row must not reject applyChain and discard the
+          // whole day's extraction+LLM spend.
+          try {
+            await prisma.driveRestrictedFile.updateMany({
+              where: { accountId: ctx.accountId, fileId: file.id },
+              data: { status: 'resolved', resolvedAt: new Date(), lastProbedAt: new Date() },
+            });
+          } catch (err) {
+            filesErrored++;
+            log(`      ✗ worklist resolve failed: ${summarizeError(err)}`);
+          }
         }
       }
       return;
@@ -476,40 +484,45 @@ export async function processBatch(
       log(`    ⛔ ${file.name}  RESTRICTED (403 — visible in listings, content not readable)`);
       filesRestricted++;
       if (applyToDb) {
-        const existing = await prisma.driveRestrictedFile.findUnique({
-          where: { accountId_fileId: { accountId: ctx.accountId, fileId: file.id } },
-        });
-        if (existing) {
-          await prisma.driveRestrictedFile.update({
-            where: { id: existing.id },
-            data: { lastProbedAt: new Date() },
+        try {
+          const existing = await prisma.driveRestrictedFile.findUnique({
+            where: { accountId_fileId: { accountId: ctx.accountId, fileId: file.id } },
           });
-        } else {
-          await prisma.driveRestrictedFile.create({
-            data: {
-              accountId: ctx.accountId,
-              campaignId:
-                attribution.matchedCampaignId ?? (ctx.type === 'campaign' ? ctx.id : null),
-              fileId: file.id,
-              name: file.name,
-              path: file.path,
-              mimeType: file.mimeType,
-              parentFolderId: file.parents?.[0] ?? null,
-            },
-          });
-          // First sighting: the dossier should KNOW the file exists — a
-          // hole you can see beats one you can't (restriction correlates
-          // with value: briefs, budgets, recaps).
-          pushRoutedObs(
-            {
-              text: `A file named "${file.name}" exists at ${file.path} but its content is access-restricted — the sync bot cannot read it.`,
-              reasoning:
-                'Drive returned 403 for content export; the file is visible in folder listings only.',
-              confidence: 1,
-            },
-            file.id,
-            attribution,
-          );
+          if (existing) {
+            await prisma.driveRestrictedFile.update({
+              where: { id: existing.id },
+              data: { lastProbedAt: new Date() },
+            });
+          } else {
+            await prisma.driveRestrictedFile.create({
+              data: {
+                accountId: ctx.accountId,
+                campaignId:
+                  attribution.matchedCampaignId ?? (ctx.type === 'campaign' ? ctx.id : null),
+                fileId: file.id,
+                name: file.name,
+                path: file.path,
+                mimeType: file.mimeType,
+                parentFolderId: file.parents?.[0] ?? null,
+              },
+            });
+            // First sighting: the dossier should KNOW the file exists — a
+            // hole you can see beats one you can't (restriction correlates
+            // with value: briefs, budgets, recaps).
+            pushRoutedObs(
+              {
+                text: `A file named "${file.name}" exists at ${file.path} but its content is access-restricted — the sync bot cannot read it.`,
+                reasoning:
+                  'Drive returned 403 for content export; the file is visible in folder listings only.',
+                confidence: 1,
+              },
+              file.id,
+              attribution,
+            );
+          }
+        } catch (err) {
+          filesErrored++;
+          log(`      ✗ restricted-worklist write failed: ${summarizeError(err)}`);
         }
       }
       return;
@@ -872,16 +885,6 @@ export async function processBatch(
   }
   log('');
 
-  // ── Distillation (calls real distill.ts which would normally write to DB,
-  // but we want to capture results without persisting). Trade-off: distill
-  // currently writes proposals. For dryrun we want to RUN the prompt but
-  // NOT persist. Simplest: call distill against the bucket but suppress
-  // writes via a transaction rollback? Or just accept that this dryrun
-  // does write proposals (and we live with the cleanup).
-  //
-  // For now: keep it pure dry-run by directly invoking the distillation
-  // prompt here, not the DB-writing distillAndEmit. We get the same
-  // classification output, just don't persist.
   // ── Stage 3: per-entity distill + synthesize ───────────────────────────
   //
   // For each entity that has a non-empty observation bucket: distill its
@@ -1083,21 +1086,16 @@ export async function processBatch(
         : 'NEW campaign candidate';
       wlog(`  • ${statusTag}: "${target.entityName}"  ·  ${target.observations.length} obs / ${target.fileIds.size} file(s)`);
 
-      // ── Distill (uniform across all entity kinds; dry-run only) ────────
+      // ── Distill (uniform across all entity kinds) ──────────────────────
       // Every target — account, existing campaign, new candidate — runs the
       // same distillation prompt, and we apply the resulting field_changes
       // to the target's CurrentState so the synthesized at-a-glance bullets
-      // reflect what the post-approval state WOULD look like (current
-      // values + proposed updates layered on top). Otherwise the account's
-      // at-a-glance shows empty fields even when distillation surfaced
-      // structured proposals for them.
+      // reflect current values + this scan's updates layered on top.
       //
-      // No proposals get written to the DB — the dry-run is intentionally
-      // dry. The production path will write proposals via distillAndEmit
-      // (or the structure-driven proposeNewEntity for new candidates) when
-      // backfill ships. Keeping the dry-run write-free eliminates the
-      // proposal-cleanup chore and avoids surprising the reviewer with
-      // dev-run proposals.
+      // NO PROPOSALS, BY DESIGN: the engine writes entity columns and
+      // *_changes rows directly with system-staff attribution (see
+      // persistTarget). distillAndEmit/proposeNewEntity are the v1
+      // review-gated pipeline's writers, not this engine's.
       let distillResult: EntitySynthesisResult['distillResult'] = null;
       let validatedChanges: ValidatedChange[] = [];
       if (target.entityType === 'piece') {
@@ -1207,6 +1205,7 @@ export async function processBatch(
 
       // ── Synthesize (dual-output: general + sensitive) ───────────────
       const synthStart = Date.now();
+      let synthFailed = false;
       let synthesizedMarkdown: string;
       let synthesizedSensitiveMarkdown: string | null = null;
       try {
@@ -1287,6 +1286,12 @@ export async function processBatch(
               })
             : null;
       } catch (err) {
+        // Placeholder is for the LOG/result display only — it must never
+        // reach the DB: persistTarget writes statusMarkdown unconditionally,
+        // so persisting it would clobber the entity's accumulated dossier
+        // with "(synthesis failed…)", and since the cursor still advances,
+        // the day would never re-run to restore it.
+        synthFailed = true;
         synthesizedMarkdown = `(synthesis failed: ${summarizeError(err)})`;
       }
       const synthesisMs = Date.now() - synthStart;
@@ -1294,21 +1299,25 @@ export async function processBatch(
         `      synthesized in ${fmtMs(synthesisMs)}${synthesizedSensitiveMarkdown ? ' (general + sensitive)' : ''}`,
       );
 
-      // ── Apply (when --apply is set) ─────────────────────────────────
+      // ── Apply (unless --dryrun) ─────────────────────────────────────
       if (applyToDb) {
-        try {
-          await timed('db_writes', () =>
-            persistTarget({
-              target,
-              ctx,
-              validatedChanges,
-              synthesizedMarkdown,
-              synthesizedSensitiveMarkdown,
-            }),
-          );
-          wlog('      ✓ applied (system-staff attribution)');
-        } catch (err) {
-          wlog(`      apply failed: ${summarizeError(err)}`);
+        if (synthFailed) {
+          wlog("      ✗ NOT applied — synthesis failed; keeping the entity's prior status_markdown");
+        } else {
+          try {
+            await timed('db_writes', () =>
+              persistTarget({
+                target,
+                ctx,
+                validatedChanges,
+                synthesizedMarkdown,
+                synthesizedSensitiveMarkdown,
+              }),
+            );
+            wlog('      ✓ applied (system-staff attribution)');
+          } catch (err) {
+            wlog(`      apply failed: ${summarizeError(err)}`);
+          }
         }
       }
 

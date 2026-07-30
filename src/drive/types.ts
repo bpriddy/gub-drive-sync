@@ -2,10 +2,6 @@
  * drive/types.ts — Internal types for the Drive sync module.
  */
 
-import type { drive_v3 } from 'googleapis';
-
-export type DriveFile = drive_v3.Schema$File;
-
 /**
  * Minimum fields we need off every file in a traversal.
  * Kept narrow so the caller can't accidentally depend on fields that might

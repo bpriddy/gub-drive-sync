@@ -196,11 +196,13 @@ async function claimNext(): Promise<{
  * processing. If the trigger fails the continuation request stays
  * `pending` for the next manual click or scheduled invocation to pick up.
  */
+type ContinuationOutcome = 'triggered' | 'row_write_failed' | 'trigger_failed' | 'misconfig';
+
 async function scheduleContinuation(
   parentRequestId: string,
   accountId: string,
   mode: string,
-): Promise<void> {
+): Promise<ContinuationOutcome> {
   const project = config.GCP_PROJECT_ID;
   const region = config.GCP_REGION;
   const job = config.DRIVE_SYNC_JOB_NAME;
@@ -215,7 +217,7 @@ async function scheduleContinuation(
         hint: 'GCP_PROJECT_ID / GCP_REGION / DRIVE_SYNC_JOB_NAME must be set',
       }),
     );
-    return;
+    return 'misconfig';
   }
 
   // Write the continuation request first. If the Admin API trigger
@@ -242,7 +244,7 @@ async function scheduleContinuation(
         error: err instanceof Error ? err.message : String(err),
       }),
     );
-    return;
+    return 'row_write_failed';
   }
 
   const url =
@@ -277,6 +279,7 @@ async function scheduleContinuation(
         job,
       }),
     );
+    return 'triggered';
   } catch (err) {
     console.error(
       JSON.stringify({
@@ -284,9 +287,10 @@ async function scheduleContinuation(
         parentRequestId,
         continuationId,
         error: err instanceof Error ? err.message : String(err),
-        hint: 'continuation row stays pending; next manual click will pick it up',
+        hint: 'continuation row stays pending; the still-warm drain loop or the next manual click picks it up',
       }),
     );
+    return 'trigger_failed';
   }
 }
 
@@ -355,16 +359,38 @@ async function processOne(req: {
       dryrun: false,
       captureLog,
     });
-    await prisma.driveSyncRun.update({
-      where: { id: req.id },
-      data: {
-        status: 'completed',
-        completedAt: new Date(),
-        filesProcessed: result.filesProcessed,
-        logSummary: tailLogSummary(captureLog),
-        nextAttemptAt: null,
-      },
-    });
+    // Bookkeeping persist gets its own guard: the scan already committed
+    // (cursor included), so a transient DB error HERE must not flow into
+    // the engine-failure path — that would re-queue (attempts 1-2) or
+    // terminally fail (attempt 3) a day that succeeded. On failure the
+    // row stays 'running'; the stale-running reaper reclaims it and the
+    // retry simply continues from the already-advanced cursor.
+    // errorMessage is cleared — a success must not keep displaying a
+    // stale failure from an earlier attempt or reclaim.
+    let completedPersisted = true;
+    await prisma.driveSyncRun
+      .update({
+        where: { id: req.id },
+        data: {
+          status: 'completed',
+          completedAt: new Date(),
+          filesProcessed: result.filesProcessed,
+          logSummary: tailLogSummary(captureLog),
+          nextAttemptAt: null,
+          errorMessage: null,
+        },
+      })
+      .catch((updateErr) => {
+        completedPersisted = false;
+        console.error(
+          JSON.stringify({
+            msg: 'backfill-queue.completed.persist_error',
+            requestId: req.id,
+            error: updateErr instanceof Error ? updateErr.message : String(updateErr),
+            hint: 'scan committed; row left running for the stale reaper — not an engine failure',
+          }),
+        );
+      });
     console.log(
       JSON.stringify({
         msg: 'backfill-queue.completed',
@@ -392,9 +418,15 @@ async function processOne(req: {
     // being already-warm, it would usually win the claim, leaving
     // the cold-started successor with nothing to do.
     let continuationFired = false;
-    if (req.allRemaining && !result.bootstrapCompleted) {
-      await scheduleContinuation(req.id, req.accountId, req.mode);
-      continuationFired = true;
+    if (completedPersisted && req.allRemaining && !result.bootstrapCompleted) {
+      const cont = await scheduleContinuation(req.id, req.accountId, req.mode);
+      // Only a successfully TRIGGERED successor justifies breaking the
+      // drain loop (racing it would starve the cold successor). On
+      // 'trigger_failed' the pending row exists but no successor is
+      // coming — keep draining so this warm process claims it. On
+      // 'row_write_failed'/'misconfig' there is no successor row at all —
+      // keep draining whatever else is queued.
+      continuationFired = cont === 'triggered';
     }
 
     return { kind: 'completed', continuationFired };

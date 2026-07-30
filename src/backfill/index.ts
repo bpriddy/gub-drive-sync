@@ -25,15 +25,20 @@
  *     inspect what would happen — observation routing, field guesses,
  *     synthesized status_markdowns — before committing.
  *
- * Each batch is INDEPENDENT — synthesis runs with prior_status = null
- * every time. Daily-snapshot timeline replay is a separate driver
- * (Stage 4) that loops this script over historical createdTime windows.
+ * Scans CHAIN — synthesis merges each day's observations with the
+ * entity's existing status_markdown (prior context/transient bullets
+ * are extracted and fed back in, so newer information supersedes older
+ * as the cursor advances). Day-by-day replay is driven by the queue's
+ * one-day continuation chain (src/drive/backfill-queue.ts), not a
+ * separate replay driver.
  *
  * Honest trade-off: per-file CONTENT is the file's CURRENT state, not
- * historical. We track revision METADATA (editor, timestamp) accurately,
- * but the LLM sees today's content. Acceptable proxy per the "creation-
- * order processing gives temporal evolution via processing order" model
- * for backfill; revision-content replay is a later refinement.
+ * historical — the LLM sees today's content. Per-file metadata is only
+ * what files.list returns (modifiedTime, lastModifyingUser); there is
+ * no revision walking. Acceptable proxy per the "creation-order
+ * processing gives temporal evolution via processing order" model for
+ * backfill; revision-content replay was rejected, not deferred (see
+ * docs/edit-stats-decision.md).
  *
  * Usage:
  *   npm run backfill -- --account-id <uuid>
@@ -43,12 +48,6 @@
  *   npm run backfill -- --account-id <uuid> --dryrun
  *     → Preview only. Nothing written. Same flow, same logs, no DB
  *       changes — use to inspect what would happen before committing.
- *
- *   npm run backfill -- --account-id <uuid> --batch-size 100
- *     → First 100 files
- *
- *   npm run backfill -- --account-id <uuid> --batch 1
- *     → Files 31–60 (second batch of 30)
  *
  *   npm run backfill -- --account-id <uuid> --newest-first
  *     → Pick the LATEST active day past the cursor instead of the
@@ -62,6 +61,11 @@
  *   --account-id <uuid>  OR --campaign-id <uuid>  (exactly one)
  *   --newest-first       Pick the NEWEST active day past cursor; default
  *                        is OLDEST (which is what catchup wants).
+ *   --flat               Process EVERY file in ONE scan stamped with
+ *                        today's date — no day-by-day replay, no cursor
+ *                        gating. Marks bootstrap completed.
+ *   --concurrency <n>    Per-file worker count within one day's batch
+ *                        (integer 1–16; default 4). 1 = fully serial.
  *   --output <path>      Tee all output to a file
  *   --structure          Account-only. Print the entity map and exit.
  *   --dryrun             Skip DB writes — preview only. Default is to

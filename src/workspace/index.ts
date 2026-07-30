@@ -8,7 +8,6 @@
  */
 export {
   buildBotOAuthClient,
-  isKnownBot,
   type BotName,
   BotCredentialsMissingError,
   BotCredentialsScopeMismatchError,

@@ -60,9 +60,26 @@ export async function main(): Promise<void> {
 export async function runBackfill(args: Args): Promise<BackfillRunResult> {
   const prevCapture = getLogCapture();
   if (args.captureLog) setLogCapture(args.captureLog);
+  // Heap watcher — emits a [mem] line every 30s with rss/heap/external
+  // so OOM diagnostics survive even though the phase-summary block
+  // can't print after SIGKILL. Cloud Run kills on rss exceeding the
+  // Job's --memory limit; logging rss correlates directly.
+  const memTicker = setInterval(() => {
+    const m = process.memoryUsage();
+    const mb = (n: number): number => Math.round(n / 1024 / 1024);
+    log(
+      `  [mem] rss=${mb(m.rss)}MB  heapUsed=${mb(m.heapUsed)}MB  heapTotal=${mb(m.heapTotal)}MB  external=${mb(m.external)}MB`,
+    );
+  }, 30_000);
+  memTicker.unref();
   try {
     return await runBackfillInner(args);
   } finally {
+    // Queue mode drains many rows in ONE process (up to 50 per Job
+    // execution); an uncleared ticker would keep writing [mem] lines
+    // into LATER rows' captureLog. .unref alone only frees the event
+    // loop — it does not stop the ticks.
+    clearInterval(memTicker);
     setLogCapture(prevCapture);
   }
 }
@@ -81,25 +98,10 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     bootstrapCompleted: false,
   });
 
-  // Fresh phase timer for this invocation. Reset between back-to-back
-  // CLI runs in the same process; queue mode spawns one process per
-  // request so it's effectively per-row.
+  // Fresh phase timer for this invocation. Queue mode drains many rows
+  // in the same process, so each row's runBackfill call gets its own
+  // timer window.
   resetPhaseTimer();
-
-  // Heap watcher — emits a [mem] line every 30s with rss/heap/external
-  // so OOM diagnostics survive even though the phase-summary block
-  // can't print after SIGKILL. Cloud Run kills on rss exceeding the
-  // Job's --memory limit; logging rss correlates directly.
-  //
-  // .unref() so the interval doesn't keep the event loop alive past
-  // the scan's natural completion — we never need to clearInterval.
-  setInterval(() => {
-    const m = process.memoryUsage();
-    const mb = (n: number): number => Math.round(n / 1024 / 1024);
-    log(
-      `  [mem] rss=${mb(m.rss)}MB  heapUsed=${mb(m.heapUsed)}MB  heapTotal=${mb(m.heapTotal)}MB  external=${mb(m.external)}MB`,
-    );
-  }, 30_000).unref();
 
   log('');
   log(rule(args.dryrun ? 'Backfill (dryrun — no DB writes)' : 'Backfill'));
@@ -313,16 +315,21 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       log(`  + piece folders gathered (${piecesById.size}) → total ${allFiles.length} files`);
     }
     log(`  Total files in folder: ${allFiles.length}`);
+    // Nothing-to-do exits report bootstrapCompleted: TRUE — an empty
+    // drive is trivially bootstrapped. Returning false here made an
+    // all_remaining queue row fire a continuation, which hit the same
+    // empty result and fired another: an unbounded self-triggering
+    // Job chain until a human noticed.
     if (allFiles.length === 0) {
       log('  Nothing to do. Exiting.');
-      return emptyResult();
+      return { ...emptyResult(), bootstrapCompleted: true };
     }
 
     activeDates = groupFilesByDate(allFiles);
     if (args.newestFirst) activeDates.reverse();
     if (activeDates.length === 0) {
       log('  No files have modifiedTime — nothing to scan. Exiting.');
-      return emptyResult();
+      return { ...emptyResult(), bootstrapCompleted: true };
     }
     // Persist for chunks 2..N.
     if (!args.dryrun) {
@@ -495,8 +502,3 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     bootstrapCompleted,
   };
 }
-
-// Guard: only run the CLI entry when this file IS the entry point.
-// When imported as a module (e.g., backfill-queue.ts imports
-// runBackfill), main() would otherwise execute on import, fail
-// parseArgs against the wrong argv, and crash the importer.

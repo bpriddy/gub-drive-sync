@@ -183,7 +183,7 @@ Queue of bootstrap + forward runs.
 | `files_processed` | INT | Files processed in this chunk |
 | `activity_page_token_in` | TEXT | Forward only: token handed to this chunk |
 | `activity_page_token_out` | TEXT | Forward only: token at chunk end |
-| `error_message` | TEXT | Terminal-failure detail |
+| `error_message` | TEXT | Last failure detail — written on transient retries and stale reclaims as well as terminal failure, and not cleared on later success, so a completed row can still show an old failure (known quirk) |
 | `log_summary` | TEXT | Last ~40 lines / 2KB of engine stdout |
 
 Indexes:
@@ -353,19 +353,48 @@ cold-started successor for the row it just wrote.
 ### `gub-drive-sync` (engine)
 
 ```
-scripts/
-  backfill.ts                   The engine. Args, Result, parseArgs, main(),
-                                runBackfill, runBackfillInner. Contains
-                                Args interface, structure-cache helpers,
-                                processBatch, runStructureOnly, and the
-                                day-walking loop.
-  clear.ts                      Operator utility: nuke a specific account
-                                (or all campaigns) from drive-sync data.
+scripts/                        Dev probes, seeds, and operator utilities
+                                only — the engine lives in src/backfill/.
+  clear.ts                      Operator utility: complete per-account
+                                nuke (delegates to clearAccountComplete),
+                                single-campaign clear, or all-campaigns
+                                wipe.
   nuke-before-v2.sql            One-time pre-migration data wipe.
   probe-*.ts                    Diagnostic probes (Activity API,
                                 revisions, file history, permission
                                 gating). Useful for investigation; not
                                 wired into runtime.
+  seed-status-proposal.ts       Seed one additional_update proposal +
+                                reviewer magic link (prompt iteration).
+  seed-new-entity-proposal.ts   Seed one new_entity proposal group +
+                                reviewer magic link.
+  setup-gcp.sh                  One-time GCP provisioning for the Cloud
+                                Run Job. Idempotent.
+
+src/backfill/                   The engine (split from the former
+                                scripts/backfill.ts monolith). One scan =
+                                one day of file CRUD.
+  index.ts                      CLI entry + engine header docs.
+                                Re-exports runBackfill.
+  args.ts                       Args interface + parseArgs.
+  run.ts                        runBackfill / runBackfillInner — per-scan
+                                driver: structure resolve, file discovery,
+                                day pick, cursor advance.
+  days.ts                       Cursor + day-bucketing helpers.
+  discovery.ts                  gatherFilesAuto / gatherFilesRecursive —
+                                Drive file gathering.
+  entity.ts                     loadEntity → EntityCtx (the account or
+                                campaign under scan).
+  structure-mode.ts             runStructureOnly (--structure-only mode).
+  process-batch.ts              processBatch — per-file extract/interpret
+                                workers, per-entity distill + synthesis +
+                                persist.
+  routing.ts                    Observation → bucket routing rules.
+  persist.ts                    Distillation + persistTarget DB writes.
+  batch-types.ts                Bucket/outcome shared types.
+  output.ts                     log(), output-file + log-capture plumbing.
+  timing.ts                     Phase-timing map + end-of-run summary.
+  util.ts                       runWithConcurrency worker pool.
 
 src/drive/
   client.ts                     Drive v3 API client. Includes:
@@ -402,8 +431,11 @@ src/config.ts                   Env-driven config. Includes
                                 DRIVE_MAX_FILE_SIZE_BYTES.
 src/main.ts                     Job entry point. Modes:
                                 'poll' | 'run-full-sync' | 'continue' |
-                                'cron' | 'notify' | 'backfill-pending' |
-                                'sweep-expired'. Dispatch in main().
+                                'cron' | 'notify' | 'sweep-expired' |
+                                'backfill-pending' |
+                                'merge-campaign-dupes' | 'clear-account' |
+                                'extract-ideas' | 'derive-pieces'.
+                                Dispatch in main().
 src/heal/                       Drive-aware staff/account healing (older).
 
 prisma/schema.prisma            Mirrored schema (drive_sync_runs +

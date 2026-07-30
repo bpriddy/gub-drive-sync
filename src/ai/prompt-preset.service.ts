@@ -18,9 +18,6 @@ import type { LlmCompletionResult } from './ai.types';
 export interface RunPresetOptions {
   key: string;
   variables: Record<string, string | number | boolean | null | undefined>;
-  /** Optional model/temperature override for experimentation. */
-  modelOverride?: string;
-  temperatureOverride?: number;
   /** Optional Gemini structured-output schema — forces JSON responses. */
   responseSchema?: Schema;
 }
@@ -50,8 +47,8 @@ export async function runPreset(opts: RunPresetOptions): Promise<LlmCompletionRe
 
   const prompt = renderTemplate(preset.template, opts.variables);
   const result = await defaultLlm.complete({
-    model: opts.modelOverride ?? preset.model,
-    temperature: opts.temperatureOverride ?? Number(preset.temperature),
+    model: preset.model,
+    temperature: Number(preset.temperature),
     prompt,
     tag: opts.key,
     ...(opts.responseSchema ? { responseSchema: opts.responseSchema } : {}),

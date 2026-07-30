@@ -9,7 +9,8 @@ import type { TraversedFile } from '../drive/types';
 // ── Cursor + date-grouping helpers ───────────────────────────────────────────
 //
 // Backfill scans by active day. A scan = one calendar-day bucket of files
-// (createdTime → YYYY-MM-DD). The cursor lives on `accounts.drive_backfill_cursor`
+// keyed by effective last-touch date — max(modifiedTime, createdTime) →
+// YYYY-MM-DD (see groupFilesByDate). The cursor lives on `accounts.drive_bootstrap_cursor`
 // — a dedicated DATE column written at the end of every scan regardless
 // of synthesis output. Earlier the cursor was derived from `_edited_at:`
 // lines on status_markdown, but zero-obs days (no synthesis → no persist)

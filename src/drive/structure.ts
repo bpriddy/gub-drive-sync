@@ -285,32 +285,6 @@ Return the classified folders.`;
 // ── Public entrypoint ────────────────────────────────────────────────────────
 
 /**
- * Resolve in one shot: gather folders, then classify. Production callers
- * use this. The dry-run calls gatherFolders + classifyFolders separately
- * so it can print the tree between the (fast) gather and the (slower) LLM
- * classification.
- */
-export async function resolveStructure(args: {
-  accountId: string;
-  accountName: string;
-  rootFolderId: string;
-  existingCampaigns: ExistingCampaignAnchor[];
-}): Promise<EntityMap> {
-  const folders = await gatherFolders(args.rootFolderId, args.accountName);
-  logger.info(
-    { accountId: args.accountId, folderCount: folders.length },
-    `[drive.structure] gathered ${folders.length} folders — classifying with LLM…`,
-  );
-  return classifyFolders({
-    accountId: args.accountId,
-    accountName: args.accountName,
-    rootFolderId: args.rootFolderId,
-    folders,
-    existingCampaigns: args.existingCampaigns,
-  });
-}
-
-/**
  * Classify an already-gathered folder set into the entity map. Separated
  * from gatherFolders so callers can render/inspect the tree before paying
  * for the LLM call.

@@ -53,7 +53,7 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 // calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
 // burst. Acceptable, and we never get a 403 in steady state.
 
-function isRateLimitError(err: unknown): boolean {
+export function isRateLimitError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   const e = err as {
     code?: number;
@@ -404,20 +404,6 @@ export async function downloadFileBuffer(fileId: string): Promise<Buffer> {
   const res = await driveLimiter.run(() =>
     client.files.get(
       { fileId, alt: 'media', supportsAllDrives: true },
-      { responseType: 'stream' },
-    ),
-  );
-  return streamToBuffer(res.data as Readable);
-}
-
-/**
- * Export a Google-native doc to a specific mime type (e.g. text/plain for Docs).
- */
-export async function exportFileBuffer(fileId: string, mimeType: string): Promise<Buffer> {
-  const client = await driveClient();
-  const res = await driveLimiter.run(() =>
-    client.files.export(
-      { fileId, mimeType },
       { responseType: 'stream' },
     ),
   );

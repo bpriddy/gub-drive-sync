@@ -50,12 +50,6 @@ type OAuth2Client = Auth.OAuth2Client;
  */
 export type BotName = 'directory' | 'drive' | 'groups';
 
-const KNOWN_BOTS: ReadonlySet<BotName> = new Set<BotName>(['directory', 'drive', 'groups']);
-
-export function isKnownBot(name: string): name is BotName {
-  return KNOWN_BOTS.has(name as BotName);
-}
-
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 export class BotCredentialsMissingError extends Error {

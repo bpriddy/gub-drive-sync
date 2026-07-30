@@ -209,12 +209,3 @@ async function processFile(
   });
   result.filesExtracted++;
 }
-
-/**
- * Deprecated shell kept so the existing router doesn't blow up on import.
- * Phase 5 will replace this with the real weekly runner.
- */
-export async function runDriveSync(): Promise<{ note: string }> {
-  logger.info('[drive.sync] runDriveSync stub — Phase 5 will implement the weekly runner');
-  return { note: 'phase-3-ready' };
-}

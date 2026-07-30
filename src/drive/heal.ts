@@ -34,7 +34,6 @@
  *   5. NEXT scan: heal sees the new markdown, may extract more structured fields
  */
 
-import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../prisma';
@@ -329,9 +328,3 @@ function castToEntity(kind: 'text' | 'uuid' | 'date', value: unknown): unknown {
     }
   }
 }
-
-// Unused but exported for testing/exploration use.
-export const _internal = { projectChangeValue, castToEntity };
-
-// Silence eslint about unused import in some builds.
-void crypto;

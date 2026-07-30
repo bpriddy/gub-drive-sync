@@ -120,7 +120,11 @@ cd ~/Documents/WORK/.../gub-drive-sync
 npm run clear -- --account-id <uuid>
 ```
 
-This clears the account's:
+This is a COMPLETE per-account nuke — `clearAccountComplete`
+(src/drive/clear-account.ts), the same code the `clear-account` Cloud
+Run mode runs. The account row itself survives (folder pointer +
+business fields kept); everything else Drive-sync goes:
+
 - `status_markdown` + `status_sensitive_markdown`
 - `drive_bootstrap_cursor`
 - `drive_bootstrap_completed_at`
@@ -128,13 +132,22 @@ This clears the account's:
 - `drive_activity_page_token`
 - `drive_structure_classification`
 - `drive_bootstrap_files`
-- All child campaign rows + their `*_changes` audit rows
+- `drive_last_run_at`
+- All child campaign rows + their `campaign_changes` audit rows
+- All `account_changes` audit rows
 - All `drive_change_proposals` for this account
 - All `drive_scan_logs` for this account
+- All `drive_file_snapshots` for this account
+- All `drive_sync_runs` queue rows for this account
+- All `access_grants` — account-scoped AND campaign-scoped
+- Account-scoped `audit_log` entries (succeeds in dev, where the
+  append-only triggers are dropped; in prod the triggers reject the
+  delete and the whole transaction rolls back)
 
-⚠ **Manually-entered campaign rows are also deleted.** If the operator
-wants to preserve some campaigns, audit before running and pluck them
-out of `clearAccount`'s scope.
+⚠ **Manually-entered campaign rows are also deleted**, along with their
+access grants and audit-log entries. There is no partial scope to pluck
+campaigns out of — the wipe is one all-or-nothing transaction. If the
+operator wants to preserve campaigns, export/audit them before running.
 
 After clearing, click **Backfill** in gub-admin. Bootstrap runs again
 from scratch.
@@ -169,7 +182,7 @@ Useful sub-filters:
 
 ```bash
 # Per-phase narration
-textPayload =~ "Gathering folders|Classifying|Discover files|Scan:|Fetching revision|Extracting|Synthesized|Backfill done"
+textPayload =~ "Gathering folders|Classifying|Discover files|Scan:|Extracting|Synthesized|Backfill done"
 
 # Heap usage every 30s
 textPayload =~ "\\[mem\\]"

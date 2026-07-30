@@ -25,7 +25,6 @@ const EnvSchema = z.object({
   DRIVE_ROOT_FOLDER_ID: z.string().optional(),
   DRIVE_DELAY_BETWEEN_ACCOUNTS_MS: z.string().default('5000').transform(Number),
   DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS: z.string().default('2000').transform(Number),
-  DRIVE_DELAY_BETWEEN_FILES_MS: z.string().default('500').transform(Number),
   // 300 MB default. Only enforced for BINARY downloads (PDF, DOCX, PPTX,
   // text/*) where we pull bytes into memory. Google-native files
   // (Docs/Sheets/Slides) are API-traversed and skip this cap entirely.

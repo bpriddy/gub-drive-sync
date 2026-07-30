@@ -1,5 +1,6 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
+import { isRateLimitError } from '../drive/client';
 import { matchCampaignName } from '../drive/name-similarity';
 import type { CampaignObservation } from '../drive/interpret';
 import type { EntityAttribution } from '../drive/structure';
@@ -198,8 +199,14 @@ export function routeCampaignObs(
  * the restricted-file condition (shortcut to an unshared personal-drive doc,
  * or download-restricted file), distinct from transient errors. These become
  * worklist rows re-probed every scan; see the drive_restricted_files model.
+ *
+ * Rate-limit 403s (userRateLimitExceeded etc.) are EXCLUDED: when the
+ * limiter exhausts its retries that 403 is transient, not a permission
+ * condition — classifying it as restricted minted a bogus worklist row
+ * plus a false "content is access-restricted" dossier observation.
  */
 export function isDrivePermissionError(err: unknown): boolean {
+  if (isRateLimitError(err)) return false;
   if (!err || typeof err !== 'object') return false;
   const e = err as { code?: number | string; response?: { status?: number } };
   return e.code === 403 || e.code === '403' || e.response?.status === 403;
