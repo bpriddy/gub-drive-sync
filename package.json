@@ -20,7 +20,10 @@
     "probe-file-history": "tsx -r dotenv/config scripts/probe-file-history.ts",
     "probe-edited-files": "tsx -r dotenv/config scripts/probe-edited-files.ts",
     "probe-permission-test": "tsx -r dotenv/config scripts/probe-permission-test.ts",
-    "probe-revision-content": "tsx -r dotenv/config scripts/probe-revision-content.ts"
+    "probe-revision-content": "tsx -r dotenv/config scripts/probe-revision-content.ts",
+    "lint": "eslint src",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "@google/genai": "^2.11.0",
@@ -36,10 +39,14 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.5",
+    "eslint": "^10.8.1",
+    "prettier": "^3.9.6",
     "prisma": "^5.22.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
+    "typescript-eslint": "^8.66.0",
     "vitest": "^2.1.8"
   }
 }
