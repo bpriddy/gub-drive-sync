@@ -1,0 +1,91 @@
+# Deploy — build the image with the repo Dockerfile, push to Artifact
+# Registry, update the Cloud Run **Job** (not a Service — no HTTP surface).
+#
+# The job is only STARTED by Cloud Scheduler (mode=poll), gub-admin's
+# "Sync now", its own chunked continuation, or an operator — this workflow
+# never executes it; the next `jobs:run` picks up the new image.
+#
+# Auth is Workload Identity Federation (OIDC) — no service-account keys.
+# Required GitHub repository variables: see CI-CD.md.
+#
+# This workflow updates the IMAGE ONLY. Env vars, secrets, Cloud SQL
+# attachment, task/retry/timeout posture stay whatever the last
+# cloudbuild/<env>.yaml deploy set — those files remain the config source of
+# truth, and first-time provisioning still goes through them.
+#
+# Manual trigger only for now: the existing Cloud Build trigger fires on push
+# to main; enabling a push trigger here too would double-deploy. Once the
+# Cloud Build trigger is disabled, uncomment `push:`.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (must already be provisioned via cloudbuild/<env>.yaml)
+        type: choice
+        default: dev
+        options: [dev, staging, prod]
+  # push:
+  #   branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  AR_REPO: gub-drive-sync
+  JOB: gub-drive-sync-${{ github.event.inputs.environment || 'dev' }}
+  REGION: ${{ vars.GCP_REGION }}
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      # An image-only deploy must never CREATE the job — a bare create would
+      # come up without its secrets, runtime SA, or Cloud SQL socket.
+      - name: Verify target job is provisioned
+        run: |
+          gcloud run jobs describe "$JOB" --region "$REGION" --format='value(metadata.name)' >/dev/null \
+            || { echo "::error::Cloud Run job $JOB does not exist in $PROJECT_ID/$REGION. Provision '$ENVIRONMENT' first with cloudbuild/$ENVIRONMENT.yaml."; exit 1; }
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/$JOB"
+          docker build -t "$IMAGE:$SHORT_SHA" -t "$IMAGE:latest" .
+          docker push --all-tags "$IMAGE"
+          echo "IMAGE_URI=$IMAGE:$SHORT_SHA" >> "$GITHUB_ENV"
+
+      # `jobs deploy` has no traffic/promotion step; the next `jobs:run`
+      # (Scheduler / gub-admin / continuation) uses the new image.
+      - name: Update Cloud Run job image
+        run: gcloud run jobs deploy "$JOB" --image "$IMAGE_URI" --region "$REGION"
+
+      - name: Report job image
+        run: |
+          gcloud run jobs describe "$JOB" --region "$REGION" \
+            --format='value(template.template.containers[0].image)'
