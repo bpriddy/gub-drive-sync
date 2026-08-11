@@ -508,6 +508,79 @@ async function processOne(req: {
   }
 }
 
+export interface ForwardEnqueueResult {
+  /** Accounts with a Drive folder AND a completed bootstrap. */
+  eligible: number;
+  /** Forward rows created this invocation. */
+  enqueued: number;
+  /** Eligible accounts skipped because a pending/running row already exists. */
+  skippedActive: number;
+}
+
+/**
+ * Interval entry point (Cloud Scheduler → jobs:run args=["forward-enqueue"]).
+ *
+ * For every account whose bootstrap has completed, enqueue ONE forward
+ * row (all_remaining, so the chunk chain catches the account all the way
+ * up to today if it fell multiple days behind), unless a pending/running
+ * row already exists — that guard keeps the day-serial doctrine intact
+ * when a previous interval's chain is still working. A caught-up account
+ * costs one cheap no-op scan (the nothing-past-cursor case reports
+ * trivially complete; no continuation fires).
+ *
+ * Forward rows currently run the day-walk engine (the documented v2
+ * "stub"); forward-sync-v2 replaces the delta mechanism INSIDE this
+ * scheduled path without changing the enqueue/drain shape.
+ *
+ * NOTE: the pending/running check narrows but does not eliminate the
+ * race with an overlapping tick (no DB-level uniqueness). Overlap is
+ * bounded by scheduler cadence vs chain runtime; a partial unique index
+ * on (account_id) WHERE status IN ('pending','running') is the hard
+ * guard if it ever bites.
+ */
+export async function enqueueForwardRows(): Promise<ForwardEnqueueResult> {
+  const accounts = await prisma.account.findMany({
+    where: {
+      driveFolderId: { not: null },
+      driveBootstrapCompletedAt: { not: null },
+    },
+    select: { id: true, name: true },
+  });
+
+  let enqueued = 0;
+  let skippedActive = 0;
+  for (const a of accounts) {
+    const active = await prisma.driveSyncRun.findFirst({
+      where: { accountId: a.id, status: { in: ['pending', 'running'] } },
+      select: { id: true },
+    });
+    if (active) {
+      skippedActive++;
+      continue;
+    }
+    await prisma.driveSyncRun.create({
+      data: {
+        accountId: a.id,
+        mode: 'forward',
+        allRemaining: true,
+        requestedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
+        logSummary: 'interval forward-enqueue',
+      },
+    });
+    enqueued++;
+  }
+
+  console.log(
+    JSON.stringify({
+      msg: 'forward-enqueue.done',
+      eligible: accounts.length,
+      enqueued,
+      skippedActive,
+    }),
+  );
+  return { eligible: accounts.length, enqueued, skippedActive };
+}
+
 /**
  * Single-invocation drain. Loops claim → process → claim … until either:
  *   - claimNext() returns null (queue empty or all eligible rows already

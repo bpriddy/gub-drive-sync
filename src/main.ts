@@ -16,6 +16,10 @@
  *                                                    drive_backfill_requests
  *                                                    queue; Cloud Scheduler
  *                                                    target)
+ *   forward-enqueue          → enqueueForwardRows + processBackfillQueue
+ *                              (interval forward sync: one forward row per
+ *                              bootstrapped account, then drain in-process;
+ *                              the Cloud Scheduler interval target)
  *   merge-campaign-dupes     → runCampaignMerge  (operator gcloud; one-shot
  *     --account-name X [--confirm]                 detect + merge duplicate
  *     [--min-confidence 0..1]                      campaigns. No --confirm =
@@ -43,7 +47,7 @@ import {
   continuePausedSync,
   startFullSync,
 } from './drive/runner';
-import { processBackfillQueue } from './drive/backfill-queue';
+import { enqueueForwardRows, processBackfillQueue } from './drive/backfill-queue';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
 import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
@@ -57,6 +61,7 @@ type Mode =
   | 'notify'
   | 'sweep-expired'
   | 'backfill-pending'
+  | 'forward-enqueue'
   | 'merge-campaign-dupes'
   | 'clear-account'
   | 'extract-ideas'
@@ -70,6 +75,7 @@ const ALL_MODES: readonly Mode[] = [
   'notify',
   'sweep-expired',
   'backfill-pending',
+  'forward-enqueue',
   'merge-campaign-dupes',
   'clear-account',
   'extract-ideas',
@@ -318,6 +324,18 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
       // entry (rows stuck in 'running' for >60min).
       const result = await processBackfillQueue();
       return result as unknown as Record<string, unknown>;
+    }
+
+    case 'forward-enqueue': {
+      // Interval entry point (Cloud Scheduler): enqueue one forward row
+      // per bootstrapped account (skipping accounts with an active row),
+      // then drain in-process exactly like backfill-pending.
+      const enqueue = await enqueueForwardRows();
+      const drain = await processBackfillQueue();
+      return {
+        enqueue: enqueue as unknown as Record<string, unknown>,
+        drain: drain as unknown as Record<string, unknown>,
+      };
     }
 
     case 'merge-campaign-dupes': {

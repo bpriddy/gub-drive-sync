@@ -248,6 +248,8 @@ export async function processBatch(
   let filesZeroObs = 0;
   let accountLevelFiles = 0;
   let campaignObsDiscarded = 0;
+  /** Stage-3 synthesis/apply failures — see BatchOutcome.stage3Failures. */
+  let stage3Failures = 0;
   /** Obs about a DIFFERENT campaign found inside a campaign zone — misfiled content, dropped. */
   let foreignObsDropped = 0;
   /** Account-zone obs naming an UNKNOWN campaign → converted to account observations (no phantoms). */
@@ -1292,6 +1294,7 @@ export async function processBatch(
         // with "(synthesis failed…)", and since the cursor still advances,
         // the day would never re-run to restore it.
         synthFailed = true;
+        stage3Failures++;
         synthesizedMarkdown = `(synthesis failed: ${summarizeError(err)})`;
       }
       const synthesisMs = Date.now() - synthStart;
@@ -1316,6 +1319,7 @@ export async function processBatch(
             );
             wlog('      ✓ applied (system-staff attribution)');
           } catch (err) {
+            stage3Failures++;
             wlog(`      apply failed: ${summarizeError(err)}`);
           }
         }
@@ -1423,6 +1427,7 @@ export async function processBatch(
     accountLevelFiles,
     campaignObsDiscarded,
     synthesized,
+    stage3Failures,
     ideaStats: ideaCtx?.stats ?? null,
   };
 }

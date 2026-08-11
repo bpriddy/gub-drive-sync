@@ -114,6 +114,14 @@ export interface BatchOutcome {
   campaignObsDiscarded: number;
   /** Stage 3: one entry per entity that got distill+synth. */
   synthesized: EntitySynthesisResult[];
+  /**
+   * Stage-3 synthesis/apply failures. Non-zero means at least one
+   * entity's day is NOT in the DB — run.ts throws before the cursor
+   * persists so the queue retry re-runs the day instead of silently
+   * losing it. Distill failures are deliberately excluded (degraded,
+   * not lost — observations still reach synthesis).
+   */
+  stage3Failures: number;
   /** Ideas tier: deck-gated extraction stats (null when account folder unknown). */
   ideaStats: IdeaScanStats | null;
 }

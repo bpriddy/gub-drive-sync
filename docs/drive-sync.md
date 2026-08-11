@@ -46,9 +46,14 @@ with the actual edit timestamps from the activity events.
   **Sync** in gub-admin to fire one immediately.
 - Same chunking + continuation pattern; the changeset window is bounded
   by `pageToken` rather than calendar day.
+- Interval wiring: Cloud Scheduler fires `jobs:run args=["forward-enqueue"]`,
+  which enqueues one `mode='forward'` row per bootstrapped account
+  (skipping accounts with an active row — the day-serial guard) and then
+  drains in-process. A caught-up account costs one cheap no-op scan.
 - Status: **stub today.** Forward mode runs through the same engine but
   doesn't yet poll Activity API — it walks `modifiedTime` buckets like
-  bootstrap. Real Activity-driven forward sync is the next milestone.
+  bootstrap. Real Activity-driven forward sync is the next milestone and
+  replaces the delta mechanism INSIDE the scheduled path above.
 - **When building it, start from [edit-stats-decision.md](edit-stats-decision.md)**
   — the per-editor edit-event stats (decided 2026-07-20) ride this build:
   the same Activity event stream feeds both file re-processing and the
@@ -432,7 +437,7 @@ src/config.ts                   Env-driven config. Includes
 src/main.ts                     Job entry point. Modes:
                                 'poll' | 'run-full-sync' | 'continue' |
                                 'cron' | 'notify' | 'sweep-expired' |
-                                'backfill-pending' |
+                                'backfill-pending' | 'forward-enqueue' |
                                 'merge-campaign-dupes' | 'clear-account' |
                                 'extract-ideas' | 'derive-pieces'.
                                 Dispatch in main().
