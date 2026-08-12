@@ -6,7 +6,6 @@
 # never executes it; the next `jobs:run` picks up the new image.
 #
 # Auth is Workload Identity Federation (OIDC) — no service-account keys.
-# Required GitHub repository variables: see CI-CD.md.
 #
 # This workflow updates the IMAGE ONLY. Env vars, secrets, Cloud SQL
 # attachment, task/retry/timeout posture stay whatever the last
