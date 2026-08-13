@@ -108,7 +108,11 @@ this merges. Interval scheduling stays OFF until Phase 2 (the parked
    credential reuse?~~ **ANSWERED 2026-08-13 (user): yes** — drive-sync
    holds the directory bot's credential for this one read-only
    profile→email lookup, cached.
-2. Deletion policy = count + log only — acceptable for Phase 1?
+2. ~~Deletion policy = count + log only — acceptable for Phase 1?~~
+   **ANSWERED 2026-08-13 (user): do nothing.** Deletion doesn't signify
+   invalidated information; dossiers are memory, not a mirror. Run logs
+   still count deletions for operational visibility; dossiers never
+   react.
 3. Run the ~1y historical seed at validation? (Default: yes — same
    query, wider window, one-shot.)
 4. Cursor-timestamp overlap: window edges use a 2-minute lookback
