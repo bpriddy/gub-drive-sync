@@ -2,7 +2,7 @@
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { listSharedDriveFiles, probeFolder } from '../drive/client';
 import { traverseFolder } from '../drive/traversal';
-import { log } from './output';
+import { log } from '../scan/output';
 import type { TraversedFile } from '../drive/types';
 
 // ── Phase 1: gather all files ───────────────────────────────────────────────

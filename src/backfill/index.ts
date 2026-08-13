@@ -79,7 +79,7 @@ import { main } from './run';
 
 export { runBackfill } from './run';
 export { parseArgs, type Args, type BackfillRunResult } from './args';
-export { isForeignCampaignTag } from './routing';
+export { isForeignCampaignTag } from '../scan/routing';
 
 if (require.main === module) {
   main()

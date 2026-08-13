@@ -53,7 +53,7 @@ import {
   persistTarget,
   type ValidatedChange,
 } from './persist';
-import type { EntityCtx } from './entity';
+import type { EntityCtx } from '../backfill/entity';
 import type {
   BatchOutcome,
   CampaignBucket,

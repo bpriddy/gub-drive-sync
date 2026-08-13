@@ -13,8 +13,8 @@ import {
 } from '../drive/structure';
 import type { TraversedFile } from '../drive/types';
 import { parseArgs, DEFAULT_CONCURRENCY, type Args, type BackfillRunResult } from './args';
-import { log, rule, fmtMs, setOutputFile, getLogCapture, setLogCapture } from './output';
-import { resetPhaseTimer, printPhaseSummary, timed } from './timing';
+import { log, rule, fmtMs, setOutputFile, getLogCapture, setLogCapture } from '../scan/output';
+import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
 import { loadEntity } from './entity';
 import { gatherFilesAuto, gatherFilesRecursive } from './discovery';
 import {
@@ -27,8 +27,8 @@ import {
   type StructureCache,
   type BootstrapFilesCache,
 } from './days';
-import { buildCampaignNameDirectory, type CampaignNameDirectory } from './batch-types';
-import { processBatch } from './process-batch';
+import { buildCampaignNameDirectory, type CampaignNameDirectory } from '../scan/batch-types';
+import { processBatch } from '../scan/process-batch';
 import { runStructureOnly } from './structure-mode';
 
 // ── Main ─────────────────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ import { parseLlmJson, runPreset } from '../ai';
 import { DRIVE_SYNC_SYSTEM_STAFF_ID } from '../drive/heal';
 import type { AccountObservation, CampaignObservation } from '../drive/interpret';
 import { log } from './output';
-import type { EntityCtx } from './entity';
+import type { EntityCtx } from '../backfill/entity';
 
 // ── Dry-run distillation helper (for new candidates) ────────────────────────
 //
