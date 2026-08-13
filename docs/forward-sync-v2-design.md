@@ -38,9 +38,10 @@ and hands over batches, exactly like the day-walk driver.
    any discovery result; content is current-state, per doctrine).
 5. **Structure**: same path as today — cheap re-gather + fingerprint;
    LLM re-classify only on drift.
-6. **Per day-group**: `processBatch(files, { …, editedAt: <event day> })`.
-   The day-commit gate applies: stage-3 failure → throw → queue retry
-   re-runs from the last committed cursor.
+6. **Per day-group**: `processBatch(files, { …, editedAt: <event day> })`
+   with application policy **`propose`** (see below). The day-commit gate
+   applies: stage-3 failure → throw → queue retry re-runs from the last
+   committed cursor.
 7. **Advance cursor** after each committed day-group (crash-safe);
    final group advances it to the window end.
 8. **Edit stats**: upsert the (file, day, actor) tallies gathered in
@@ -52,6 +53,33 @@ Dispatch: `backfill-queue.processOne` routes by `req.mode` —
 enqueues forward rows, so it starts exercising the real driver the day
 this merges. Interval scheduling stays OFF until Phase 2 (the parked
 `forward-enqueue` shell returns then, in final form).
+
+## Application policy: forward PROPOSES, review APPLIES
+
+**Corrected 2026-08-13 after user review** — the reviewer architecture
+(status-markdown-plan.md D6/D7/D14/D28: proposals → notify fan-out →
+gub-review magic-link UI → GUB `applyDecisions` with synthesis) is the
+PLANNED forward-sync application layer, not v1 legacy. Auto-apply was
+always the backfill exception ("per-day human review is impractical"
+across years of history), per the human-reviews-AI contract.
+
+- The scan core's `applyToDb: boolean` becomes
+  `application: 'apply' | 'propose' | 'dryrun'` — bootstrap keeps
+  `apply`; forward uses `propose`.
+- `propose`: distilled field_changes → `drive_change_proposals`; notes →
+  additional_update items; new-entity candidates → new_entity groups.
+  Dossiers untouched until the account owner approves; synthesis fires
+  inside `applyDecisions` on approval (D7), `changed_by` = reviewer
+  (D14). Sensitivity uses the reviewer's per-item toggle (D28).
+- Forward runs end with the existing `notify` fan-out to
+  `EntityCtx.reviewerEmail` (the wiring the engine has carried all
+  along). `sweep-expired` keeps its job.
+- Edit stats are telemetry, not dossier content — they bypass review
+  and upsert directly.
+- **Open sub-question (Q5)**: do pieces/ideas gate on review in forward
+  too? Default: no for Phase 1 — dossier/field changes go through
+  review (the plan's contract); the piece/idea ratchets stay automatic
+  and we revisit with real usage.
 
 ## Edit stats
 
@@ -80,7 +108,13 @@ this merges. Interval scheduling stays OFF until Phase 2 (the parked
 - **Deletions/trashes**: counted + logged, not applied. Dossiers are
   memory, not a mirror; how (whether) deletions should surface is a
   Phase 2+ conversation.
-- **v1 retirement, interval scheduling, phantom cleanup**: Phase 2.
+- **v1 retirement, interval scheduling, phantom cleanup**: Phase 2 —
+  and the retirement list is NARROWER than earlier drafts implied: only
+  the delta/discovery machinery goes (poll, runner, orchestrator, sync,
+  snapshot, discover). The proposal/review application layer
+  (distill-proposal writers, notify, sweep-expired, GUB drive.review,
+  gub-review UI) is planned architecture and STAYS — forward sync runs
+  on it.
 - **Per-editor content attribution**: impossible on public APIs —
   settled in the decision record; do not reopen.
 
