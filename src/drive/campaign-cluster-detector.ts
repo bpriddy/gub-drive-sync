@@ -20,11 +20,12 @@
 
 import { z } from 'zod';
 import { SchemaType, type ResponseSchema } from '../ai';
-import { defaultLlm } from '../ai';
+import { defaultLlm, DEFAULT_GEMINI_MODEL } from '../ai';
 import { parseLlmJson } from '../ai/prompt-preset.service';
 import { logger } from '../logger';
+import { runWithConcurrency } from '../scan/util';
 
-const MODEL = 'gemini-3.5-flash';
+const MODEL = DEFAULT_GEMINI_MODEL;
 const CONFIDENCE_FLOOR = 0.8;
 /**
  * MUST be generous: gemini-3.5-flash's THINKING tokens count against this cap.
@@ -330,18 +331,6 @@ function roundRobinPairings(B: number): Array<Array<[number, number]>> {
 }
 
 /** Bounded-concurrency map. */
-async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let idx = 0;
-  const worker = async (): Promise<void> => {
-    while (idx < items.length) {
-      const i = idx++;
-      out[i] = await fn(items[i]!);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return out;
-}
 
 /** Canonical = folder-anchored > non-empty markdown > oldest createdAt. */
 function pickCanonical(members: CampaignForClustering[]): CampaignForClustering {
@@ -436,7 +425,7 @@ export async function detectCampaignClustersWindowed(args: {
     schedule++;
     const windows = buildScheduleWindows(working, windowSize, voteThreshold, schedule);
 
-    const results = await mapPool(windows, WINDOW_CONCURRENCY, async (window) => {
+    const results = await runWithConcurrency(windows, WINDOW_CONCURRENCY, async (window) => {
       windowCalls++;
       try {
         return await detectCampaignClusters({ accountName: args.accountName, campaigns: window });

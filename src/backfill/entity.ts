@@ -1,59 +1,15 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { prisma } from '../prisma';
-import {
-  buildAccountCurrentState,
-  buildCampaignCurrentState,
-  type AccountCurrentState,
-  type CampaignCurrentState,
-} from '../drive/schema';
+import { buildAccountCurrentState, buildCampaignCurrentState } from '../drive/schema';
+import type { EntityCtx } from '../scan/batch-types';
 import type { Args } from './args';
+
+export type { EntityCtx } from '../scan/batch-types';
 import { ymdFromDate } from './days';
 
 // ── Entity ───────────────────────────────────────────────────────────────────
 
-export interface EntityCtx {
-  type: 'account' | 'campaign';
-  id: string;
-  name: string;
-  folderId: string;
-  /**
-   * The parent account id for both account- and campaign-scoped ctx —
-   * the bootstrap cursor lives on `accounts.drive_bootstrap_cursor` and
-   * is account-scoped regardless of which entity drove the chunk.
-   */
-  accountId: string;
-  /** Account ROOT folder id — the org-scope external key on idea rows. */
-  accountFolderId: string | null;
-  accountState: AccountCurrentState;
-  accountName: string;
-  campaignName: string | null;
-  campaignState: CampaignCurrentState | null;
-  /** Current persisted status_markdown (general) or null. */
-  statusMarkdown: string | null;
-  /** Current persisted status_sensitive_markdown or null (per D29). */
-  statusSensitiveMarkdown: string | null;
-  /**
-   * Persisted `accounts.drive_bootstrap_cursor` as YYYY-MM-DD, or null.
-   * Drives the modifiedTime-day walker's "next pending day" lookup.
-   * Written at the end of every chunk regardless of synthesis output.
-   */
-  driveBootstrapCursor: string | null;
-  /**
-   * Cached structure (folders + entity_map + fingerprint) from a prior
-   * chunk. NULL = first chunk in chain, or cache invalidated. Engine
-   * checks fingerprint; on match, skips the ~1m 45s LLM classify step.
-   */
-  driveStructureClassification: unknown;
-  /**
-   * Cached file list + active_dates from bootstrap chunk #1. NULL after
-   * bootstrap completes (or before first chunk). When present, chunks
-   * 2..N skip the ~3 min file discovery + grouping step.
-   */
-  driveBootstrapFiles: unknown;
-  reviewerEmail: string | null;
-  reviewerStaffId: string | null;
-}
 
 export async function loadEntity(args: Args): Promise<EntityCtx> {
   if (args.accountId) {

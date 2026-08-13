@@ -25,11 +25,11 @@
 
 import { z } from 'zod';
 import { SchemaType, type ResponseSchema } from '../ai';
-import { defaultLlm, parseLlmJson } from '../ai';
+import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
 import { logger } from '../logger';
 import type { TraversedFile } from './types';
 
-const MODEL = 'gemini-3.5-flash';
+const MODEL = DEFAULT_GEMINI_MODEL;
 const TEMPERATURE = 0.2;
 // Generous on purpose: gemini-3.5-flash thinking tokens count against this,
 // and a dense deck can emit several ideas with many facet rows. Too low a cap

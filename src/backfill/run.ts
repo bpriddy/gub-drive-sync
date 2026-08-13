@@ -398,18 +398,17 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log('');
 
     const scanStart = Date.now();
-    const outcome = await processBatch(
-      nextDay.files,
+    const outcome = await processBatch(nextDay.files, {
       ctx,
       attributor,
       nameDirectory,
       folderPathById,
-      piecesById.size > 0 ? piecesById : null,
+      piecesById: piecesById.size > 0 ? piecesById : null,
       familyByCampaignId,
-      !args.dryrun,
-      nextDay.date,
-      args.concurrency ?? DEFAULT_CONCURRENCY,
-    );
+      applyToDb: !args.dryrun,
+      editedAt: nextDay.date,
+      concurrency: args.concurrency ?? DEFAULT_CONCURRENCY,
+    });
     const scanMs = Date.now() - scanStart;
 
     // ── Print synthesized status_markdowns for this scan ──────────────

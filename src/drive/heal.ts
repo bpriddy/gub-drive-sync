@@ -298,7 +298,7 @@ export async function healFromMarkdown(input: HealInput): Promise<HealResult> {
 
 // ── value-projection helpers (mirror drive.review.ts's projectValue) ────────
 
-function projectChangeValue(
+export function projectChangeValue(
   kind: 'text' | 'uuid' | 'date',
   value: unknown,
   side: 'new' | 'previous',
@@ -315,7 +315,7 @@ function projectChangeValue(
   return { [key]: s };
 }
 
-function castToEntity(kind: 'text' | 'uuid' | 'date', value: unknown): unknown {
+export function castToEntity(kind: 'text' | 'uuid' | 'date', value: unknown): unknown {
   if (value === null || value === undefined) return null;
   switch (kind) {
     case 'text':

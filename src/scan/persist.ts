@@ -1,5 +1,5 @@
-// Part of the backfill engine (see index.ts). Extracted verbatim from the
-// former scripts/backfill.ts monolith — behavior-preserving reorganization.
+// Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
+// by every driver (day-walk backfill today; the Activity forward driver next).
 import { z } from 'zod';
 import { prisma } from '../prisma';
 import {
@@ -7,33 +7,27 @@ import {
   CAMPAIGN_WRITABLE_FIELDS,
   type AccountCurrentState,
   type CampaignCurrentState,
-  type ChangeValueKind,
   type FieldWriteSpec,
 } from '../drive/schema';
 import { distillationResponseSchema } from '../drive/structured-output';
 import { parseLlmJson, runPreset } from '../ai';
-import { DRIVE_SYNC_SYSTEM_STAFF_ID } from '../drive/heal';
+import { DRIVE_SYNC_SYSTEM_STAFF_ID, castToEntity, projectChangeValue } from '../drive/heal';
 import type { AccountObservation, CampaignObservation } from '../drive/interpret';
 import { log } from './output';
-import type { EntityCtx } from '../backfill/entity';
+import type { EntityCtx } from './batch-types';
 
-// ── Dry-run distillation helper (for new candidates) ────────────────────────
-//
-// New campaign candidates have no DB row yet, so distillAndEmit (which writes
-// proposals) would violate the proposal CHECK constraint. But we still want
-// the distillation LLM to extract field guesses from the bucketed
-// observations — that's what turns a free-form note like "launch is
-// September 5" into a structured `live_at = 2024-09-05` guess that should
-// land in the at-a-glance bullets.
-//
-// This helper runs the same distillation prompt as production but DOES NOT
-// write to the DB. The caller uses the resulting field_changes to populate
-// the campaign's CurrentState for synthesis rendering. The integration with
-// proposeNewEntity (so production new-entity proposals also carry these
-// field guesses) is the Phase 7 / discover-refactor work — out of scope for
-// the dry-run visibility fix.
 
-const DryRunDistillationSchema = z.object({
+// ── Distillation (the engine's structured-field step) ───────────────────────
+//
+// Runs the drive.distillation.v1 preset over an entity's observation bucket
+// and returns structured field_changes + notes. Pure LLM call — writes
+// nothing; persistTarget applies the results (auto-apply, system-staff
+// attribution). Named runDryRunDistillation historically because it began
+// as the dry-run path; it has been the production distillation step since
+// auto-apply shipped. (The v1 pipeline's distillAndEmit writes review
+// proposals instead — that is its difference, not this one's.)
+
+const DistillationSchema = z.object({
   field_changes: z
     .array(
       z.object({
@@ -64,7 +58,7 @@ const DryRunDistillationSchema = z.object({
     .default([]),
 });
 
-export async function runDryRunDistillation(
+export async function runDistillation(
   entityType: 'account' | 'campaign',
   observations: Array<{
     observation: AccountObservation | CampaignObservation;
@@ -72,8 +66,8 @@ export async function runDryRunDistillation(
   }>,
   currentState: AccountCurrentState | CampaignCurrentState,
 ): Promise<{
-  field_changes: z.infer<typeof DryRunDistillationSchema>['field_changes'];
-  notes: z.infer<typeof DryRunDistillationSchema>['notes'];
+  field_changes: z.infer<typeof DistillationSchema>['field_changes'];
+  notes: z.infer<typeof DistillationSchema>['notes'];
   driver: string;
 }> {
   const observationsForPrompt = observations.map((o) => ({
@@ -95,7 +89,7 @@ export async function runDryRunDistillation(
   });
 
   const parsed = parseLlmJson<unknown>(completion.text);
-  const validated = DryRunDistillationSchema.parse(parsed);
+  const validated = DistillationSchema.parse(parsed);
   return {
     field_changes: validated.field_changes,
     notes: validated.notes,
@@ -105,42 +99,12 @@ export async function runDryRunDistillation(
 
 // ── Apply helpers (cast + project to *_changes column shape) ─────────────────
 //
-// Mirrors gcp-universal-backend's drive.review.ts apply path so backfill
-// produces audit rows + entity-column updates identical to what a reviewer
-// approval would produce in forward sync. The only differences are
+// Shared with the heal step: castToEntity + projectChangeValue live in
+// src/drive/heal.ts (which mirrors gcp-universal-backend's drive.review.ts
+// apply path), so scan-apply, heal, and reviewer approval all produce
+// identical audit rows + entity-column shapes. The only differences are
 // changed_by (system staff here, reviewer there) and the lack of a
 // drive_change_proposals row to reference.
-
-function castToEntityValue(kind: ChangeValueKind, value: unknown): unknown {
-  if (value === null || value === undefined) return null;
-  switch (kind) {
-    case 'text':
-      return typeof value === 'string' ? value : String(value);
-    case 'uuid':
-      return typeof value === 'string' ? value : String(value);
-    case 'date': {
-      const s = typeof value === 'string' ? value : String(value);
-      return new Date(`${s}T00:00:00Z`);
-    }
-  }
-}
-
-function projectChangeRow(
-  kind: ChangeValueKind,
-  value: unknown,
-  side: 'new' | 'previous',
-): Record<string, string | Date | null> {
-  const keyPrefix = side === 'new' ? 'value' : 'previousValue';
-  const suffix = kind === 'text' ? 'Text' : kind === 'uuid' ? 'Uuid' : 'Date';
-  const key = `${keyPrefix}${suffix}`;
-  if (value === null || value === undefined) return { [key]: null };
-  if (kind === 'date') {
-    const s = typeof value === 'string' ? value : String(value);
-    return { [key]: new Date(`${s}T00:00:00Z`) };
-  }
-  const s = typeof value === 'string' ? value : String(value);
-  return { [key]: s };
-}
 
 export interface ValidatedChange {
   field: string;
@@ -298,7 +262,7 @@ async function persistAccountTarget(
 ): Promise<void> {
   const columnUpdates: Record<string, unknown> = {};
   for (const vc of validatedChanges) {
-    columnUpdates[vc.spec.entityColumn] = castToEntityValue(vc.spec.changeKind, vc.validatedValue);
+    columnUpdates[vc.spec.entityColumn] = castToEntity(vc.spec.changeKind, vc.validatedValue);
   }
   columnUpdates['statusMarkdown'] = synthesizedMarkdown;
   if (synthesizedSensitiveMarkdown !== null) {
@@ -311,8 +275,8 @@ async function persistAccountTarget(
       data: columnUpdates,
     });
     for (const vc of validatedChanges) {
-      const previousCols = projectChangeRow(vc.spec.changeKind, vc.previousValue, 'previous');
-      const newCols = projectChangeRow(vc.spec.changeKind, vc.validatedValue, 'new');
+      const previousCols = projectChangeValue(vc.spec.changeKind, vc.previousValue, 'previous');
+      const newCols = projectChangeValue(vc.spec.changeKind, vc.validatedValue, 'new');
       await tx.accountChange.create({
         data: {
           accountId,
@@ -357,7 +321,7 @@ async function persistExistingCampaignTarget(
 ): Promise<void> {
   const columnUpdates: Record<string, unknown> = {};
   for (const vc of validatedChanges) {
-    columnUpdates[vc.spec.entityColumn] = castToEntityValue(vc.spec.changeKind, vc.validatedValue);
+    columnUpdates[vc.spec.entityColumn] = castToEntity(vc.spec.changeKind, vc.validatedValue);
   }
   columnUpdates['statusMarkdown'] = synthesizedMarkdown;
   if (synthesizedSensitiveMarkdown !== null) {
@@ -373,8 +337,8 @@ async function persistExistingCampaignTarget(
       data: columnUpdates,
     });
     for (const vc of validatedChanges) {
-      const previousCols = projectChangeRow(vc.spec.changeKind, vc.previousValue, 'previous');
-      const newCols = projectChangeRow(vc.spec.changeKind, vc.validatedValue, 'new');
+      const previousCols = projectChangeValue(vc.spec.changeKind, vc.previousValue, 'previous');
+      const newCols = projectChangeValue(vc.spec.changeKind, vc.validatedValue, 'new');
       await tx.campaignChange.create({
         data: {
           campaignId,
@@ -437,7 +401,7 @@ async function persistNewCampaignTarget(args: {
   } = args;
   const initialFields: Record<string, unknown> = {};
   for (const vc of validatedChanges) {
-    initialFields[vc.spec.entityColumn] = castToEntityValue(
+    initialFields[vc.spec.entityColumn] = castToEntity(
       vc.spec.changeKind,
       vc.validatedValue,
     );

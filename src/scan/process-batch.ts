@@ -1,5 +1,5 @@
-// Part of the backfill engine (see index.ts). Extracted verbatim from the
-// former scripts/backfill.ts monolith — behavior-preserving reorganization.
+// Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
+// by every driver (day-walk backfill today; the Activity forward driver next).
 import { prisma } from '../prisma';
 import { driveClient } from '../drive/client';
 import { extractText } from '../drive/extract';
@@ -21,7 +21,7 @@ import {
   type FieldWriteSpec,
 } from '../drive/schema';
 import { summarizeError } from '../progress';
-import { defaultLlm } from '../ai';
+import { defaultLlm, DEFAULT_GEMINI_MODEL } from '../ai';
 import {
   accountFieldsAsMap,
   assembleSensitiveStatusMarkdown,
@@ -49,22 +49,25 @@ import { timed } from './timing';
 import { runWithConcurrency } from './util';
 import { isForeignCampaignTag, routeCampaignObs, isDrivePermissionError, EMPTY_CAMPAIGN_STATE } from './routing';
 import {
-  runDryRunDistillation,
+  runDistillation,
   persistTarget,
   type ValidatedChange,
 } from './persist';
-import type { EntityCtx } from '../backfill/entity';
+
 import type {
   BatchOutcome,
   CampaignBucket,
   CampaignNameDirectory,
   EntitySynthesisResult,
+  EntityCtx,
 } from './batch-types';
 
-export async function processBatch(
-  batch: TraversedFile[],
-  ctx: EntityCtx,
-  attributor: Attributor | null,
+/** Everything the scan core needs beyond the batch itself. Built by a
+ * DRIVER (day-walk backfill today; the Activity forward driver later). */
+export interface ProcessBatchOptions {
+  ctx: EntityCtx;
+  /** Folder→entity attributor from the structure scan; null for campaign-scoped scans. */
+  attributor: Attributor | null;
   /**
    * Directory for subject-based campaign routing. Null when attributor
    * is null (campaign-scoped scan — no cross-campaign attribution).
@@ -73,39 +76,55 @@ export async function processBatch(
    * lookup tables used to resolve a matched name back to its bucket
    * key (existing campaignId or structure-discovered folderId).
    */
-  nameDirectory: CampaignNameDirectory | null,
+  nameDirectory: CampaignNameDirectory | null;
   /**
    * FolderNode.path by folder id (deterministic breadcrumb), from the
    * structure walk. Null when attributor is null. Used to stamp
    * campaign.drive_folder_path on newly created campaigns.
    */
-  folderPathById: Map<string, string> | null,
+  folderPathById: Map<string, string> | null;
   /**
    * Pieces of the SCANNED campaign (campaign-scoped runs only; null for
    * account scans). Used by regime-1 routing to bucket piece-tagged files
    * (file.pieceId, set at discovery) to their piece.
    */
-  piecesById: Map<string, { name: string; driveFolderId: string }> | null,
+  piecesById: Map<string, { name: string; driveFolderId: string }> | null;
   /**
    * Identity family per existing campaign (campaign name + its pieces'
    * names). Account scans use it to (a) lock campaign-zone files to their
    * family and (b) hand the family to the per-file call as the vocabulary.
    */
-  familyByCampaignId: Map<string, string[]> | null,
-  applyToDb: boolean,
+  familyByCampaignId: Map<string, string[]> | null;
+  applyToDb: boolean;
   /**
    * The "as-of" date for this scan in YYYY-MM-DD form. Used to stamp the
    * synthesized status_markdown's edited_at header. For backfill this is
-   * the day being processed (the file bucket's calendar day); for any
-   * future forward-sync callers it'd be today's date.
+   * the day being processed (the file bucket's calendar day); for the
+   * forward driver it's the real change day.
    */
-  editedAt: string,
+  editedAt: string;
   /**
    * Per-file worker count WITHIN this one batch (= one day). See the
    * scan-parallelism doctrine at the pool below: days never overlap.
    */
-  concurrency: number,
+  concurrency: number;
+}
+
+export async function processBatch(
+  batch: TraversedFile[],
+  opts: ProcessBatchOptions,
 ): Promise<BatchOutcome> {
+  const {
+    ctx,
+    attributor,
+    nameDirectory,
+    folderPathById,
+    piecesById,
+    familyByCampaignId,
+    applyToDb,
+    editedAt,
+    concurrency,
+  } = opts;
   log(`  Extracting + interpreting ${batch.length} file(s)…`);
 
   const accountBucket: Array<{ observation: AccountObservation; sourceFileId: string }> = [];
@@ -1113,7 +1132,7 @@ export async function processBatch(
             ? target.accountState
             : (target.campaignState ?? EMPTY_CAMPAIGN_STATE);
         const dry = await timed('distill', () =>
-          runDryRunDistillation(
+          runDistillation(
             distillEntityType,
             target.observations,
             baseState,
@@ -1254,7 +1273,7 @@ export async function processBatch(
         });
         const res = await timed('synthesis', () =>
           defaultLlm.complete({
-            model: 'gemini-3.5-flash',
+            model: DEFAULT_GEMINI_MODEL,
             temperature: 0.2,
             prompt: renderedPrompt,
             tag: `backfill.${STATUS_SYNTHESIS_V1_VERSION}`,

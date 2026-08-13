@@ -1,5 +1,5 @@
-// Part of the backfill engine (see index.ts). Extracted verbatim from the
-// former scripts/backfill.ts monolith — behavior-preserving reorganization.
+// Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
+// by every driver (day-walk backfill today; the Activity forward driver next).
 import { appendFileSync } from 'node:fs';
 
 // ── Output ───────────────────────────────────────────────────────────────────
