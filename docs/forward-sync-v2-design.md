@@ -104,8 +104,10 @@ this merges. Interval scheduling stays OFF until Phase 2 (the parked
 
 ## Open questions for review (defaults applied unless vetoed)
 
-1. Actor resolution via the directory bot's People API — acceptable
-   credential reuse? (Default: yes; it's read-only profile→email.)
+1. ~~Actor resolution via the directory bot's People API — acceptable
+   credential reuse?~~ **ANSWERED 2026-08-13 (user): yes** — drive-sync
+   holds the directory bot's credential for this one read-only
+   profile→email lookup, cached.
 2. Deletion policy = count + log only — acceptable for Phase 1?
 3. Run the ~1y historical seed at validation? (Default: yes — same
    query, wider window, one-shot.)
