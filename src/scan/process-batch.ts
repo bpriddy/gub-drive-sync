@@ -53,6 +53,7 @@ import {
   persistTarget,
   type ValidatedChange,
 } from './persist';
+import { proposeTarget } from './propose';
 
 import type {
   BatchOutcome,
@@ -95,7 +96,16 @@ export interface ProcessBatchOptions {
    * family and (b) hand the family to the per-file call as the vocabulary.
    */
   familyByCampaignId: Map<string, string[]> | null;
-  applyToDb: boolean;
+  /**
+   * Application policy (docs/forward-sync-v2-design.md, "Application
+   * policy: forward PROPOSES, review APPLIES"):
+   *   'apply'   — bootstrap: auto-apply with system-staff attribution.
+   *   'propose' — forward: account/campaign changes become review
+   *               proposals; pieces/ideas keep their automatic ratchets
+   *               (Q5); synthesis is deferred to applyDecisions (D7).
+   *   'dryrun'  — preview only; nothing written anywhere.
+   */
+  application: 'apply' | 'propose' | 'dryrun';
   /**
    * The "as-of" date for this scan in YYYY-MM-DD form. Used to stamp the
    * synthesized status_markdown's edited_at header. For backfill this is
@@ -121,10 +131,15 @@ export async function processBatch(
     folderPathById,
     piecesById,
     familyByCampaignId,
-    applyToDb,
+    application,
     editedAt,
     concurrency,
   } = opts;
+  // Dossier auto-apply is 'apply' only; infrastructure + automatic-ratchet
+  // writes (restricted worklist, ideas, piece markdown) happen in 'propose'
+  // mode too — review gates DOSSIER/FIELD content, not telemetry (Q5).
+  const applyToDb = application === 'apply';
+  const infraWrites = application !== 'dryrun';
   log(`  Extracting + interpreting ${batch.length} file(s)…`);
 
   const accountBucket: Array<{ observation: AccountObservation; sourceFileId: string }> = [];
@@ -161,7 +176,7 @@ export async function processBatch(
     ? createIdeaScanContext({
         accountExternalId: ctx.accountFolderId,
         accountName: ctx.accountName,
-        apply: applyToDb,
+        apply: infraWrites,
       })
     : null;
 
@@ -267,6 +282,8 @@ export async function processBatch(
   let filesZeroObs = 0;
   let accountLevelFiles = 0;
   let campaignObsDiscarded = 0;
+  /** Stage-3 synthesis/apply/propose failures — see BatchOutcome.stage3Failures. */
+  let stage3Failures = 0;
   /** Obs about a DIFFERENT campaign found inside a campaign zone — misfiled content, dropped. */
   let foreignObsDropped = 0;
   /** Account-zone obs naming an UNKNOWN campaign → converted to account observations (no phantoms). */
@@ -482,7 +499,7 @@ export async function processBatch(
       if (o.skipReason === 'empty' && probedFileIds.has(file.id)) {
         filesRestored++;
         log(`      🔓 previously restricted — now reachable (no extractable text); worklist row resolved`);
-        if (applyToDb) {
+        if (infraWrites) {
           // Guarded like the main body's writes: a transient DB error on
           // one worklist row must not reject applyChain and discard the
           // whole day's extraction+LLM spend.
@@ -502,7 +519,7 @@ export async function processBatch(
     if (o.kind === 'restricted') {
       log(`    ⛔ ${file.name}  RESTRICTED (403 — visible in listings, content not readable)`);
       filesRestricted++;
-      if (applyToDb) {
+      if (infraWrites) {
         try {
           const existing = await prisma.driveRestrictedFile.findUnique({
             where: { accountId_fileId: { accountId: ctx.accountId, fileId: file.id } },
@@ -747,7 +764,7 @@ export async function processBatch(
       if (probedFileIds.has(file.id)) {
         filesRestored++;
         log(`      🔓 previously restricted — now readable; worklist row resolved`);
-        if (applyToDb) {
+        if (infraWrites) {
           await prisma.driveRestrictedFile.updateMany({
             where: { accountId: ctx.accountId, fileId: file.id },
             data: { status: 'resolved', resolvedAt: new Date(), lastProbedAt: new Date() },
@@ -895,7 +912,7 @@ export async function processBatch(
   if (ideaCtx && ideaCtx.stats.deckFiles > 0) {
     const i = ideaCtx.stats;
     log(
-      `    Ideas: ${i.deckFiles} deck file(s) → ${i.ideasCreated} created, ${i.ideasUpdated} updated, ${i.ideasUnchanged} unchanged${i.ideaErrors > 0 ? `, ${i.ideaErrors} error(s)` : ''}${applyToDb ? '' : ' (dryrun — not persisted)'}`,
+      `    Ideas: ${i.deckFiles} deck file(s) → ${i.ideasCreated} created, ${i.ideasUpdated} updated, ${i.ideasUnchanged} unchanged${i.ideaErrors > 0 ? `, ${i.ideaErrors} error(s)` : ''}${infraWrites ? '' : ' (dryrun — not persisted)'}`,
     );
   }
   if (legacyCampaignBucket.length > 0 && !attributor) {
@@ -1117,6 +1134,7 @@ export async function processBatch(
       // review-gated pipeline's writers, not this engine's.
       let distillResult: EntitySynthesisResult['distillResult'] = null;
       let validatedChanges: ValidatedChange[] = [];
+      let distilledNotes: Array<{ text: string; source_file_ids: string[] }> = [];
       if (target.entityType === 'piece') {
         // Pieces are markdown-only: no writable fields → nothing to distill.
         // Observations flow straight into synthesis below.
@@ -1138,6 +1156,7 @@ export async function processBatch(
             baseState,
           ),
         );
+        distilledNotes = dry.notes.map((n) => ({ text: n.text, source_file_ids: n.source_file_ids }));
         distillResult = {
           proposalsCreated: dry.field_changes.length,
           notesWritten: dry.notes.length,
@@ -1191,7 +1210,7 @@ export async function processBatch(
         }
 
         const verb = target.entityStatus === 'new' ? 'would propose' : 'would update';
-        const persistTag = applyToDb ? '' : ' (dryrun — not persisted)';
+        const persistTag = applyToDb ? '' : application === 'propose' ? ' (→ review proposals)' : ' (dryrun — not persisted)';
         wlog(
           `      ${verb}: ${validatedChanges.length} field changes${invalidCount > 0 ? ` (${invalidCount} invalid)` : ''}${noOpCount > 0 ? ` (${noOpCount} no-op)` : ''}, ${dry.notes.length} notes  [${dry.driver}]${persistTag}`,
         );
@@ -1223,6 +1242,44 @@ export async function processBatch(
       }
 
       // ── Synthesize (dual-output: general + sensitive) ───────────────
+      // ── PROPOSE path (forward): review applies, we don't ─────────────
+      // Field changes + notes validated above become review proposals;
+      // synthesis is deferred to GUB applyDecisions on approval (D7).
+      // Piece targets fall through to normal synthesis — their markdown
+      // is an automatic ratchet (Q5), and their rollup reaches the
+      // campaign's review card via the absorb-up observation.
+      if (application === 'propose' && target.entityType !== 'piece') {
+        try {
+          await timed('propose', () =>
+            proposeTarget({
+              ctx,
+              entityType: target.entityType === 'account' ? 'account' : 'campaign',
+              entityStatus:
+                target.entityStatus === 'piece' ? 'existing' : target.entityStatus,
+              entityId: target.entityId,
+              entityName: target.entityName,
+              validatedChanges,
+              notes: distilledNotes,
+            }),
+          );
+        } catch (err) {
+          stage3Failures++;
+          wlog(`      ✗ propose failed: ${summarizeError(err)}`);
+        }
+        for (const line of lineBuffer) log(line);
+        return {
+          entityType: target.entityType,
+          entityName: target.entityName,
+          entityStatus: target.entityStatus,
+          observationsCount: target.observations.length,
+          filesCount: target.fileIds.size,
+          distillResult,
+          synthesizedMarkdown: '(proposed for review — synthesis at applyDecisions)',
+          synthesizedSensitiveMarkdown: null,
+          synthesisMs: 0,
+        };
+      }
+
       const synthStart = Date.now();
       let synthFailed = false;
       let synthesizedMarkdown: string;
@@ -1311,6 +1368,7 @@ export async function processBatch(
         // with "(synthesis failed…)", and since the cursor still advances,
         // the day would never re-run to restore it.
         synthFailed = true;
+        stage3Failures++;
         synthesizedMarkdown = `(synthesis failed: ${summarizeError(err)})`;
       }
       const synthesisMs = Date.now() - synthStart;
@@ -1319,7 +1377,9 @@ export async function processBatch(
       );
 
       // ── Apply (unless --dryrun) ─────────────────────────────────────
-      if (applyToDb) {
+      // Pieces persist whenever writes are on (automatic ratchet, Q5);
+      // account/campaign only in 'apply' mode (propose returned above).
+      if (target.entityType === 'piece' ? infraWrites : applyToDb) {
         if (synthFailed) {
           wlog("      ✗ NOT applied — synthesis failed; keeping the entity's prior status_markdown");
         } else {
@@ -1335,6 +1395,7 @@ export async function processBatch(
             );
             wlog('      ✓ applied (system-staff attribution)');
           } catch (err) {
+            stage3Failures++;
             wlog(`      apply failed: ${summarizeError(err)}`);
           }
         }
@@ -1442,6 +1503,7 @@ export async function processBatch(
     accountLevelFiles,
     campaignObsDiscarded,
     synthesized,
+    stage3Failures,
     ideaStats: ideaCtx?.stats ?? null,
   };
 }

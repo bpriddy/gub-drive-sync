@@ -405,7 +405,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       folderPathById,
       piecesById: piecesById.size > 0 ? piecesById : null,
       familyByCampaignId,
-      applyToDb: !args.dryrun,
+      application: args.dryrun ? 'dryrun' : 'apply',
       editedAt: nextDay.date,
       concurrency: args.concurrency ?? DEFAULT_CONCURRENCY,
     });
@@ -453,6 +453,17 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log('');
     log(`  ✓ Scan done in ${fmtMs(scanMs)}  (${nextDay.date})`);
     log('');
+
+    // Day-commit gate: a synthesis/apply/propose failure means at least
+    // one entity's day is NOT recorded. Throw BEFORE the cursor persists
+    // so the queue retry re-runs this day — the alternative is silent
+    // permanent loss (the day-walk never revisits a committed day).
+    // Dryrun previews report the count but complete normally.
+    if (!args.dryrun && outcome.stage3Failures > 0) {
+      throw new Error(
+        `${outcome.stage3Failures} entity stage-3 failure(s) on ${nextDay.date} — day NOT committed; the queue retry re-runs it`,
+      );
+    }
 
     scansDone = 1;
     finalCursor = nextDay.date;
