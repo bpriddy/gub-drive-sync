@@ -396,6 +396,30 @@ export async function listSharedDriveFiles(
 }
 
 /**
+ * Fetch one file's metadata (FILE_FIELDS) by id. Returns null on 404 /
+ * gone — the forward driver treats vanished files as skips (the
+ * Activity window may reference items deleted moments later). Other
+ * errors propagate (rate limits already retried by the limiter).
+ */
+export async function getFileMetadata(
+  fileId: string,
+): Promise<drive_v3.Schema$File | null> {
+  const client = await driveClient();
+  try {
+    const res = await driveLimiter.run(() =>
+      client.files.get({ fileId, fields: FILE_FIELDS, supportsAllDrives: true }),
+    );
+    return res.data;
+  } catch (err) {
+    const status =
+      (err as { code?: number; response?: { status?: number } }).code ??
+      (err as { response?: { status?: number } }).response?.status;
+    if (status === 404) return null;
+    throw err;
+  }
+}
+
+/**
  * Download file bytes via `files.get(alt=media)`.
  * Use `exportMedia` instead for Google-native docs (Docs/Sheets/Slides).
  */

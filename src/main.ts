@@ -14,8 +14,13 @@
  *   sweep-expired            → sweepExpiredProposals (cron target)
  *   backfill-pending         → processBackfillQueue (drains the
  *                                                    drive_backfill_requests
- *                                                    queue; Cloud Scheduler
- *                                                    target)
+ *                                                    queue — bootstrap rows
+ *                                                    day-walk + auto-apply;
+ *                                                    forward rows drain the
+ *                                                    Activity window and
+ *                                                    PROPOSE for review)
+ *   seed-edit-stats          → seedEditStats (one-shot ~1y historical
+ *     [--account-id X]         drive_edit_stats seed; stats only)
  *   merge-campaign-dupes     → runCampaignMerge  (operator gcloud; one-shot
  *     --account-name X [--confirm]                 detect + merge duplicate
  *     [--min-confidence 0..1]                      campaigns. No --confirm =
@@ -44,6 +49,7 @@ import {
   startFullSync,
 } from './drive/runner';
 import { processBackfillQueue } from './drive/backfill-queue';
+import { seedEditStats } from './forward/seed';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
 import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
@@ -60,7 +66,8 @@ type Mode =
   | 'merge-campaign-dupes'
   | 'clear-account'
   | 'extract-ideas'
-  | 'derive-pieces';
+  | 'derive-pieces'
+  | 'seed-edit-stats';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -74,6 +81,7 @@ const ALL_MODES: readonly Mode[] = [
   'clear-account',
   'extract-ideas',
   'derive-pieces',
+  'seed-edit-stats',
 ];
 
 interface ParsedArgs {
@@ -309,6 +317,13 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
 
     case 'sweep-expired': {
       const result = await sweepExpiredProposals();
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'seed-edit-stats': {
+      const result = await seedEditStats({
+        ...(args.accountId ? { accountId: args.accountId } : {}),
+      });
       return result as unknown as Record<string, unknown>;
     }
 
