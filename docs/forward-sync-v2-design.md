@@ -9,9 +9,10 @@ granted + probe-verified: Activity API live, ~1y retention on Chevy).
 
 A real forward driver: instead of re-walking `modifiedTime` buckets (the
 current "forward" stub), each run asks the Drive Activity API "what
-happened since the cursor", scans exactly those files, stamps
-observations with the **real event days**, and tallies per-editor edit
-events into a new `drive_edit_stats` table from the same stream.
+happened since the cursor", scans exactly those files once as **today's
+scan** (run-date stamped), and tallies per-editor edit events — keyed by
+their TRUE event days — into a new `drive_edit_stats` table from the
+same stream.
 
 The scan core is untouched — the driver builds `ProcessBatchOptions`
 and hands over batches, exactly like the day-walk driver.
@@ -43,16 +44,14 @@ and hands over batches, exactly like the day-walk driver.
    event days.
 5. **Structure**: same path as today — cheap re-gather + fingerprint;
    LLM re-classify only on drift.
-6. **Per day-group**: `processBatch(files, { …, editedAt: <event day> })`
-   with application policy **`propose`** (see below). The day-commit gate
-   applies: stage-3 failure → throw → queue retry re-runs from the last
-   committed cursor.
+6. **The batch**: `processBatch(files, { …, editedAt: <run date> })`
+   with application policy **`propose`** (see below).
 7. **Advance cursor once**, to the window end, only after the batch's
    proposals and stats all landed (window-commit gate — a failure
    leaves the cursor put and the queue retry re-runs the identical
    window).
 8. **Edit stats**: upsert the (file, day, actor) tallies gathered in
-   step 3. Stats commit with their day-group.
+   step 3, keyed by true event days, before the cursor advances.
 
 Dispatch: `backfill-queue.processOne` routes by `req.mode` —
 `'bootstrap'` → `runBackfill` (day-walk), `'forward'` → `runForward`
