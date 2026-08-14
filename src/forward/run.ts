@@ -24,7 +24,7 @@ import { resolveAccountStructure } from '../backfill/structure-stage';
 import { processBatch } from '../scan/process-batch';
 import { log, rule, fmtMs, getLogCapture, setLogCapture } from '../scan/output';
 import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
-import { queryActivityWindow, foldEvents } from './activity';
+import { queryActivityWindow, foldEvents, ymdUtc } from './activity';
 import { resolveActors } from './people';
 import { upsertEditTallies } from './stats';
 
@@ -131,77 +131,91 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
   });
 
   const days = [...folded.filesByDay.keys()].sort();
+  // Run-date stamping (user ruling, 2026-08-14): this is TODAY's scan of
+  // everything since the cursor — ONE batch, one date, regardless of which
+  // calendar days the events fell on. Each changed file is scanned exactly
+  // once with its current content (a file edited on both sides of midnight
+  // is one scan, not two). Event-day precision lives where it belongs:
+  // drive_edit_stats stays keyed by the true event day below.
+  const scanDate = ymdUtc(to.toISOString());
+  const changedIds = new Set<string>();
+  for (const set of folded.filesByDay.values()) for (const id of set) changedIds.add(id);
+  log('');
+  log(
+    rule(
+      `Forward scan ${scanDate}: ${changedIds.size} changed file${changedIds.size === 1 ? '' : 's'} across ${days.length} event day(s)`,
+    ),
+  );
+
+  // Current metadata for the changed files. Vanished files (deleted
+  // after the window) skip; folders never scan.
+  const files: TraversedFile[] = [];
+  for (const id of changedIds) {
+    let meta;
+    try {
+      meta = await timed('file_metadata', () => getFileMetadata(id));
+    } catch (err) {
+      log(`    ⚠ metadata fetch failed for ${id}: ${summarizeError(err)} — skipping`);
+      continue;
+    }
+    if (!meta?.id || !meta.name) {
+      log(`    (file ${id} gone — skipped)`);
+      continue;
+    }
+    if (meta.mimeType === 'application/vnd.google-apps.folder') continue;
+    const parentId = meta.parents?.[0] ?? null;
+    const parentPath = (parentId && structure.folderPathById.get(parentId)) || ctx.name;
+    files.push({
+      id: meta.id,
+      name: meta.name,
+      mimeType: meta.mimeType ?? 'application/octet-stream',
+      parents: meta.parents ?? [],
+      path: `${parentPath} / ${meta.name}`,
+      modifiedTime: meta.modifiedTime ?? null,
+      modifiedByEmail: meta.lastModifyingUser?.emailAddress ?? null,
+      createdTime: meta.createdTime ?? null,
+      size: meta.size ? Number(meta.size) : null,
+      isFolder: false,
+      ...(meta.shortcutDetails?.targetId && meta.shortcutDetails?.targetMimeType
+        ? {
+            shortcutTarget: {
+              id: meta.shortcutDetails.targetId,
+              mimeType: meta.shortcutDetails.targetMimeType,
+            },
+          }
+        : {}),
+    });
+  }
+
   let filesProcessed = 0;
   let scansProcessed = 0;
+  if (files.length > 0) {
+    const outcome = await processBatch(files, {
+      ctx,
+      attributor: structure.attributor,
+      nameDirectory: structure.nameDirectory,
+      folderPathById: structure.folderPathById,
+      piecesById: null,
+      familyByCampaignId: structure.familyByCampaignId,
+      application: 'propose',
+      editedAt: scanDate,
+      concurrency: DEFAULT_CONCURRENCY,
+    });
+    // Window-commit gate: don't advance the cursor unless every entity's
+    // proposals landed — the queue retry re-runs the identical window.
+    if (outcome.stage3Failures > 0) {
+      throw new Error(
+        `${outcome.stage3Failures} stage-3 failure(s) — cursor NOT advanced; retry re-runs this window`,
+      );
+    }
+    filesProcessed = files.length;
+    scansProcessed = 1;
+  }
 
+  // Edit stats keep TRUE event days (batching is a scan label; telemetry
+  // is history). Upserted before the cursor advances so a crash retries
+  // them with the window.
   for (const day of days) {
-    const ids = [...(folded.filesByDay.get(day) ?? [])];
-    log('');
-    log(rule(`Forward scan: ${day}  (${ids.length} changed file${ids.length === 1 ? '' : 's'})`));
-
-    // Current metadata for the changed files. Vanished files (deleted
-    // after the window) skip; folders never scan.
-    const files: TraversedFile[] = [];
-    for (const id of ids) {
-      let meta;
-      try {
-        meta = await timed('file_metadata', () => getFileMetadata(id));
-      } catch (err) {
-        log(`    ⚠ metadata fetch failed for ${id}: ${summarizeError(err)} — skipping`);
-        continue;
-      }
-      if (!meta?.id || !meta.name) {
-        log(`    (file ${id} gone — skipped)`);
-        continue;
-      }
-      if (meta.mimeType === 'application/vnd.google-apps.folder') continue;
-      const parentId = meta.parents?.[0] ?? null;
-      const parentPath = (parentId && structure.folderPathById.get(parentId)) || ctx.name;
-      files.push({
-        id: meta.id,
-        name: meta.name,
-        mimeType: meta.mimeType ?? 'application/octet-stream',
-        parents: meta.parents ?? [],
-        path: `${parentPath} / ${meta.name}`,
-        modifiedTime: meta.modifiedTime ?? null,
-        modifiedByEmail: meta.lastModifyingUser?.emailAddress ?? null,
-        createdTime: meta.createdTime ?? null,
-        size: meta.size ? Number(meta.size) : null,
-        isFolder: false,
-        ...(meta.shortcutDetails?.targetId && meta.shortcutDetails?.targetMimeType
-          ? {
-              shortcutTarget: {
-                id: meta.shortcutDetails.targetId,
-                mimeType: meta.shortcutDetails.targetMimeType,
-              },
-            }
-          : {}),
-      });
-    }
-
-    if (files.length > 0) {
-      const outcome = await processBatch(files, {
-        ctx,
-        attributor: structure.attributor,
-        nameDirectory: structure.nameDirectory,
-        folderPathById: structure.folderPathById,
-        piecesById: null,
-        familyByCampaignId: structure.familyByCampaignId,
-        application: 'propose',
-        editedAt: day,
-        concurrency: DEFAULT_CONCURRENCY,
-      });
-      // Day-commit gate: don't advance past a day whose proposals didn't
-      // all land — the queue retry re-runs from the previous cursor.
-      if (outcome.stage3Failures > 0) {
-        throw new Error(
-          `${outcome.stage3Failures} stage-3 failure(s) on ${day} — cursor NOT advanced; retry re-runs this window`,
-        );
-      }
-      filesProcessed += files.length;
-      scansProcessed++;
-    }
-
     const statRows = await upsertEditTallies({
       accountId: fargs.accountId,
       day,
@@ -209,10 +223,9 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
       actorEmailBy,
     });
     if (statRows > 0) log(`  ✎ edit stats: ${statRows} (file × actor) row(s) for ${day}`);
-
-    const isLastDay = day === days[days.length - 1];
-    await advanceCursor(isLastDay ? to : new Date(`${day}T23:59:59.999Z`));
   }
+
+  await advanceCursor(to);
 
   // Reviewer fan-out for whatever this window proposed (existing notify
   // machinery; grouped per reviewer; console mail driver in dev).
@@ -235,7 +248,7 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
   return result({
     scansProcessed,
     filesProcessed,
-    finalCursorYmd: days[days.length - 1] ?? null,
+    finalCursorYmd: scanDate,
     activeDaysFirst: days[0] ?? null,
     activeDaysLast: days[days.length - 1] ?? null,
     activeDaysCount: days.length,

@@ -1,7 +1,6 @@
 // Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
 // by every driver (day-walk backfill today; the Activity forward driver next).
 import { prisma } from '../prisma';
-import { driveClient } from '../drive/client';
 import { extractText } from '../drive/extract';
 import { interpretAssetFolder } from '../drive/asset-folder';
 import {
@@ -188,89 +187,22 @@ export async function processBatch(
       ? [ctx.name, ...(piecesById ? Array.from(piecesById.values()).map((p) => p.name) : [])]
       : [ctx.name];
 
-  // ── Restricted-file re-probe ─────────────────────────────────────────────
-  // A sharing fix does NOT bump modifiedTime, so delta gating would never
-  // retry a restricted file on its own. Append every still-'restricted'
-  // worklist row for this entity to the batch (skipping ids already
-  // present) — the normal worker probes it: still 403 → lastProbedAt
-  // advances; readable → the content flows through the full pipeline and
-  // the row resolves. 'ignored' rows (human action in gub-admin) are never
-  // probed. Cost: one Drive call per still-restricted file per scan.
-  const probeCandidates = await prisma.driveRestrictedFile.findMany({
-    where: {
-      accountId: ctx.accountId,
-      status: 'restricted',
-      ...(ctx.type === 'campaign' ? { campaignId: ctx.id } : {}),
-    },
-  });
-  const probedFileIds = new Set<string>();
-  if (probeCandidates.length > 0) {
-    log(`  Re-probing ${probeCandidates.length} restricted file(s)…`);
-    const inBatch = new Set(batch.map((b) => b.id));
-    const drive = await driveClient();
-    for (const r of probeCandidates) {
-      probedFileIds.add(r.fileId);
-      if (inBatch.has(r.fileId)) continue;
-      // Fresh metadata fetch: shortcuts need shortcutDetails (targetId +
-      // targetMimeType) for extractText to follow them — the worklist row
-      // doesn't carry that, and it can change (someone may replace the
-      // shortcut's target). Metadata access can itself 403 on some
-      // restricted shapes — treat that as "still restricted".
-      let meta: {
-        name?: string | null;
-        mimeType?: string | null;
-        parents?: string[] | null;
-        size?: string | null;
-        shortcutDetails?: { targetId?: string | null; targetMimeType?: string | null } | null;
-      };
-      try {
-        const res = await drive.files.get({
-          fileId: r.fileId,
-          fields: 'id,name,mimeType,parents,size,shortcutDetails(targetId,targetMimeType)',
-          supportsAllDrives: true,
-        });
-        meta = res.data;
-      } catch (err) {
-        if (isDrivePermissionError(err)) {
-          batch.push({
-            id: r.fileId,
-            name: r.name,
-            mimeType: r.mimeType ?? 'application/octet-stream',
-            parents: r.parentFolderId ? [r.parentFolderId] : [],
-            path: r.path ?? r.name,
-            modifiedTime: null,
-            modifiedByEmail: null,
-            createdTime: null,
-            size: null,
-            isFolder: false,
-          });
-          continue;
-        }
-        log(`  ⚠ re-probe metadata fetch failed for "${r.name}": ${summarizeError(err)}`);
-        continue;
-      }
-      batch.push({
-        id: r.fileId,
-        name: meta.name ?? r.name,
-        mimeType: meta.mimeType ?? r.mimeType ?? 'application/octet-stream',
-        parents: meta.parents ?? (r.parentFolderId ? [r.parentFolderId] : []),
-        path: r.path ?? r.name,
-        modifiedTime: null,
-        modifiedByEmail: null,
-        createdTime: null,
-        size: meta.size ? Number(meta.size) : null,
-        isFolder: false,
-        ...(meta.shortcutDetails?.targetId && meta.shortcutDetails?.targetMimeType
-          ? {
-              shortcutTarget: {
-                id: meta.shortcutDetails.targetId,
-                mimeType: meta.shortcutDetails.targetMimeType,
-              },
-            }
-          : {}),
-      });
-    }
-  }
+  // ── Restricted worklist (no probing — practice over polling) ─────────────
+  // Policy (user ruling, 2026-08-14): we do NOT re-probe files we lack
+  // permission to read. The organizational practice is to affirmatively
+  // share with the bot (bot.clientdrives@); the worklist + first-sighting
+  // observation exist to FEED that practice — the admin page is the
+  // "please share this" to-do list. A rescued file re-enters scans via its
+  // next normal change event, and a successful extraction below
+  // auto-resolves its row. 'ignored' rows are permanent exemptions.
+  const restrictedRowIds = new Set(
+    (
+      await prisma.driveRestrictedFile.findMany({
+        where: { accountId: ctx.accountId, status: 'restricted' },
+        select: { fileId: true },
+      })
+    ).map((r) => r.fileId),
+  );
 
   let filesExtracted = 0;
   let filesSkipped = 0;
@@ -496,7 +428,7 @@ export async function processBatch(
       // Metadata-only skips (unsupported_mime, shortcut_unverified_size,
       // oversized) prove nothing about content access: leave the row
       // restricted — probing is cheap and the operator can Ignore it.
-      if (o.skipReason === 'empty' && probedFileIds.has(file.id)) {
+      if (o.skipReason === 'empty' && restrictedRowIds.has(file.id)) {
         filesRestored++;
         log(`      🔓 previously restricted — now reachable (no extractable text); worklist row resolved`);
         if (infraWrites) {
@@ -761,7 +693,7 @@ export async function processBatch(
       // A probed file that fully extracted is restored — resolve its
       // worklist row; its observations just flowed through the normal
       // pipeline above.
-      if (probedFileIds.has(file.id)) {
+      if (restrictedRowIds.has(file.id)) {
         filesRestored++;
         log(`      🔓 previously restricted — now readable; worklist row resolved`);
         if (infraWrites) {

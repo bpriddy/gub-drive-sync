@@ -31,19 +31,26 @@ and hands over batches, exactly like the day-walk driver.
      columns get dropped in Phase 2.
 3. **Fold events** into: changed `fileId` set, per-file **event days**,
    per-(file, day, actor) edit counts, deletion/trash events.
-4. **Batch by event day**, oldest first — a catch-up window spanning
-   several days becomes several serial one-day batches, preserving the
-   supersede chronology and the engine's one-day invariant. Fetch
-   current metadata for the changed files (they enter the batch like
-   any discovery result; content is current-state, per doctrine).
+4. **One batch per run, stamped with the RUN date** (revised
+   2026-08-14, user ruling): "I'm scanning today; everything since the
+   cursor is today's scan." Event-day batching was tried first and
+   rejected — it split windows at UTC midnight, double-scanned files
+   edited on both sides of the boundary (identical current content,
+   duplicate proposals), and bought no real fidelity in propose mode
+   (synthesis runs at applyDecisions, not at scan time). Each changed
+   file is scanned exactly once with current metadata; event-day
+   precision lives in drive_edit_stats, which stays keyed by true
+   event days.
 5. **Structure**: same path as today — cheap re-gather + fingerprint;
    LLM re-classify only on drift.
 6. **Per day-group**: `processBatch(files, { …, editedAt: <event day> })`
    with application policy **`propose`** (see below). The day-commit gate
    applies: stage-3 failure → throw → queue retry re-runs from the last
    committed cursor.
-7. **Advance cursor** after each committed day-group (crash-safe);
-   final group advances it to the window end.
+7. **Advance cursor once**, to the window end, only after the batch's
+   proposals and stats all landed (window-commit gate — a failure
+   leaves the cursor put and the queue retry re-runs the identical
+   window).
 8. **Edit stats**: upsert the (file, day, actor) tallies gathered in
    step 3. Stats commit with their day-group.
 
@@ -74,6 +81,14 @@ across years of history), per the human-reviews-AI contract.
 - Forward runs end with the existing `notify` fan-out to
   `EntityCtx.reviewerEmail` (the wiring the engine has carried all
   along). `sweep-expired` keeps its job.
+- **Restricted files: no re-probing** (user ruling, 2026-08-14 —
+  "practice over polling"). Scans never re-check files the bot can't
+  read; the worklist + first-sighting dossier observation exist to
+  drive the affirmative-sharing practice (share with the bot when it
+  matters). A rescued file re-enters via its next normal change event,
+  and a successful extraction auto-resolves its worklist row. Accepted
+  edge: shared-but-never-edited-again files stay unscanned until a
+  manual sync.
 - Edit stats are telemetry, not dossier content — they bypass review
   and upsert directly.
 - **Open sub-question (Q5)**: do pieces/ideas gate on review in forward
