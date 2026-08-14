@@ -258,62 +258,69 @@ model StaffExternalId {
 // ── Accounts ───────────────────────────────────────────────────────────────
 
 model Account {
-  id                  String    @id @default(uuid()) @db.Uuid
-  name                String
-  parentId            String?   @map("parent_id") @db.Uuid
-  ownerStaffId        String?   @map("owner_staff_id") @db.Uuid
+  id                           String    @id @default(uuid()) @db.Uuid
+  name                         String
+  parentId                     String?   @map("parent_id") @db.Uuid
+  ownerStaffId                 String?   @map("owner_staff_id") @db.Uuid
   // Business fields ("write both": state on row, history in account_changes).
   // Drive sync proposals target these; allowlist lives in drive.schema.ts.
-  status              String?
-  accountExecStaffId  String?   @map("account_exec_staff_id") @db.Uuid
-  industry            String?
-  primaryContactName  String?   @map("primary_contact_name")
-  primaryContactEmail String?   @map("primary_contact_email")
-  notes               String?
+  status                       String?
+  accountExecStaffId           String?   @map("account_exec_staff_id") @db.Uuid
+  industry                     String?
+  primaryContactName           String?   @map("primary_contact_name")
+  primaryContactEmail          String?   @map("primary_contact_email")
+  notes                        String?
   // Synthesized by the Drive sync review-approval flow. See
   // docs/status-markdown-plan.md. NOT a writable field (not in
   // drive.schema.ts's allowlist) — written via post-approval synthesis,
   // not via the per-file LLM's field_change proposals.
-  statusMarkdown      String?   @map("status_markdown") @db.Text
+  statusMarkdown               String?   @map("status_markdown") @db.Text
   // Sensitive companion. See docs/status-markdown-plan.md D29.
-  statusSensitiveMarkdown String? @map("status_sensitive_markdown") @db.Text
+  statusSensitiveMarkdown      String?   @map("status_sensitive_markdown") @db.Text
   // Drive anchoring
-  driveFolderId       String?   @map("drive_folder_id")
-  driveFolderUrl      String?   @map("drive_folder_url")
-  driveFolderPath     String?   @map("drive_folder_path")
+  driveFolderId                String?   @map("drive_folder_id")
+  driveFolderUrl               String?   @map("drive_folder_url")
+  driveFolderPath              String?   @map("drive_folder_path")
   /// Wall-clock of the latest drive-sync run touching this account.
-  driveLastRunAt      DateTime? @map("drive_last_run_at") @db.Timestamptz
+  driveLastRunAt               DateTime? @map("drive_last_run_at") @db.Timestamptz
   /// Bootstrap walks modifiedTime calendar days ASC. DATE column holds the
   /// LATEST completed day. NULL = bootstrap hasn't started.
-  driveBootstrapCursor DateTime? @map("drive_bootstrap_cursor") @db.Date
+  driveBootstrapCursor         DateTime? @map("drive_bootstrap_cursor") @db.Date
   /// Set ONCE when bootstrap catches the cursor up to today.
-  driveBootstrapCompletedAt DateTime? @map("drive_bootstrap_completed_at") @db.Timestamptz
+  driveBootstrapCompletedAt    DateTime? @map("drive_bootstrap_completed_at") @db.Timestamptz
   /// Cached structure (folders + entity_map + fingerprint). Survives
   /// bootstrap completion; forward sync re-uses with hash invalidation.
-  driveStructureClassification Json? @map("drive_structure_classification")
+  driveStructureClassification Json?     @map("drive_structure_classification")
   /// Cached file list + active_dates (bootstrap-only; NULL on completion).
-  driveBootstrapFiles Json? @map("drive_bootstrap_files")
+  driveBootstrapFiles          Json?     @map("drive_bootstrap_files")
   /// Latest completed forward sync wall-clock. NULL until first forward
   /// chunk completes after bootstrap.
-  driveLastSyncedAt   DateTime? @map("drive_last_synced_at") @db.Timestamptz
+  driveLastSyncedAt            DateTime? @map("drive_last_synced_at") @db.Timestamptz
   /// Activity API pageToken at the start of the next forward run. NULL
   /// before the first forward chunk — engine calls getStartPageToken()
   /// to establish baseline.
-  driveActivityPageToken String? @map("drive_activity_page_token")
-  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  driveActivityPageToken       String?   @map("drive_activity_page_token")
+  /// Forward-sync v2 cursor: exclusive lower bound of the next Activity
+  /// window. NULL until the first forward run (initialized from
+  /// drive_bootstrap_completed_at). The Activity API has NO change token
+  /// — this timestamp IS the cursor; drive_activity_page_token drops in
+  /// v2 Phase 2. See docs/forward-sync-v2-design.md.
+  driveForwardCursorAt         DateTime? @map("drive_forward_cursor_at") @db.Timestamptz
+  createdAt                    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt                    DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
-  parent             Account?               @relation("AccountHierarchy", fields: [parentId], references: [id])
-  children           Account[]              @relation("AccountHierarchy")
-  owner              Staff?                 @relation("AccountOwnerStaff", fields: [ownerStaffId], references: [id], onDelete: SetNull)
-  accountExec        Staff?                 @relation("AccountExecStaff", fields: [accountExecStaffId], references: [id], onDelete: SetNull)
-  changes            AccountChange[]
-  campaigns          Campaign[]
-  driveFileSnapshots DriveFileSnapshot[]
-  driveScanLogs      DriveScanLog[]
-  driveProposals     DriveChangeProposal[]
-  driveSyncRuns       DriveSyncRun[]
+  parent               Account?              @relation("AccountHierarchy", fields: [parentId], references: [id])
+  children             Account[]             @relation("AccountHierarchy")
+  owner                Staff?                @relation("AccountOwnerStaff", fields: [ownerStaffId], references: [id], onDelete: SetNull)
+  accountExec          Staff?                @relation("AccountExecStaff", fields: [accountExecStaffId], references: [id], onDelete: SetNull)
+  changes              AccountChange[]
+  campaigns            Campaign[]
+  driveFileSnapshots   DriveFileSnapshot[]
+  driveScanLogs        DriveScanLog[]
+  driveProposals       DriveChangeProposal[]
+  driveSyncRuns        DriveSyncRun[]
   driveRestrictedFiles DriveRestrictedFile[]
+  driveEditStats       DriveEditStat[]
 
   @@index([ownerStaffId])
   @@index([accountExecStaffId])
@@ -325,33 +332,33 @@ model Account {
 /// Queue of drive-sync runs in either mode (bootstrap or forward).
 /// See gub-drive-sync/docs/drive-sync-v2-design.md for the architecture.
 model DriveSyncRun {
-  id            String    @id @default(uuid()) @db.Uuid
-  accountId     String    @map("account_id") @db.Uuid
+  id                   String    @id @default(uuid()) @db.Uuid
+  accountId            String    @map("account_id") @db.Uuid
   /// 'bootstrap' | 'forward'
-  mode          String    @default("bootstrap")
-  requestedBy   String    @map("requested_by") @db.Uuid
-  requestedAt   DateTime  @default(now()) @map("requested_at") @db.Timestamptz
-  startedAt     DateTime? @map("started_at") @db.Timestamptz
-  completedAt   DateTime? @map("completed_at") @db.Timestamptz
-  status        String    @default("pending")
-  errorMessage  String?   @map("error_message")
-  logSummary    String?   @map("log_summary")
-  attempts      Int       @default(0)
-  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz
+  mode                 String    @default("bootstrap")
+  requestedBy          String    @map("requested_by") @db.Uuid
+  requestedAt          DateTime  @default(now()) @map("requested_at") @db.Timestamptz
+  startedAt            DateTime? @map("started_at") @db.Timestamptz
+  completedAt          DateTime? @map("completed_at") @db.Timestamptz
+  status               String    @default("pending")
+  errorMessage         String?   @map("error_message")
+  logSummary           String?   @map("log_summary")
+  attempts             Int       @default(0)
+  nextAttemptAt        DateTime? @map("next_attempt_at") @db.Timestamptz
   /// True → after this chunk completes, queue another row in the same mode
   /// if more work remains. Chain of chunks via scheduleContinuation.
-  allRemaining  Boolean   @default(false) @map("all_remaining")
+  allRemaining         Boolean   @default(false) @map("all_remaining")
   /// Files extracted in this chunk (post pre-filter).
-  filesProcessed Int      @default(0) @map("files_processed")
+  filesProcessed       Int       @default(0) @map("files_processed")
   /// Liveness pulse. Stale (>15 min) → reclaimed on next Job startup.
-  lastHeartbeatAt DateTime? @map("last_heartbeat_at") @db.Timestamptz
+  lastHeartbeatAt      DateTime? @map("last_heartbeat_at") @db.Timestamptz
   /// Forward only: Activity API pageToken handed to this chunk.
-  activityPageTokenIn  String? @map("activity_page_token_in")
+  activityPageTokenIn  String?   @map("activity_page_token_in")
   /// Forward only: Activity API pageToken at chunk end.
-  activityPageTokenOut String? @map("activity_page_token_out")
+  activityPageTokenOut String?   @map("activity_page_token_out")
 
-  account     Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  requestedByStaff Staff @relation("DriveSyncRunRequestedBy", fields: [requestedBy], references: [id])
+  account          Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  requestedByStaff Staff   @relation("DriveSyncRunRequestedBy", fields: [requestedBy], references: [id])
 
   @@index([status, nextAttemptAt, requestedAt], map: "drive_sync_runs_pickup_idx")
   @@index([accountId, requestedAt(sort: Desc)], map: "drive_sync_runs_history_idx")
@@ -386,40 +393,40 @@ model AccountChange {
 // ── Campaigns ──────────────────────────────────────────────────────────────
 
 model Campaign {
-  id                 String    @id @default(uuid()) @db.Uuid
-  accountId          String    @map("account_id") @db.Uuid
-  name               String
-  status             String    @default("pitch")
-  budget             Decimal?  @db.Decimal(15, 2)
-  assetsUrl          String?   @map("assets_url")
-  awardedAt          DateTime? @map("awarded_at") @db.Date
-  liveAt             DateTime? @map("live_at") @db.Date
-  endsAt             DateTime? @map("ends_at") @db.Date
+  id                      String    @id @default(uuid()) @db.Uuid
+  accountId               String    @map("account_id") @db.Uuid
+  name                    String
+  status                  String    @default("pitch")
+  budget                  Decimal?  @db.Decimal(15, 2)
+  assetsUrl               String?   @map("assets_url")
+  awardedAt               DateTime? @map("awarded_at") @db.Date
+  liveAt                  DateTime? @map("live_at") @db.Date
+  endsAt                  DateTime? @map("ends_at") @db.Date
   // Synthesized by the Drive sync review-approval flow. See
   // docs/status-markdown-plan.md. NOT a writable field (not in
   // drive.schema.ts's allowlist) — written via post-approval synthesis,
   // not via the per-file LLM's field_change proposals.
-  statusMarkdown     String?   @map("status_markdown") @db.Text
+  statusMarkdown          String?   @map("status_markdown") @db.Text
   // Sensitive companion. See docs/status-markdown-plan.md D29.
-  statusSensitiveMarkdown String? @map("status_sensitive_markdown") @db.Text
-  driveFolderId      String?   @map("drive_folder_id")
-  driveFolderUrl     String?   @map("drive_folder_url")
-  driveFolderPath    String?   @map("drive_folder_path")
+  statusSensitiveMarkdown String?   @map("status_sensitive_markdown") @db.Text
+  driveFolderId           String?   @map("drive_folder_id")
+  driveFolderUrl          String?   @map("drive_folder_url")
+  driveFolderPath         String?   @map("drive_folder_path")
   /// Bumped when this campaign's status_markdown is updated by a drive
   /// sync run (bootstrap or forward — same campaign-level synthesis).
-  driveLastRunAt     DateTime? @map("drive_last_run_at") @db.Timestamptz
-  createdBy          String    @map("created_by") @db.Uuid
-  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  driveLastRunAt          DateTime? @map("drive_last_run_at") @db.Timestamptz
+  createdBy               String    @map("created_by") @db.Uuid
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
-  account            Account               @relation(fields: [accountId], references: [id])
-  createdByStaff     Staff                 @relation("CampaignCreatedByStaff", fields: [createdBy], references: [id])
-  changes            CampaignChange[]
-  driveFileSnapshots DriveFileSnapshot[]
-  driveScanLogs      DriveScanLog[]
-  driveProposals     DriveChangeProposal[]
+  account              Account               @relation(fields: [accountId], references: [id])
+  createdByStaff       Staff                 @relation("CampaignCreatedByStaff", fields: [createdBy], references: [id])
+  changes              CampaignChange[]
+  driveFileSnapshots   DriveFileSnapshot[]
+  driveScanLogs        DriveScanLog[]
+  driveProposals       DriveChangeProposal[]
   driveRestrictedFiles DriveRestrictedFile[]
-  pieces             CampaignPiece[]
+  pieces               CampaignPiece[]
 
   @@index([accountId])
   @@index([status])
@@ -798,6 +805,39 @@ model SyncRun {
 //      poll catches it, clears pageToken, sets lastOutcome='bootstrap_required',
 //      returns 503. Same recovery path as initial bootstrap.
 
+/// MIRRORED from gcp-universal-backend prisma/schema.prisma (canonical).
+/// Per-editor Drive edit-event tallies from the Activity API stream
+/// (forward-sync v2). One row per file × day × actor. Telemetry —
+/// bypasses review; campaign attribution resolves at query time.
+/// actor_email = resolved email, or the raw people/<id> resource when
+/// resolution failed (unresolved actors are kept, never dropped).
+model DriveEditStat {
+  accountId  String   @map("account_id") @db.Uuid
+  fileId     String   @map("file_id")
+  day        DateTime @db.Date
+  actorEmail String   @map("actor_email")
+  editCount  Int      @default(0) @map("edit_count")
+  capturedAt DateTime @default(now()) @map("captured_at") @db.Timestamptz
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@id([fileId, day, actorEmail])
+  @@index([accountId, day])
+  @@map("drive_edit_stats")
+}
+
+/// MIRRORED from gcp-universal-backend prisma/schema.prisma (canonical).
+/// people/<id> → email cache for Activity actor resolution (People API
+/// via the directory bot's credential). Successes only; misses retry.
+model PeopleResourceMap {
+  personResource String   @id @map("person_resource")
+  email          String?
+  displayName    String?  @map("display_name")
+  resolvedAt     DateTime @default(now()) @map("resolved_at") @db.Timestamptz
+
+  @@map("people_resource_map")
+}
+
 /// Restricted-file worklist: files visible in listings but 403 on content
 /// export (shortcuts to unshared personal-drive docs, download-restricted
 /// files). Re-probed each scan until resolved or human-ignored in gub-admin.
@@ -1111,6 +1151,7 @@ model StaffResearchDossier {
   @@index([staffId])
   @@map("staff_research_dossiers")
 }
+
 // ── Campaign pieces ─────────────────────────────────────────────────────────
 // Execution deliverables of a campaign — a commercial, a website, a social
 // run, an interactive experience. A level below Campaign so a multi-deliverable
@@ -1118,23 +1159,23 @@ model StaffResearchDossier {
 // duplicate campaign rows. Folder-derived; carries its own status_markdown
 // "to start". campaign_id CASCADE — a clear-account / campaign nuke removes it.
 model CampaignPiece {
-  id              String    @id @default(uuid()) @db.Uuid
-  campaignId      String    @map("campaign_id") @db.Uuid
-  name            String
-  statusMarkdown  String?   @map("status_markdown") @db.Text
+  id                      String    @id @default(uuid()) @db.Uuid
+  campaignId              String    @map("campaign_id") @db.Uuid
+  name                    String
+  statusMarkdown          String?   @map("status_markdown") @db.Text
   /// Sensitive companion (D28/D29, same design as Campaign). Pieces are
   /// synthesis targets; the quad-output prompt always emits a sensitive tier.
-  statusSensitiveMarkdown String? @map("status_sensitive_markdown") @db.Text
-  driveFolderId   String?   @map("drive_folder_id") @unique
+  statusSensitiveMarkdown String?   @map("status_sensitive_markdown") @db.Text
+  driveFolderId           String?   @unique @map("drive_folder_id")
   /// HARD piece identity: agency job number (bracket code on project folders,
   /// e.g. GMCHV550002340). Outranks name matching — same number = same piece,
   /// always. NULL for content-born pieces with no surfaced number (name-keyed).
-  jobNumber       String?   @map("job_number") @unique
-  driveFolderUrl  String?   @map("drive_folder_url")
-  driveFolderPath String?   @map("drive_folder_path")
-  driveLastRunAt  DateTime? @map("drive_last_run_at") @db.Timestamptz
-  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  jobNumber               String?   @unique @map("job_number")
+  driveFolderUrl          String?   @map("drive_folder_url")
+  driveFolderPath         String?   @map("drive_folder_path")
+  driveLastRunAt          DateTime? @map("drive_last_run_at") @db.Timestamptz
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
   campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
 
