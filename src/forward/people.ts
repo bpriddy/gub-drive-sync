@@ -59,7 +59,10 @@ export async function resolveActors(
       const res = await people.people.get({
         resourceName: resource,
         personFields: 'emailAddresses,names',
-        sources: ['READ_SOURCE_TYPE_DOMAIN_PROFILE', 'READ_SOURCE_TYPE_PROFILE'],
+        // READ_SOURCE_TYPE_PROFILE covers ACCOUNT + DOMAIN_PROFILE + PROFILE
+        // response sources; DOMAIN_PROFILE is not itself a valid *read*
+        // source enum (validated live 2026-08-14 — it 400s every call).
+        sources: ['READ_SOURCE_TYPE_PROFILE', 'READ_SOURCE_TYPE_DOMAIN_CONTACT'],
       });
       const email =
         res.data.emailAddresses?.find((e) => e.metadata?.primary)?.value ??
