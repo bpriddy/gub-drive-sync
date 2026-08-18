@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isTransientTransportError, withTransientRetry } from './client';
+import { isTransientTransportError, withTransientRetry } from './retry';
 
 describe('isTransientTransportError', () => {
   it('accepts 5xx from Google, however the status is shaped', () => {

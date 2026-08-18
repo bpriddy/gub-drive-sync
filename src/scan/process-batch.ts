@@ -52,12 +52,8 @@ import {
   persistTarget,
   type ValidatedChange,
 } from './persist';
-import {
-  hasNewCandidateMarker,
-  loadPendingNoteTexts,
-  proposeTarget,
-  stripNewCandidateMarker,
-} from './propose';
+import { loadPendingNoteTexts, proposeTarget } from './propose';
+import { hasNewCandidateMarker, stripNewCandidateMarker } from './note-marker';
 
 import type {
   BatchOutcome,

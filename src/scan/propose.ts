@@ -27,6 +27,7 @@ import { config } from '../config';
 import { log } from './output';
 import type { ValidatedChange } from './persist';
 import type { EntityCtx } from './batch-types';
+import { newCandidateMarker } from './note-marker';
 
 export interface ProposeNoteItem {
   text: string;
@@ -50,39 +51,6 @@ export interface ProposeTargetResult {
   noteItems: number;
   /** field_change rows skipped because an identical pending proposal exists. */
   duplicatesSkipped: number;
-}
-
-// ── The new-candidate marker ─────────────────────────────────────────────────
-//
-// New candidates have no DB row, so their items ride the ACCOUNT card,
-// labelled with this marker. That makes one card key hold several distinct
-// pending rows at once — the account's own notes, plus one row per candidate
-// — and the marker is the only thing separating them.
-//
-// It is therefore load-bearing in BOTH directions, and must be defined once:
-// proposeTarget writes it, and the scan's already-on-record collection reads
-// it to partition the card (an account target must not be told a candidate's
-// facts, and a candidate must not be told a sibling's). Two separate
-// definitions would drift and the partition would fail silently — no error,
-// just suppression quietly matching nothing.
-
-export function newCandidateMarker(entityName: string): string {
-  return `[new campaign candidate "${entityName}"]`;
-}
-
-/** True when a note item text carries ANY candidate marker. */
-export function hasNewCandidateMarker(text: string): boolean {
-  return /^\[new campaign candidate "/.test(text);
-}
-
-/**
- * Strip `entityName`'s marker off a note text, or null when the text isn't
- * marked for that candidate. Exact matching on a prefix WE wrote in a format
- * we control — not a similarity test on model prose.
- */
-export function stripNewCandidateMarker(text: string, entityName: string): string | null {
-  const prefix = `${newCandidateMarker(entityName)} `;
-  return text.startsWith(prefix) ? text.slice(prefix.length) : null;
 }
 
 function toJson(value: unknown): Prisma.InputJsonValue | typeof Prisma.JsonNull {

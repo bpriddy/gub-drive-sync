@@ -3,7 +3,7 @@ import {
   hasNewCandidateMarker,
   newCandidateMarker,
   stripNewCandidateMarker,
-} from './propose';
+} from './note-marker';
 
 // The marker is what partitions the shared account card: the account's own
 // notes plus one pending row per new candidate all live under one key, and
