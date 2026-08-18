@@ -52,7 +52,7 @@ import {
   persistTarget,
   type ValidatedChange,
 } from './persist';
-import { proposeTarget } from './propose';
+import { loadPendingNoteTexts, proposeTarget } from './propose';
 
 import type {
   BatchOutcome,
@@ -1040,6 +1040,49 @@ export async function processBatch(
     // can't be preempted by another worker — each entity's block is
     // atomic in the output, even though entity order may not match
     // input order.
+
+    // Facts already captured for a target: stored status bullets (both
+    // tiers, Context + surviving Transient) plus note items already
+    // awaiting review. Fed to distillation on the propose path so a
+    // re-observed fact never reaches the reviewer a second time.
+    //
+    // Expired transient bullets are pruned first, same as synthesis does
+    // (D23) — a bullet whose time has passed no longer states a current
+    // fact, so re-observing it IS news.
+    const collectKnownFacts = async (
+      target: Target,
+      distillEntityType: 'account' | 'campaign',
+    ): Promise<string[]> => {
+      const bulletsFrom = (stored: string | null): string[] => {
+        if (!stored) return [];
+        const sections = [
+          extractContextSection(stored),
+          pruneExpiredTransientBullets(extractTransientSection(stored), editedAt),
+        ];
+        return sections
+          .filter((body): body is string => !!body)
+          .flatMap((body) => body.split('\n'))
+          .map((line) => line.trim().replace(/^-\s*/, '').trim())
+          .filter((line) => line.length > 0);
+      };
+
+      // Same (accountId, campaignId) resolution proposeTarget uses to
+      // write the row — the lookup has to match where the notes land.
+      const pending = await loadPendingNoteTexts({
+        entityType: distillEntityType,
+        accountId: distillEntityType === 'account' ? target.entityId : ctx.accountId,
+        campaignId: distillEntityType === 'campaign' ? target.entityId : null,
+      });
+
+      return Array.from(
+        new Set([
+          ...bulletsFrom(target.priorStatusMarkdown),
+          ...bulletsFrom(target.priorSensitiveMarkdown),
+          ...pending,
+        ]),
+      );
+    };
+
     const synthesizeTarget = async (target: Target): Promise<EntitySynthesisResult> => {
       const lineBuffer: string[] = [];
       const wlog = (line = ''): void => {
@@ -1081,11 +1124,34 @@ export async function processBatch(
           target.entityType === 'account'
             ? target.accountState
             : (target.campaignState ?? EMPTY_CAMPAIGN_STATE);
+        // ── Already-on-record set (propose path only) ─────────────────
+        // Review sits between distillation and synthesis on the propose
+        // path, so the synthesis merge — which is what normally drops a
+        // re-observed fact (status-synthesis "Merge operations (D25)"
+        // rule A) — no longer runs before a human is asked. Hand the
+        // recorded facts to distillation instead, so a restatement never
+        // becomes a card. Two sources: the entity's stored bullets, and
+        // note items already awaiting a decision.
+        //
+        // Deliberately empty on the apply/dryrun paths: synthesis runs in
+        // the same pass there and already handles this, and backfill
+        // output stays byte-faithful for the dryrun tool.
+        const knownFacts =
+          application === 'propose' && target.entityId
+            ? await timed('known-facts', () =>
+                collectKnownFacts(target, distillEntityType),
+              )
+            : [];
+        if (knownFacts.length > 0) {
+          wlog(`      already on record: ${knownFacts.length} fact(s) — restatements suppressed`);
+        }
+
         const dry = await timed('distill', () =>
           runDistillation(
             distillEntityType,
             target.observations,
             baseState,
+            knownFacts,
           ),
         );
         distilledNotes = dry.notes.map((n) => ({ text: n.text, source_file_ids: n.source_file_ids }));

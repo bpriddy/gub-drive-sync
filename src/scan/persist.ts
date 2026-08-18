@@ -65,6 +65,17 @@ export async function runDistillation(
     sourceFileId: string;
   }>,
   currentState: AccountCurrentState | CampaignCurrentState,
+  /**
+   * Facts this entity has ALREADY captured — stored Context/Transient
+   * bullets plus note items already awaiting review. The prompt suppresses
+   * notes that merely restate one of these (contradictions still emit —
+   * that's how the record gets corrected).
+   *
+   * Empty on the auto-apply path, where synthesis's own merge already
+   * dedupes against the prior doc in the same pass. Only the propose path
+   * needs this, because review sits between distillation and synthesis.
+   */
+  knownFacts: string[] = [],
 ): Promise<{
   field_changes: z.infer<typeof DistillationSchema>['field_changes'];
   notes: z.infer<typeof DistillationSchema>['notes'];
@@ -85,6 +96,7 @@ export async function runDistillation(
       ),
       observations_json: JSON.stringify(observationsForPrompt, null, 2),
       current_state_json: JSON.stringify(currentState, null, 2),
+      known_facts_json: JSON.stringify(knownFacts, null, 2),
     },
   });
 

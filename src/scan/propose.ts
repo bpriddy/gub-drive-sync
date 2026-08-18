@@ -165,6 +165,47 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
   return { fieldProposals, noteItems, duplicatesSkipped };
 }
 
+/**
+ * Note items already sitting in a PENDING proposal for this target.
+ *
+ * Half of the "already on record" set distillation dedupes against (the
+ * other half is the entity's stored status bullets). A fact that's been
+ * proposed but not yet decided isn't in the status doc yet, so the doc
+ * alone wouldn't stop the next scan from proposing it again — which is
+ * exactly the duplicate-card stacking review finding #2 reported.
+ *
+ * Returns raw item texts; the prompt does the semantic comparison.
+ */
+export async function loadPendingNoteTexts(args: {
+  entityType: 'account' | 'campaign';
+  accountId: string | null;
+  campaignId: string | null;
+}): Promise<string[]> {
+  const rows = await prisma.driveChangeProposal.findMany({
+    where: {
+      kind: 'additional_update',
+      property: '__note__',
+      entityType: args.entityType,
+      accountId: args.accountId,
+      campaignId: args.campaignId,
+      state: 'pending',
+      expiresAt: { gt: new Date() },
+    },
+    select: { proposedValue: true },
+  });
+
+  const texts: string[] = [];
+  for (const row of rows) {
+    const value = row.proposedValue as { items?: Array<{ text?: unknown }> } | null;
+    for (const item of value?.items ?? []) {
+      if (typeof item?.text === 'string' && item.text.trim().length > 0) {
+        texts.push(item.text);
+      }
+    }
+  }
+  return texts;
+}
+
 async function writeNoteBatch(args: {
   entityType: 'account' | 'campaign';
   accountId: string | null;

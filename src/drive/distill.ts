@@ -123,6 +123,10 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
       ),
       observations_json: JSON.stringify(observationsForPrompt, null, 2),
       current_state_json: JSON.stringify(input.currentState, null, 2),
+      // Always-empty here: the already-on-record suppression is a scan-core
+      // propose-path concern (see runDistillation's knownFacts). Passed
+      // explicitly so the preset doesn't warn about an unbound variable.
+      known_facts_json: '[]',
     },
   });
 
