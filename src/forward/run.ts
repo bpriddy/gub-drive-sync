@@ -152,13 +152,28 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
 
   // Current metadata for the changed files. Vanished files (deleted
   // after the window) skip; folders never scan.
+  //
+  // A file we can't fetch is LOST, not fatal: getFileMetadata has already
+  // spent the effort (the limiter retries rate limits, withTransientRetry
+  // retries 5xx + dropped sockets), so anything still failing here has had
+  // its chance. Dropping one file matches how processBatch treats a file
+  // that fails extraction — count it, log it, keep the run alive. Failing
+  // the run instead would stall the account indefinitely: the cursor lives
+  // on the account, so every later run would re-enter the same window,
+  // hit the same file, and die again, with nothing watching to notice.
+  //
+  // The count rides the final summary line, which survives the 40-line
+  // log_summary tail clip — otherwise a run that silently dropped a dozen
+  // files reads exactly like a clean one.
   const files: TraversedFile[] = [];
+  let filesUnfetchable = 0;
   for (const id of changedIds) {
     let meta;
     try {
       meta = await timed('file_metadata', () => getFileMetadata(id));
     } catch (err) {
-      log(`    ⚠ metadata fetch failed for ${id}: ${summarizeError(err)} — skipping`);
+      filesUnfetchable++;
+      log(`    ⚠ metadata unreadable for ${id} after retries: ${summarizeError(err)} — file dropped from this window`);
       continue;
     }
     if (!meta?.id || !meta.name) {
@@ -240,9 +255,15 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
 
   const overallMs = Date.now() - overallStart;
   log('');
+  if (filesUnfetchable > 0) {
+    log(
+      `  ⚠ ${filesUnfetchable} file(s) dropped — metadata unreadable after retries; their changes are not in this scan`,
+    );
+  }
   log(
     rule(
-      `Forward sync done — ${scansProcessed} day-scan(s) / ${filesProcessed} file(s) in ${fmtMs(overallMs)}`,
+      `Forward sync done — ${scansProcessed} day-scan(s) / ${filesProcessed} file(s)` +
+        `${filesUnfetchable > 0 ? ` / ${filesUnfetchable} dropped` : ''} in ${fmtMs(overallMs)}`,
     ),
   );
   printPhaseSummary(overallMs);
