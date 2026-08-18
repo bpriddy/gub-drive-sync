@@ -1,42 +1,57 @@
 /**
  * forward/stats.ts — drive_edit_stats persistence, shared by the forward
- * driver (per day-group) and the one-shot seed-edit-stats mode.
+ * driver and the seed-edit-stats mode.
+ *
+ * Run framing (user ruling 2026-08-15, review finding #1): a stats row
+ * is one RUN's count of one actor's edit events on one file, dated by
+ * the run — the same day framing the drive scan uses. Same-day runs are
+ * separate contributions summed at query time (the panel GROUPs by
+ * actor/day anyway), and a retry REPLACES its own run's rows, so no
+ * cross-window merge function exists at all. This is what makes the
+ * write idempotent without pretending partial windows can reconstruct
+ * "day truth" — they never could.
  */
 
 import { prisma } from '../prisma';
 
-/**
- * Upsert one day's (file × actor) edit tallies. Overlap-safe: the
- * forward window re-reads a 2-minute boundary slice, whose recomputed
- * counts cover only part of the day — so an existing count is never
- * LOWERED, only raised (a full re-run of the same window recomputes
- * identical totals; a partial overlap can only see fewer).
- */
-export async function upsertEditTallies(args: {
+export async function writeRunEditStats(args: {
   accountId: string;
-  day: string; // YYYY-MM-DD
-  /** `${fileId}|${day}|${actorResource}` → count (all days; filtered here). */
+  /** drive_sync_runs id, or a synthetic uuid for seed windows. */
+  syncRunId: string;
+  /** The run's date, YYYY-MM-DD (drive-scan day framing). */
+  day: string;
+  /** `${fileId}|${actorResource}` → whole-window count (from foldEvents). */
   tallies: ReadonlyMap<string, number>;
   /** actorResource → email (or raw resource when unresolved). */
   actorEmailBy: ReadonlyMap<string, string>;
 }): Promise<number> {
-  let rows = 0;
+  // Collapse to (file, email) first — two resources can resolve to the
+  // same email, and the PK is (run, file, email).
+  const byRow = new Map<string, number>();
   for (const [key, count] of args.tallies) {
-    const [fileId, day, actor] = key.split('|') as [string, string, string];
-    if (day !== args.day) continue;
-    const actorEmail = args.actorEmailBy.get(actor) ?? actor;
-    const dayDate = new Date(`${day}T00:00:00.000Z`);
-    const existing = await prisma.driveEditStat.findUnique({
-      where: { fileId_day_actorEmail: { fileId, day: dayDate, actorEmail } },
-      select: { editCount: true },
-    });
-    const editCount = Math.max(existing?.editCount ?? 0, count);
-    await prisma.driveEditStat.upsert({
-      where: { fileId_day_actorEmail: { fileId, day: dayDate, actorEmail } },
-      create: { accountId: args.accountId, fileId, day: dayDate, actorEmail, editCount: count },
-      update: { editCount, capturedAt: new Date() },
-    });
-    rows++;
+    const [fileId, actor] = key.split('|') as [string, string];
+    const email = args.actorEmailBy.get(actor) ?? actor;
+    const rowKey = `${fileId}|${email}`;
+    byRow.set(rowKey, (byRow.get(rowKey) ?? 0) + count);
   }
-  return rows;
+  const dayDate = new Date(`${args.day}T00:00:00.000Z`);
+  const rows = Array.from(byRow, ([rowKey, editCount]) => {
+    const [fileId, actorEmail] = rowKey.split('|') as [string, string];
+    return {
+      syncRunId: args.syncRunId,
+      accountId: args.accountId,
+      fileId,
+      day: dayDate,
+      actorEmail,
+      editCount,
+    };
+  });
+
+  // Replace THIS run's contribution atomically — a retry of the same
+  // run (or seed window) overwrites itself and touches nobody else.
+  await prisma.$transaction([
+    prisma.driveEditStat.deleteMany({ where: { syncRunId: args.syncRunId } }),
+    ...(rows.length > 0 ? [prisma.driveEditStat.createMany({ data: rows })] : []),
+  ]);
+  return rows.length;
 }

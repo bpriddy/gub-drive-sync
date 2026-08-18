@@ -26,13 +26,16 @@ import { log, rule, fmtMs, getLogCapture, setLogCapture } from '../scan/output';
 import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
 import { queryActivityWindow, foldEvents, ymdUtc } from './activity';
 import { resolveActors } from './people';
-import { upsertEditTallies } from './stats';
+import { writeRunEditStats } from './stats';
 
 /** Absorbs Activity API ingestion lag at the window edge (design Q4). */
 const OVERLAP_MS = 2 * 60 * 1000;
 
 export interface ForwardArgs {
   accountId: string;
+  /** The drive_sync_runs row driving this run — stats key their
+   *  contribution to it (run framing; retries replace themselves). */
+  syncRunId: string;
   captureLog?: string[];
 }
 
@@ -212,18 +215,17 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
     scansProcessed = 1;
   }
 
-  // Edit stats keep TRUE event days (batching is a scan label; telemetry
-  // is history). Upserted before the cursor advances so a crash retries
-  // them with the window.
-  for (const day of days) {
-    const statRows = await upsertEditTallies({
-      accountId: fargs.accountId,
-      day,
-      tallies: folded.editTallies,
-      actorEmailBy,
-    });
-    if (statRows > 0) log(`  ✎ edit stats: ${statRows} (file × actor) row(s) for ${day}`);
-  }
+  // Edit stats use the SAME day framing as the scan (user ruling
+  // 2026-08-15): this run's whole-window tallies, dated by the run.
+  // Written before the cursor advances; a retry replaces its own rows.
+  const statRows = await writeRunEditStats({
+    accountId: fargs.accountId,
+    syncRunId: fargs.syncRunId,
+    day: scanDate,
+    tallies: folded.editTallies,
+    actorEmailBy,
+  });
+  if (statRows > 0) log(`  ✎ edit stats: ${statRows} (file × actor) row(s) dated ${scanDate}`);
 
   await advanceCursor(to);
 

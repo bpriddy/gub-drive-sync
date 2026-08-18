@@ -11,9 +11,9 @@
  * drive.activity.readonly scope (granted + probe-verified 2026-07-20;
  * see docs/edit-stats-decision.md).
  *
- * Output is NORMALIZED events; folding into per-day batches and
- * per-(file, day, actor) edit tallies lives here too so the driver and
- * the seed-edit-stats mode share one implementation.
+ * Output is NORMALIZED events; folding into the changed-file set and
+ * whole-window per-(file, actor) edit tallies lives here too so the
+ * driver and the seed-edit-stats mode share one implementation.
  */
 
 import { google, type driveactivity_v2 } from 'googleapis';
@@ -138,7 +138,9 @@ export async function queryActivityWindow(
 export interface FoldedWindow {
   /** YYYY-MM-DD (UTC) → set of fileIds touched that day (delete-only files excluded). */
   filesByDay: Map<string, Set<string>>;
-  /** Edit-event tallies: `${fileId}|${day}|${actorResource}` → count. */
+  /** Edit-event tallies: `${fileId}|${actorResource}` → count for the
+   *  WHOLE window (run framing — the run supplies the date; event days
+   *  never key stats). */
   editTallies: Map<string, number>;
   /** All distinct actor resources seen in edit events (for batch resolution). */
   actorResources: Set<string>;
@@ -153,7 +155,8 @@ export function ymdUtc(iso: string): string {
 
 /**
  * Fold raw events into the two shapes the driver needs: per-day changed
- * file sets (scan batches) and per-(file, day, actor) edit tallies.
+ * file sets (for the changed-file union + logging) and whole-window
+ * per-(file, actor) edit tallies (run framing).
  * Files whose ONLY events are deletions don't enter scan batches (their
  * content is gone; dossiers don't react — Q2), but delete events still
  * count toward deletionEvents for the run log.
@@ -180,7 +183,7 @@ export function foldEvents(events: ActivityEvent[]): FoldedWindow {
     if (e.action === 'edit' || e.action === 'create') {
       const actor = e.actorResource ?? '(unattributed)';
       actorResources.add(actor);
-      const key = `${e.fileId}|${day}|${actor}`;
+      const key = `${e.fileId}|${actor}`;
       editTallies.set(key, (editTallies.get(key) ?? 0) + 1);
     }
   }

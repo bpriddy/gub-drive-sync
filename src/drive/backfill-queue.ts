@@ -356,7 +356,7 @@ async function processOne(req: {
     // forward rows drain the Activity window (propose for review).
     const result =
       req.mode === 'forward'
-        ? await runForward({ accountId: req.accountId, captureLog })
+        ? await runForward({ accountId: req.accountId, syncRunId: req.id, captureLog })
         : await runBackfill({
             accountId: req.accountId,
             newestFirst: false,

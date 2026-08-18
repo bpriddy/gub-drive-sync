@@ -15,7 +15,8 @@ import { prisma } from '../prisma';
 import { log, rule } from '../scan/output';
 import { queryActivityWindow, foldEvents } from './activity';
 import { resolveActors } from './people';
-import { upsertEditTallies } from './stats';
+import crypto from 'node:crypto';
+import { writeRunEditStats } from './stats';
 
 export interface SeedEditStatsResult {
   accounts: number;
@@ -58,17 +59,18 @@ export async function seedEditStats(args: {
 
       const folded = foldEvents(events);
       const actorEmailBy = await resolveActors(folded.actorResources);
-      const days = new Set<string>();
-      for (const key of folded.editTallies.keys()) days.add(key.split('|')[1]!);
-      let windowRows = 0;
-      for (const day of days) {
-        windowRows += await upsertEditTallies({
-          accountId: account.id,
-          day,
-          tallies: folded.editTallies,
-          actorEmailBy,
-        });
-      }
+      // Run framing: each seed window is a synthetic "run" dated by its
+      // window end. Re-seeding with the same windows produces new run
+      // ids — TRUNCATE first (the migration does) or accept additive
+      // re-seeds only after a wipe; forward runs are unaffected either
+      // way (they own their queue-row ids).
+      const windowRows = await writeRunEditStats({
+        accountId: account.id,
+        syncRunId: crypto.randomUUID(),
+        day: toIso.slice(0, 10),
+        tallies: folded.editTallies,
+        actorEmailBy,
+      });
       result.statRows += windowRows;
       log(
         `  ${fromIso.slice(0, 10)} → ${toIso.slice(0, 10)}: ${events.length} event(s) → ${windowRows} stat row(s)`,

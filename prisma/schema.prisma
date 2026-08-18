@@ -812,8 +812,14 @@ model SyncRun {
 /// actor_email = resolved email, or the raw people/<id> resource when
 /// resolution failed (unresolved actors are kept, never dropped).
 model DriveEditStat {
+  /// The sync run (drive_sync_runs id, or a synthetic id for seed
+  /// windows) that counted this contribution. No FK by design — seed
+  /// runs have no queue row, and stats must survive queue cleanup.
+  syncRunId  String   @map("sync_run_id") @db.Uuid
   accountId  String   @map("account_id") @db.Uuid
   fileId     String   @map("file_id")
+  /// The RUN's date (drive-scan day framing — user ruling 2026-08-15),
+  /// not the event's calendar day. Same-day runs sum at query time.
   day        DateTime @db.Date
   actorEmail String   @map("actor_email")
   editCount  Int      @default(0) @map("edit_count")
@@ -821,7 +827,7 @@ model DriveEditStat {
 
   account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
-  @@id([fileId, day, actorEmail])
+  @@id([syncRunId, fileId, actorEmail])
   @@index([accountId, day])
   @@map("drive_edit_stats")
 }
