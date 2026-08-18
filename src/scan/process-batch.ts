@@ -52,7 +52,12 @@ import {
   persistTarget,
   type ValidatedChange,
 } from './persist';
-import { loadPendingNoteTexts, proposeTarget } from './propose';
+import {
+  hasNewCandidateMarker,
+  loadPendingNoteTexts,
+  proposeTarget,
+  stripNewCandidateMarker,
+} from './propose';
 
 import type {
   BatchOutcome,
@@ -1049,10 +1054,44 @@ export async function processBatch(
     // Expired transient bullets are pruned first, same as synthesis does
     // (D23) — a bullet whose time has passed no longer states a current
     // fact, so re-observing it IS news.
+    //
+    // ── Partitioning the shared account card ─────────────────────────────
+    // New candidates have no DB row, so their items ride the ACCOUNT card
+    // alongside the account's own — several distinct pending rows under one
+    // key, told apart only by the candidate marker. Both directions matter:
+    // an account target must not be handed a candidate's facts (they're
+    // about a campaign that doesn't exist yet), and a candidate must not be
+    // handed a sibling's. Without the partition the result would even depend
+    // on worker scheduling — targets run 8-wide and the propose write happens
+    // inside them, so siblings read this card while others are writing it.
     const collectKnownFacts = async (
       target: Target,
       distillEntityType: 'account' | 'campaign',
     ): Promise<string[]> => {
+      // ── New candidate: no row, so no doc and no target-keyed pending ────
+      // Its own prior items are on the account card. Keep the ones bearing
+      // THIS candidate's marker and strip it, so distillation compares fact
+      // against fact rather than fact against fact-with-a-location-tag.
+      //
+      // Only works from the second scan onward — the first scan is what
+      // creates the items to compare against. True of every target, but for
+      // candidates it's the whole mechanism: there's no status doc to fall
+      // back on.
+      if (!target.entityId) {
+        const accountPending = await loadPendingNoteTexts({
+          entityType: 'account',
+          accountId: ctx.accountId,
+          campaignId: null,
+        });
+        return Array.from(
+          new Set(
+            accountPending
+              .map((text) => stripNewCandidateMarker(text, target.entityName))
+              .filter((text): text is string => text !== null),
+          ),
+        );
+      }
+
       const bulletsFrom = (stored: string | null): string[] => {
         if (!stored) return [];
         const sections = [
@@ -1068,11 +1107,18 @@ export async function processBatch(
 
       // Same (accountId, campaignId) resolution proposeTarget uses to
       // write the row — the lookup has to match where the notes land.
-      const pending = await loadPendingNoteTexts({
+      const pendingRaw = await loadPendingNoteTexts({
         entityType: distillEntityType,
         accountId: distillEntityType === 'account' ? target.entityId : ctx.accountId,
         campaignId: distillEntityType === 'campaign' ? target.entityId : null,
       });
+      // The other half of the partition: an account's pending set includes
+      // every candidate's marked items, which are about campaigns that don't
+      // exist yet. They must not suppress an account-level observation.
+      const pending =
+        distillEntityType === 'account'
+          ? pendingRaw.filter((text) => !hasNewCandidateMarker(text))
+          : pendingRaw;
 
       return Array.from(
         new Set([
@@ -1137,7 +1183,7 @@ export async function processBatch(
         // the same pass there and already handles this, and backfill
         // output stays byte-faithful for the dryrun tool.
         const knownFacts =
-          application === 'propose' && target.entityId
+          application === 'propose'
             ? await timed('known-facts', () =>
                 collectKnownFacts(target, distillEntityType),
               )
