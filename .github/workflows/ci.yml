@@ -30,6 +30,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      # @anomaly-technology/gub-schemas lives on GitHub Packages under the
+      # Anomaly-Technology org (different owner than this repo), so GITHUB_TOKEN
+      # cannot read it. GH_PACKAGES_TOKEN = repo secret, classic PAT read:packages.
+      - name: Authenticate npm to GitHub Packages
+        run: echo "//npm.pkg.github.com/:_authToken=${{ secrets.GH_PACKAGES_TOKEN }}" >> ~/.npmrc
+
       - name: Install dependencies
         run: npm ci
 

@@ -39,6 +39,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@anomaly-technology/gub-schemas": "^0.1.0",
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.5",
     "eslint": "^10.8.1",
@@ -48,5 +49,8 @@
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.66.0",
     "vitest": "^2.1.8"
+  },
+  "prisma": {
+    "schema": "node_modules/@anomaly-technology/gub-schemas/prisma/schema.prisma"
   }
 }

@@ -8,10 +8,12 @@ WORKDIR /app
 
 RUN apt-get update -qq && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 
-COPY package*.json ./
-RUN npm ci
+COPY package*.json .npmrc ./
+RUN --mount=type=secret,id=gh_packages_token \
+    echo "//npm.pkg.github.com/:_authToken=$(cat /run/secrets/gh_packages_token)" >> /root/.npmrc \
+    && npm ci \
+    && rm -f /root/.npmrc
 
-COPY prisma ./prisma
 RUN npx prisma generate
 
 COPY tsconfig.json ./
