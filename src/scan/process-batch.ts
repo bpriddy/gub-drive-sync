@@ -1204,6 +1204,8 @@ export async function processBatch(
             previousValue: currentValue,
             proposedValueRaw: fc.proposed_value ?? null,
             confidence: fc.confidence,
+            reasoning: fc.reasoning ?? null,
+            sourceFileIds: fc.source_file_ids ?? [],
           });
         }
 

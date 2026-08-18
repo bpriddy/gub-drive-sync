@@ -73,7 +73,7 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
     const items: ProposeNoteItem[] = [
       ...validatedChanges.map((vc) => ({
         text: `[new campaign candidate "${input.entityName}"] ${vc.field}: ${vc.proposedValueRaw ?? '(null)'}`,
-        source_file_ids: [] as string[],
+        source_file_ids: vc.sourceFileIds,
       })),
       ...notes.map((n) => ({
         text: `[new campaign candidate "${input.entityName}"] ${n.text}`,
@@ -133,8 +133,12 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
         property: vc.field,
         currentValue: toJson(vc.previousValue),
         proposedValue: proposedJson,
-        reasoning: null,
-        sourceFileIds: [],
+        // Provenance the reviewer decides on: WHY this value, and which
+        // files it came from. distillAndEmit (v1) has always carried both;
+        // the scan-core propose path was writing null/[] and handing the
+        // reviewer a bare value with no way to check it.
+        reasoning: vc.reasoning,
+        sourceFileIds: vc.sourceFileIds,
         confidence: new Prisma.Decimal(vc.confidence),
         state: 'pending',
         reviewToken: crypto.randomBytes(32).toString('hex'),

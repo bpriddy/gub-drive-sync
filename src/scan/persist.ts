@@ -126,6 +126,14 @@ export interface ValidatedChange {
   /** Raw string form of proposed_value, used to populate state for synthesis. */
   proposedValueRaw: string | null;
   confidence: number;
+  /**
+   * The LLM's justification for this change. Carried so the propose path
+   * can show a reviewer WHY a value is being suggested — a field_change
+   * card with a bare value and no reasoning is close to unreviewable.
+   */
+  reasoning: string | null;
+  /** Drive file ids the change was derived from — the reviewer's audit trail. */
+  sourceFileIds: string[];
 }
 
 /** Module-level Target type — used by both processBatch and persistTarget. */
