@@ -2,34 +2,24 @@
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { writeFileSync } from 'node:fs';
 import { prisma } from '../prisma';
-import {
-  buildAttributor,
-  classifyFolders,
-  gatherFolders,
-  overlayPieceAnchors,
-  type Attributor,
-  type EntityMap,
-  type PieceAnchor,
-} from '../drive/structure';
+import type { Attributor } from '../drive/structure';
 import type { TraversedFile } from '../drive/types';
 import { parseArgs, DEFAULT_CONCURRENCY, type Args, type BackfillRunResult } from './args';
-import { log, rule, fmtMs, setOutputFile, getLogCapture, setLogCapture } from './output';
-import { resetPhaseTimer, printPhaseSummary, timed } from './timing';
+import { log, rule, fmtMs, setOutputFile, getLogCapture, setLogCapture } from '../scan/output';
+import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
 import { loadEntity } from './entity';
 import { gatherFilesAuto, gatherFilesRecursive } from './discovery';
 import {
   groupFilesByDate,
   persistCursor,
-  persistStructureCache,
   persistBootstrapFilesCache,
-  structureFingerprint,
   type DayBucket,
-  type StructureCache,
   type BootstrapFilesCache,
 } from './days';
-import { buildCampaignNameDirectory, type CampaignNameDirectory } from './batch-types';
-import { processBatch } from './process-batch';
+import type { CampaignNameDirectory } from '../scan/batch-types';
+import { processBatch } from '../scan/process-batch';
 import { runStructureOnly } from './structure-mode';
+import { resolveAccountStructure } from './structure-stage';
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 //
@@ -159,126 +149,14 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
    *  creation so the merge's year gate has a structural year to read. */
   let folderPathById: Map<string, string> | null = null;
   if (ctx.type === 'account') {
-    log(rule('Resolve structure (Stage 2 — file→entity attribution)'));
-    // existingCampaigns is read fresh every chunk — auto-created
-    // candidates during bootstrap mean the DB list grows mid-chain;
-    // nameDirectory rebuilds against the current list. Cheap query.
-    const existingCampaigns = (
-      await prisma.campaign.findMany({
-        where: { accountId: ctx.id, driveFolderId: { not: null } },
-        select: { id: true, name: true, driveFolderId: true },
-      })
-    )
-      .filter((c): c is { id: string; name: string; driveFolderId: string } => !!c.driveFolderId)
-      .map((c) => ({ id: c.id, name: c.name, driveFolderId: c.driveFolderId }));
-    log(`  Existing campaigns in DB: ${existingCampaigns.length}`);
-
-    // ── Structure cache check ─────────────────────────────────────────
-    //
-    // Chunks 2..N of a bootstrap chain reuse the structure computed by
-    // chunk #1. We trust the cache for bootstrap (chain runs in hours;
-    // structure barely changes). For forward sync, we'll re-gather +
-    // re-hash + compare fingerprint before reusing. Today this code
-    // only runs from bootstrap mode, so cache-hit = trust.
-    let entityMap: EntityMap | null = null;
-    const cached = ctx.driveStructureClassification as StructureCache | null;
-    if (cached && cached.entityMap) {
-      log(`  ✓ Structure cache HIT  (fingerprint=${cached.fingerprint.slice(0, 12)}…)`);
-      log(`    Skipping ~33s folder gather + ~1m45s LLM classify.`);
-      entityMap = cached.entityMap as EntityMap;
-    } else {
-      log('  Gathering folders…');
-      const isTTY = process.stdout.isTTY === true;
-      let lastTick = Date.now();
-      const folders = await timed('structure_walk', () =>
-        gatherFolders(ctx.folderId, ctx.name, {
-          onProgress: (n) => {
-            if (!isTTY) return;
-            if (Date.now() - lastTick < 150) return;
-            lastTick = Date.now();
-            process.stdout.write('\r' + `    …${n} folders so far`.padEnd(40));
-          },
-        }),
-      );
-      if (isTTY) process.stdout.write('\r' + ' '.repeat(40) + '\r');
-      log(`  Gathered ${folders.length} folders.`);
-      log('  Classifying with LLM…');
-      entityMap = await timed('structure_classify', () =>
-        classifyFolders({
-          accountId: ctx.id,
-          accountName: ctx.name,
-          rootFolderId: ctx.folderId,
-          folders,
-          existingCampaigns,
-        }),
-      );
-      // Persist for chunks 2..N. Fingerprint over the folder list so
-      // forward sync can detect drift later.
-      if (!args.dryrun) {
-        const fingerprint = structureFingerprint(
-          folders.map((f) => ({ id: f.id, name: f.name, parentId: f.parentId })),
-        );
-        await persistStructureCache(ctx.accountId, {
-          fingerprint,
-          entityMap,
-          folders,
-        });
-        log(`  ✓ Structure cache WRITTEN  (fingerprint=${fingerprint.slice(0, 12)}…)`);
-      }
-    }
-    const classifiedCounts = {
-      existing: entityMap.classified.filter((c) => c.classification === 'existing_campaign').length,
-      fresh: entityMap.classified.filter((c) => c.classification === 'new_campaign').length,
-      acct: entityMap.classified.filter((c) => c.classification === 'account_level').length,
-    };
-    log(
-      `  Classified: ${classifiedCounts.existing} existing campaigns, ${classifiedCounts.fresh} new candidates, ${classifiedCounts.acct} account-level  [${entityMap.driver}]`,
-    );
-    log('');
-
-    // ── Piece-anchor overlay — fresh from the DB every chunk, NEVER cached.
-    // Folders that belong to a campaign via campaign_pieces (merged-variant
-    // folders) are pinned to their owning campaign, overriding whatever the
-    // LLM classified them as. This is what makes a merge STICK: without it
-    // the next scan re-creates the merged folder as a new campaign.
-    const pieceRows = await prisma.campaignPiece.findMany({
-      where: { campaign: { accountId: ctx.id } },
-      select: {
-        id: true,
-        name: true,
-        driveFolderId: true,
-        campaignId: true,
-        campaign: { select: { name: true } },
-      },
+    const st = await resolveAccountStructure(ctx, {
+      trustCache: true, // bootstrap chain: hours-scale, structure barely drifts
+      persistCache: !args.dryrun,
     });
-    const pieceAnchors: PieceAnchor[] = pieceRows
-      .filter((p): p is typeof p & { driveFolderId: string } => !!p.driveFolderId)
-      .map((p) => ({
-        driveFolderId: p.driveFolderId,
-        campaignId: p.campaignId,
-        campaignName: p.campaign.name,
-        pieceId: p.id,
-        pieceName: p.name,
-      }));
-    if (pieceAnchors.length > 0) {
-      entityMap = overlayPieceAnchors(entityMap, pieceAnchors);
-      log(`  Piece anchors: ${pieceAnchors.length} folder(s) pinned to their owning campaign`);
-      log('');
-    }
-
-    folderPathById = new Map(entityMap.allFolders.map((f) => [f.id, f.path]));
-    attributor = buildAttributor(entityMap, pieceAnchors);
-    familyByCampaignId = new Map(existingCampaigns.map((c) => [c.id, [c.name]]));
-    for (const a of pieceAnchors) {
-      const fam = familyByCampaignId.get(a.campaignId);
-      if (fam) fam.push(a.pieceName);
-      else familyByCampaignId.set(a.campaignId, [a.campaignName, a.pieceName]);
-    }
-    nameDirectory = buildCampaignNameDirectory(entityMap, existingCampaigns);
-    log(
-      `  Known-campaign vocabulary for per-file LLM: ${nameDirectory.knownCampaignNames.length} name${nameDirectory.knownCampaignNames.length === 1 ? '' : 's'}`,
-    );
-    log('');
+    attributor = st.attributor;
+    nameDirectory = st.nameDirectory;
+    familyByCampaignId = st.familyByCampaignId;
+    folderPathById = st.folderPathById;
   }
 
   // ── Files cache check ─────────────────────────────────────────────────
@@ -398,18 +276,17 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log('');
 
     const scanStart = Date.now();
-    const outcome = await processBatch(
-      nextDay.files,
+    const outcome = await processBatch(nextDay.files, {
       ctx,
       attributor,
       nameDirectory,
       folderPathById,
-      piecesById.size > 0 ? piecesById : null,
+      piecesById: piecesById.size > 0 ? piecesById : null,
       familyByCampaignId,
-      !args.dryrun,
-      nextDay.date,
-      args.concurrency ?? DEFAULT_CONCURRENCY,
-    );
+      application: args.dryrun ? 'dryrun' : 'apply',
+      editedAt: nextDay.date,
+      concurrency: args.concurrency ?? DEFAULT_CONCURRENCY,
+    });
     const scanMs = Date.now() - scanStart;
 
     // ── Print synthesized status_markdowns for this scan ──────────────
@@ -454,6 +331,17 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     log('');
     log(`  ✓ Scan done in ${fmtMs(scanMs)}  (${nextDay.date})`);
     log('');
+
+    // Day-commit gate: a synthesis/apply/propose failure means at least
+    // one entity's day is NOT recorded. Throw BEFORE the cursor persists
+    // so the queue retry re-runs this day — the alternative is silent
+    // permanent loss (the day-walk never revisits a committed day).
+    // Dryrun previews report the count but complete normally.
+    if (!args.dryrun && outcome.stage3Failures > 0) {
+      throw new Error(
+        `${outcome.stage3Failures} entity stage-3 failure(s) on ${nextDay.date} — day NOT committed; the queue retry re-runs it`,
+      );
+    }
 
     scansDone = 1;
     finalCursor = nextDay.date;

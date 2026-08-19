@@ -1,10 +1,63 @@
-// Part of the backfill engine (see index.ts). Extracted verbatim from the
-// former scripts/backfill.ts monolith — behavior-preserving reorganization.
+// Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
+// by every driver (day-walk backfill today; the Activity forward driver next).
+import type {
+  AccountCurrentState,
+  CampaignCurrentState,
+} from '../drive/schema';
 import type { CampaignObservation } from '../drive/interpret';
 import type { EntityMap } from '../drive/structure';
 import type { IdeaScanStats } from '../drive/idea-scan';
 
 // ── Per-batch processing ────────────────────────────────────────────────────
+
+/**
+ * The scan's entity context — account/campaign identity, current state,
+ * dossiers, and the driver-owned cursor/cache fields. Constructed by the
+ * DRIVER (src/backfill/entity.ts loadEntity today; the forward driver
+ * later) and consumed read-only by the scan core.
+ */
+export interface EntityCtx {
+  type: 'account' | 'campaign';
+  id: string;
+  name: string;
+  folderId: string;
+  /**
+   * The parent account id for both account- and campaign-scoped ctx —
+   * the bootstrap cursor lives on `accounts.drive_bootstrap_cursor` and
+   * is account-scoped regardless of which entity drove the chunk.
+   */
+  accountId: string;
+  /** Account ROOT folder id — the org-scope external key on idea rows. */
+  accountFolderId: string | null;
+  accountState: AccountCurrentState;
+  accountName: string;
+  campaignName: string | null;
+  campaignState: CampaignCurrentState | null;
+  /** Current persisted status_markdown (general) or null. */
+  statusMarkdown: string | null;
+  /** Current persisted status_sensitive_markdown or null (per D29). */
+  statusSensitiveMarkdown: string | null;
+  /**
+   * Persisted `accounts.drive_bootstrap_cursor` as YYYY-MM-DD, or null.
+   * Drives the modifiedTime-day walker's "next pending day" lookup.
+   * Written at the end of every chunk regardless of synthesis output.
+   */
+  driveBootstrapCursor: string | null;
+  /**
+   * Cached structure (folders + entity_map + fingerprint) from a prior
+   * chunk. NULL = first chunk in chain, or cache invalidated. Engine
+   * checks fingerprint; on match, skips the ~1m 45s LLM classify step.
+   */
+  driveStructureClassification: unknown;
+  /**
+   * Cached file list + active_dates from bootstrap chunk #1. NULL after
+   * bootstrap completes (or before first chunk). When present, chunks
+   * 2..N skip the ~3 min file discovery + grouping step.
+   */
+  driveBootstrapFiles: unknown;
+  reviewerEmail: string | null;
+  reviewerStaffId: string | null;
+}
 
 export interface CampaignBucket {
   campaignName: string;
@@ -114,6 +167,14 @@ export interface BatchOutcome {
   campaignObsDiscarded: number;
   /** Stage 3: one entry per entity that got distill+synth. */
   synthesized: EntitySynthesisResult[];
+  /**
+   * Stage-3 synthesis/apply/propose failures. Non-zero means at least
+   * one entity's day did NOT land (in the DB or the review queue) —
+   * run.ts throws before the cursor persists so the queue retry re-runs
+   * the day instead of silently losing it. Distill failures are
+   * deliberately excluded (degraded, not lost).
+   */
+  stage3Failures: number;
   /** Ideas tier: deck-gated extraction stats (null when account folder unknown). */
   ideaStats: IdeaScanStats | null;
 }

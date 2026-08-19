@@ -21,10 +21,10 @@
 
 import { z } from 'zod';
 import { SchemaType, type ResponseSchema } from '../ai';
-import { defaultLlm, parseLlmJson } from '../ai';
+import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
 import { logger } from '../logger';
 
-const MODEL = 'gemini-3.5-flash';
+const MODEL = DEFAULT_GEMINI_MODEL;
 const TEMPERATURE = 0.1;
 // Thinking tokens count against this (see the gemini-3.5-flash memory). A merge
 // can re-emit a dozen facet rows; keep generous so the JSON never truncates.

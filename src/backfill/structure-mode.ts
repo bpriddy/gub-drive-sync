@@ -2,7 +2,7 @@
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { prisma } from '../prisma';
 import { classifyFolders, gatherFolders, type ClassifiedFolder } from '../drive/structure';
-import { log, rule, fmtMs } from './output';
+import { log, rule, fmtMs } from '../scan/output';
 import type { EntityCtx } from './entity';
 import type { EntityMap, FolderNode } from '../drive/structure';
 

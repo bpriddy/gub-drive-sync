@@ -37,6 +37,7 @@ import { config } from '../config';
 import { prisma } from '../prisma';
 import { summarizeError } from '../progress';
 import { runBackfill } from '../backfill';
+import { runForward } from '../forward/run';
 
 /** Stale-running recovery threshold — see project_drive_sync_architecture.md "Self-healing reapers". */
 /**
@@ -351,14 +352,19 @@ async function processOne(req: {
 
   const captureLog: string[] = [];
   try {
-    const result = await runBackfill({
-      accountId: req.accountId,
-      newestFirst: false,
-      outputPath: null,
-      structureOnly: false,
-      dryrun: false,
-      captureLog,
-    });
+    // Driver dispatch: bootstrap rows day-walk history (auto-apply);
+    // forward rows drain the Activity window (propose for review).
+    const result =
+      req.mode === 'forward'
+        ? await runForward({ accountId: req.accountId, syncRunId: req.id, captureLog })
+        : await runBackfill({
+            accountId: req.accountId,
+            newestFirst: false,
+            outputPath: null,
+            structureOnly: false,
+            dryrun: false,
+            captureLog,
+          });
     // Bookkeeping persist gets its own guard: the scan already committed
     // (cursor included), so a transient DB error HERE must not flow into
     // the engine-failure path — that would re-queue (attempts 1-2) or

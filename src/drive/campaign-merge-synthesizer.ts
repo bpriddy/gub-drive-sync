@@ -18,7 +18,7 @@
  * dropped before synthesis sees them), matching the production behavior.
  */
 
-import { defaultLlm } from '../ai';
+import { defaultLlm, DEFAULT_GEMINI_MODEL } from '../ai';
 import { logger } from '../logger';
 import type { CampaignCurrentState } from './schema';
 import {
@@ -34,7 +34,7 @@ import {
   STATUS_SYNTHESIS_V1_VERSION,
 } from './status-synthesis';
 
-const MODEL = 'gemini-3.5-flash';
+const MODEL = DEFAULT_GEMINI_MODEL;
 const TEMPERATURE = 0.2;
 
 export interface VariantMarkdown {

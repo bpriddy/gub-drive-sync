@@ -1,7 +1,6 @@
-// Part of the backfill engine (see index.ts). Extracted verbatim from the
-// former scripts/backfill.ts monolith — behavior-preserving reorganization.
+// Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
+// by every driver (day-walk backfill today; the Activity forward driver next).
 import { prisma } from '../prisma';
-import { driveClient } from '../drive/client';
 import { extractText } from '../drive/extract';
 import { interpretAssetFolder } from '../drive/asset-folder';
 import {
@@ -21,7 +20,7 @@ import {
   type FieldWriteSpec,
 } from '../drive/schema';
 import { summarizeError } from '../progress';
-import { defaultLlm } from '../ai';
+import { defaultLlm, DEFAULT_GEMINI_MODEL } from '../ai';
 import {
   accountFieldsAsMap,
   assembleSensitiveStatusMarkdown,
@@ -49,22 +48,27 @@ import { timed } from './timing';
 import { runWithConcurrency } from './util';
 import { isForeignCampaignTag, routeCampaignObs, isDrivePermissionError, EMPTY_CAMPAIGN_STATE } from './routing';
 import {
-  runDryRunDistillation,
+  runDistillation,
   persistTarget,
   type ValidatedChange,
 } from './persist';
-import type { EntityCtx } from './entity';
+import { loadPendingNoteTexts, proposeTarget } from './propose';
+import { hasNewCandidateMarker, stripNewCandidateMarker } from './note-marker';
+
 import type {
   BatchOutcome,
   CampaignBucket,
   CampaignNameDirectory,
   EntitySynthesisResult,
+  EntityCtx,
 } from './batch-types';
 
-export async function processBatch(
-  batch: TraversedFile[],
-  ctx: EntityCtx,
-  attributor: Attributor | null,
+/** Everything the scan core needs beyond the batch itself. Built by a
+ * DRIVER (day-walk backfill today; the Activity forward driver later). */
+export interface ProcessBatchOptions {
+  ctx: EntityCtx;
+  /** Folder→entity attributor from the structure scan; null for campaign-scoped scans. */
+  attributor: Attributor | null;
   /**
    * Directory for subject-based campaign routing. Null when attributor
    * is null (campaign-scoped scan — no cross-campaign attribution).
@@ -73,39 +77,69 @@ export async function processBatch(
    * lookup tables used to resolve a matched name back to its bucket
    * key (existing campaignId or structure-discovered folderId).
    */
-  nameDirectory: CampaignNameDirectory | null,
+  nameDirectory: CampaignNameDirectory | null;
   /**
    * FolderNode.path by folder id (deterministic breadcrumb), from the
    * structure walk. Null when attributor is null. Used to stamp
    * campaign.drive_folder_path on newly created campaigns.
    */
-  folderPathById: Map<string, string> | null,
+  folderPathById: Map<string, string> | null;
   /**
    * Pieces of the SCANNED campaign (campaign-scoped runs only; null for
    * account scans). Used by regime-1 routing to bucket piece-tagged files
    * (file.pieceId, set at discovery) to their piece.
    */
-  piecesById: Map<string, { name: string; driveFolderId: string }> | null,
+  piecesById: Map<string, { name: string; driveFolderId: string }> | null;
   /**
    * Identity family per existing campaign (campaign name + its pieces'
    * names). Account scans use it to (a) lock campaign-zone files to their
    * family and (b) hand the family to the per-file call as the vocabulary.
    */
-  familyByCampaignId: Map<string, string[]> | null,
-  applyToDb: boolean,
+  familyByCampaignId: Map<string, string[]> | null;
+  /**
+   * Application policy (docs/forward-sync-v2-design.md, "Application
+   * policy: forward PROPOSES, review APPLIES"):
+   *   'apply'   — bootstrap: auto-apply with system-staff attribution.
+   *   'propose' — forward: account/campaign changes become review
+   *               proposals; pieces/ideas keep their automatic ratchets
+   *               (Q5); synthesis is deferred to applyDecisions (D7).
+   *   'dryrun'  — preview only; nothing written anywhere.
+   */
+  application: 'apply' | 'propose' | 'dryrun';
   /**
    * The "as-of" date for this scan in YYYY-MM-DD form. Used to stamp the
    * synthesized status_markdown's edited_at header. For backfill this is
-   * the day being processed (the file bucket's calendar day); for any
-   * future forward-sync callers it'd be today's date.
+   * the day being processed (the file bucket's calendar day); for the
+   * forward driver it's the real change day.
    */
-  editedAt: string,
+  editedAt: string;
   /**
    * Per-file worker count WITHIN this one batch (= one day). See the
    * scan-parallelism doctrine at the pool below: days never overlap.
    */
-  concurrency: number,
+  concurrency: number;
+}
+
+export async function processBatch(
+  batch: TraversedFile[],
+  opts: ProcessBatchOptions,
 ): Promise<BatchOutcome> {
+  const {
+    ctx,
+    attributor,
+    nameDirectory,
+    folderPathById,
+    piecesById,
+    familyByCampaignId,
+    application,
+    editedAt,
+    concurrency,
+  } = opts;
+  // Dossier auto-apply is 'apply' only; infrastructure + automatic-ratchet
+  // writes (restricted worklist, ideas, piece markdown) happen in 'propose'
+  // mode too — review gates DOSSIER/FIELD content, not telemetry (Q5).
+  const applyToDb = application === 'apply';
+  const infraWrites = application !== 'dryrun';
   log(`  Extracting + interpreting ${batch.length} file(s)…`);
 
   const accountBucket: Array<{ observation: AccountObservation; sourceFileId: string }> = [];
@@ -142,7 +176,7 @@ export async function processBatch(
     ? createIdeaScanContext({
         accountExternalId: ctx.accountFolderId,
         accountName: ctx.accountName,
-        apply: applyToDb,
+        apply: infraWrites,
       })
     : null;
 
@@ -154,89 +188,22 @@ export async function processBatch(
       ? [ctx.name, ...(piecesById ? Array.from(piecesById.values()).map((p) => p.name) : [])]
       : [ctx.name];
 
-  // ── Restricted-file re-probe ─────────────────────────────────────────────
-  // A sharing fix does NOT bump modifiedTime, so delta gating would never
-  // retry a restricted file on its own. Append every still-'restricted'
-  // worklist row for this entity to the batch (skipping ids already
-  // present) — the normal worker probes it: still 403 → lastProbedAt
-  // advances; readable → the content flows through the full pipeline and
-  // the row resolves. 'ignored' rows (human action in gub-admin) are never
-  // probed. Cost: one Drive call per still-restricted file per scan.
-  const probeCandidates = await prisma.driveRestrictedFile.findMany({
-    where: {
-      accountId: ctx.accountId,
-      status: 'restricted',
-      ...(ctx.type === 'campaign' ? { campaignId: ctx.id } : {}),
-    },
-  });
-  const probedFileIds = new Set<string>();
-  if (probeCandidates.length > 0) {
-    log(`  Re-probing ${probeCandidates.length} restricted file(s)…`);
-    const inBatch = new Set(batch.map((b) => b.id));
-    const drive = await driveClient();
-    for (const r of probeCandidates) {
-      probedFileIds.add(r.fileId);
-      if (inBatch.has(r.fileId)) continue;
-      // Fresh metadata fetch: shortcuts need shortcutDetails (targetId +
-      // targetMimeType) for extractText to follow them — the worklist row
-      // doesn't carry that, and it can change (someone may replace the
-      // shortcut's target). Metadata access can itself 403 on some
-      // restricted shapes — treat that as "still restricted".
-      let meta: {
-        name?: string | null;
-        mimeType?: string | null;
-        parents?: string[] | null;
-        size?: string | null;
-        shortcutDetails?: { targetId?: string | null; targetMimeType?: string | null } | null;
-      };
-      try {
-        const res = await drive.files.get({
-          fileId: r.fileId,
-          fields: 'id,name,mimeType,parents,size,shortcutDetails(targetId,targetMimeType)',
-          supportsAllDrives: true,
-        });
-        meta = res.data;
-      } catch (err) {
-        if (isDrivePermissionError(err)) {
-          batch.push({
-            id: r.fileId,
-            name: r.name,
-            mimeType: r.mimeType ?? 'application/octet-stream',
-            parents: r.parentFolderId ? [r.parentFolderId] : [],
-            path: r.path ?? r.name,
-            modifiedTime: null,
-            modifiedByEmail: null,
-            createdTime: null,
-            size: null,
-            isFolder: false,
-          });
-          continue;
-        }
-        log(`  ⚠ re-probe metadata fetch failed for "${r.name}": ${summarizeError(err)}`);
-        continue;
-      }
-      batch.push({
-        id: r.fileId,
-        name: meta.name ?? r.name,
-        mimeType: meta.mimeType ?? r.mimeType ?? 'application/octet-stream',
-        parents: meta.parents ?? (r.parentFolderId ? [r.parentFolderId] : []),
-        path: r.path ?? r.name,
-        modifiedTime: null,
-        modifiedByEmail: null,
-        createdTime: null,
-        size: meta.size ? Number(meta.size) : null,
-        isFolder: false,
-        ...(meta.shortcutDetails?.targetId && meta.shortcutDetails?.targetMimeType
-          ? {
-              shortcutTarget: {
-                id: meta.shortcutDetails.targetId,
-                mimeType: meta.shortcutDetails.targetMimeType,
-              },
-            }
-          : {}),
-      });
-    }
-  }
+  // ── Restricted worklist (no probing — practice over polling) ─────────────
+  // Policy (user ruling, 2026-08-14): we do NOT re-probe files we lack
+  // permission to read. The organizational practice is to affirmatively
+  // share with the bot (bot.clientdrives@); the worklist + first-sighting
+  // observation exist to FEED that practice — the admin page is the
+  // "please share this" to-do list. A rescued file re-enters scans via its
+  // next normal change event, and a successful extraction below
+  // auto-resolves its row. 'ignored' rows are permanent exemptions.
+  const restrictedRowIds = new Set(
+    (
+      await prisma.driveRestrictedFile.findMany({
+        where: { accountId: ctx.accountId, status: 'restricted' },
+        select: { fileId: true },
+      })
+    ).map((r) => r.fileId),
+  );
 
   let filesExtracted = 0;
   let filesSkipped = 0;
@@ -248,6 +215,8 @@ export async function processBatch(
   let filesZeroObs = 0;
   let accountLevelFiles = 0;
   let campaignObsDiscarded = 0;
+  /** Stage-3 synthesis/apply/propose failures — see BatchOutcome.stage3Failures. */
+  let stage3Failures = 0;
   /** Obs about a DIFFERENT campaign found inside a campaign zone — misfiled content, dropped. */
   let foreignObsDropped = 0;
   /** Account-zone obs naming an UNKNOWN campaign → converted to account observations (no phantoms). */
@@ -460,10 +429,10 @@ export async function processBatch(
       // Metadata-only skips (unsupported_mime, shortcut_unverified_size,
       // oversized) prove nothing about content access: leave the row
       // restricted — probing is cheap and the operator can Ignore it.
-      if (o.skipReason === 'empty' && probedFileIds.has(file.id)) {
+      if (o.skipReason === 'empty' && restrictedRowIds.has(file.id)) {
         filesRestored++;
         log(`      🔓 previously restricted — now reachable (no extractable text); worklist row resolved`);
-        if (applyToDb) {
+        if (infraWrites) {
           // Guarded like the main body's writes: a transient DB error on
           // one worklist row must not reject applyChain and discard the
           // whole day's extraction+LLM spend.
@@ -483,7 +452,7 @@ export async function processBatch(
     if (o.kind === 'restricted') {
       log(`    ⛔ ${file.name}  RESTRICTED (403 — visible in listings, content not readable)`);
       filesRestricted++;
-      if (applyToDb) {
+      if (infraWrites) {
         try {
           const existing = await prisma.driveRestrictedFile.findUnique({
             where: { accountId_fileId: { accountId: ctx.accountId, fileId: file.id } },
@@ -725,10 +694,10 @@ export async function processBatch(
       // A probed file that fully extracted is restored — resolve its
       // worklist row; its observations just flowed through the normal
       // pipeline above.
-      if (probedFileIds.has(file.id)) {
+      if (restrictedRowIds.has(file.id)) {
         filesRestored++;
         log(`      🔓 previously restricted — now readable; worklist row resolved`);
-        if (applyToDb) {
+        if (infraWrites) {
           await prisma.driveRestrictedFile.updateMany({
             where: { accountId: ctx.accountId, fileId: file.id },
             data: { status: 'resolved', resolvedAt: new Date(), lastProbedAt: new Date() },
@@ -876,7 +845,7 @@ export async function processBatch(
   if (ideaCtx && ideaCtx.stats.deckFiles > 0) {
     const i = ideaCtx.stats;
     log(
-      `    Ideas: ${i.deckFiles} deck file(s) → ${i.ideasCreated} created, ${i.ideasUpdated} updated, ${i.ideasUnchanged} unchanged${i.ideaErrors > 0 ? `, ${i.ideaErrors} error(s)` : ''}${applyToDb ? '' : ' (dryrun — not persisted)'}`,
+      `    Ideas: ${i.deckFiles} deck file(s) → ${i.ideasCreated} created, ${i.ideasUpdated} updated, ${i.ideasUnchanged} unchanged${i.ideaErrors > 0 ? `, ${i.ideaErrors} error(s)` : ''}${infraWrites ? '' : ' (dryrun — not persisted)'}`,
     );
   }
   if (legacyCampaignBucket.length > 0 && !attributor) {
@@ -1072,6 +1041,90 @@ export async function processBatch(
     // can't be preempted by another worker — each entity's block is
     // atomic in the output, even though entity order may not match
     // input order.
+
+    // Facts already captured for a target: stored status bullets (both
+    // tiers, Context + surviving Transient) plus note items already
+    // awaiting review. Fed to distillation on the propose path so a
+    // re-observed fact never reaches the reviewer a second time.
+    //
+    // Expired transient bullets are pruned first, same as synthesis does
+    // (D23) — a bullet whose time has passed no longer states a current
+    // fact, so re-observing it IS news.
+    //
+    // ── Partitioning the shared account card ─────────────────────────────
+    // New candidates have no DB row, so their items ride the ACCOUNT card
+    // alongside the account's own — several distinct pending rows under one
+    // key, told apart only by the candidate marker. Both directions matter:
+    // an account target must not be handed a candidate's facts (they're
+    // about a campaign that doesn't exist yet), and a candidate must not be
+    // handed a sibling's. Without the partition the result would even depend
+    // on worker scheduling — targets run 8-wide and the propose write happens
+    // inside them, so siblings read this card while others are writing it.
+    const collectKnownFacts = async (
+      target: Target,
+      distillEntityType: 'account' | 'campaign',
+    ): Promise<string[]> => {
+      // ── New candidate: no row, so no doc and no target-keyed pending ────
+      // Its own prior items are on the account card. Keep the ones bearing
+      // THIS candidate's marker and strip it, so distillation compares fact
+      // against fact rather than fact against fact-with-a-location-tag.
+      //
+      // Only works from the second scan onward — the first scan is what
+      // creates the items to compare against. True of every target, but for
+      // candidates it's the whole mechanism: there's no status doc to fall
+      // back on.
+      if (!target.entityId) {
+        const accountPending = await loadPendingNoteTexts({
+          entityType: 'account',
+          accountId: ctx.accountId,
+          campaignId: null,
+        });
+        return Array.from(
+          new Set(
+            accountPending
+              .map((text) => stripNewCandidateMarker(text, target.entityName))
+              .filter((text): text is string => text !== null),
+          ),
+        );
+      }
+
+      const bulletsFrom = (stored: string | null): string[] => {
+        if (!stored) return [];
+        const sections = [
+          extractContextSection(stored),
+          pruneExpiredTransientBullets(extractTransientSection(stored), editedAt),
+        ];
+        return sections
+          .filter((body): body is string => !!body)
+          .flatMap((body) => body.split('\n'))
+          .map((line) => line.trim().replace(/^-\s*/, '').trim())
+          .filter((line) => line.length > 0);
+      };
+
+      // Same (accountId, campaignId) resolution proposeTarget uses to
+      // write the row — the lookup has to match where the notes land.
+      const pendingRaw = await loadPendingNoteTexts({
+        entityType: distillEntityType,
+        accountId: distillEntityType === 'account' ? target.entityId : ctx.accountId,
+        campaignId: distillEntityType === 'campaign' ? target.entityId : null,
+      });
+      // The other half of the partition: an account's pending set includes
+      // every candidate's marked items, which are about campaigns that don't
+      // exist yet. They must not suppress an account-level observation.
+      const pending =
+        distillEntityType === 'account'
+          ? pendingRaw.filter((text) => !hasNewCandidateMarker(text))
+          : pendingRaw;
+
+      return Array.from(
+        new Set([
+          ...bulletsFrom(target.priorStatusMarkdown),
+          ...bulletsFrom(target.priorSensitiveMarkdown),
+          ...pending,
+        ]),
+      );
+    };
+
     const synthesizeTarget = async (target: Target): Promise<EntitySynthesisResult> => {
       const lineBuffer: string[] = [];
       const wlog = (line = ''): void => {
@@ -1098,6 +1151,7 @@ export async function processBatch(
       // review-gated pipeline's writers, not this engine's.
       let distillResult: EntitySynthesisResult['distillResult'] = null;
       let validatedChanges: ValidatedChange[] = [];
+      let distilledNotes: Array<{ text: string; source_file_ids: string[] }> = [];
       if (target.entityType === 'piece') {
         // Pieces are markdown-only: no writable fields → nothing to distill.
         // Observations flow straight into synthesis below.
@@ -1112,13 +1166,37 @@ export async function processBatch(
           target.entityType === 'account'
             ? target.accountState
             : (target.campaignState ?? EMPTY_CAMPAIGN_STATE);
+        // ── Already-on-record set (propose path only) ─────────────────
+        // Review sits between distillation and synthesis on the propose
+        // path, so the synthesis merge — which is what normally drops a
+        // re-observed fact (status-synthesis "Merge operations (D25)"
+        // rule A) — no longer runs before a human is asked. Hand the
+        // recorded facts to distillation instead, so a restatement never
+        // becomes a card. Two sources: the entity's stored bullets, and
+        // note items already awaiting a decision.
+        //
+        // Deliberately empty on the apply/dryrun paths: synthesis runs in
+        // the same pass there and already handles this, and backfill
+        // output stays byte-faithful for the dryrun tool.
+        const knownFacts =
+          application === 'propose'
+            ? await timed('known-facts', () =>
+                collectKnownFacts(target, distillEntityType),
+              )
+            : [];
+        if (knownFacts.length > 0) {
+          wlog(`      already on record: ${knownFacts.length} fact(s) — restatements suppressed`);
+        }
+
         const dry = await timed('distill', () =>
-          runDryRunDistillation(
+          runDistillation(
             distillEntityType,
             target.observations,
             baseState,
+            knownFacts,
           ),
         );
+        distilledNotes = dry.notes.map((n) => ({ text: n.text, source_file_ids: n.source_file_ids }));
         distillResult = {
           proposalsCreated: dry.field_changes.length,
           notesWritten: dry.notes.length,
@@ -1168,11 +1246,13 @@ export async function processBatch(
             previousValue: currentValue,
             proposedValueRaw: fc.proposed_value ?? null,
             confidence: fc.confidence,
+            reasoning: fc.reasoning ?? null,
+            sourceFileIds: fc.source_file_ids ?? [],
           });
         }
 
         const verb = target.entityStatus === 'new' ? 'would propose' : 'would update';
-        const persistTag = applyToDb ? '' : ' (dryrun — not persisted)';
+        const persistTag = applyToDb ? '' : application === 'propose' ? ' (→ review proposals)' : ' (dryrun — not persisted)';
         wlog(
           `      ${verb}: ${validatedChanges.length} field changes${invalidCount > 0 ? ` (${invalidCount} invalid)` : ''}${noOpCount > 0 ? ` (${noOpCount} no-op)` : ''}, ${dry.notes.length} notes  [${dry.driver}]${persistTag}`,
         );
@@ -1204,6 +1284,44 @@ export async function processBatch(
       }
 
       // ── Synthesize (dual-output: general + sensitive) ───────────────
+      // ── PROPOSE path (forward): review applies, we don't ─────────────
+      // Field changes + notes validated above become review proposals;
+      // synthesis is deferred to GUB applyDecisions on approval (D7).
+      // Piece targets fall through to normal synthesis — their markdown
+      // is an automatic ratchet (Q5), and their rollup reaches the
+      // campaign's review card via the absorb-up observation.
+      if (application === 'propose' && target.entityType !== 'piece') {
+        try {
+          await timed('propose', () =>
+            proposeTarget({
+              ctx,
+              entityType: target.entityType === 'account' ? 'account' : 'campaign',
+              entityStatus:
+                target.entityStatus === 'piece' ? 'existing' : target.entityStatus,
+              entityId: target.entityId,
+              entityName: target.entityName,
+              validatedChanges,
+              notes: distilledNotes,
+            }),
+          );
+        } catch (err) {
+          stage3Failures++;
+          wlog(`      ✗ propose failed: ${summarizeError(err)}`);
+        }
+        for (const line of lineBuffer) log(line);
+        return {
+          entityType: target.entityType,
+          entityName: target.entityName,
+          entityStatus: target.entityStatus,
+          observationsCount: target.observations.length,
+          filesCount: target.fileIds.size,
+          distillResult,
+          synthesizedMarkdown: '(proposed for review — synthesis at applyDecisions)',
+          synthesizedSensitiveMarkdown: null,
+          synthesisMs: 0,
+        };
+      }
+
       const synthStart = Date.now();
       let synthFailed = false;
       let synthesizedMarkdown: string;
@@ -1254,7 +1372,7 @@ export async function processBatch(
         });
         const res = await timed('synthesis', () =>
           defaultLlm.complete({
-            model: 'gemini-3.5-flash',
+            model: DEFAULT_GEMINI_MODEL,
             temperature: 0.2,
             prompt: renderedPrompt,
             tag: `backfill.${STATUS_SYNTHESIS_V1_VERSION}`,
@@ -1292,6 +1410,7 @@ export async function processBatch(
         // with "(synthesis failed…)", and since the cursor still advances,
         // the day would never re-run to restore it.
         synthFailed = true;
+        stage3Failures++;
         synthesizedMarkdown = `(synthesis failed: ${summarizeError(err)})`;
       }
       const synthesisMs = Date.now() - synthStart;
@@ -1300,7 +1419,9 @@ export async function processBatch(
       );
 
       // ── Apply (unless --dryrun) ─────────────────────────────────────
-      if (applyToDb) {
+      // Pieces persist whenever writes are on (automatic ratchet, Q5);
+      // account/campaign only in 'apply' mode (propose returned above).
+      if (target.entityType === 'piece' ? infraWrites : applyToDb) {
         if (synthFailed) {
           wlog("      ✗ NOT applied — synthesis failed; keeping the entity's prior status_markdown");
         } else {
@@ -1316,6 +1437,7 @@ export async function processBatch(
             );
             wlog('      ✓ applied (system-staff attribution)');
           } catch (err) {
+            stage3Failures++;
             wlog(`      apply failed: ${summarizeError(err)}`);
           }
         }
@@ -1423,6 +1545,7 @@ export async function processBatch(
     accountLevelFiles,
     campaignObsDiscarded,
     synthesized,
+    stage3Failures,
     ideaStats: ideaCtx?.stats ?? null,
   };
 }

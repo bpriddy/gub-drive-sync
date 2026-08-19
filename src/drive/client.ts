@@ -28,6 +28,7 @@
 import { google, type drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
 import { logger } from '../logger';
+import { withTransientRetry } from './retry';
 import { buildBotOAuthClient } from '../workspace';
 
 const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
@@ -393,6 +394,36 @@ export async function listSharedDriveFiles(
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);
   return out;
+}
+
+/**
+ * Fetch one file's metadata (FILE_FIELDS) by id. Returns null on 404 /
+ * gone — the forward driver treats vanished files as skips (the
+ * Activity window may reference items deleted moments later).
+ *
+ * Retries transient transport faults (5xx, dropped sockets); rate limits
+ * are already retried inside the limiter. Anything still failing after
+ * that has had sufficient effort spent on it and propagates — callers
+ * decide whether to lose the file or fail the run.
+ */
+export async function getFileMetadata(
+  fileId: string,
+): Promise<drive_v3.Schema$File | null> {
+  const client = await driveClient();
+  try {
+    const res = await withTransientRetry(() =>
+      driveLimiter.run(() =>
+        client.files.get({ fileId, fields: FILE_FIELDS, supportsAllDrives: true }),
+      ),
+    );
+    return res.data;
+  } catch (err) {
+    const status =
+      (err as { code?: number; response?: { status?: number } }).code ??
+      (err as { response?: { status?: number } }).response?.status;
+    if (status === 404) return null;
+    throw err;
+  }
 }
 
 /**

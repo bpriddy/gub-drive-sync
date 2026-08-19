@@ -16,10 +16,10 @@
 
 import { z } from 'zod';
 import { SchemaType, type ResponseSchema } from '../ai';
-import { defaultLlm } from '../ai';
+import { defaultLlm, DEFAULT_GEMINI_MODEL } from '../ai';
 import { parseLlmJson } from '../ai/prompt-preset.service';
 
-const MODEL = 'gemini-3.5-flash';
+const MODEL = DEFAULT_GEMINI_MODEL;
 // Thinking tokens count against this cap (see cluster-detector) — keep generous.
 const MAX_OUTPUT_TOKENS = 16384;
 /** Names are cheap but unbounded folders exist (photo dumps); cap the listing. */

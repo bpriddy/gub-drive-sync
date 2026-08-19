@@ -29,7 +29,7 @@
 
 import { z } from 'zod';
 import { logger } from '../logger';
-import { defaultLlm, parseLlmJson } from '../ai';
+import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
 import { listAllFoldersInDrive, listSubfolders, probeFolder, type DriveFolderRec } from './client';
 import { structureResolutionResponseSchema } from './structured-output';
 
@@ -37,7 +37,7 @@ import { structureResolutionResponseSchema } from './structured-output';
 // an infinite-recursion bug, matching traversal.ts's cap.
 const MAX_DEPTH = 100;
 
-const STRUCTURE_MODEL = 'gemini-3.5-flash';
+const STRUCTURE_MODEL = DEFAULT_GEMINI_MODEL;
 const STRUCTURE_TEMPERATURE = 0.2;
 // gemini-3.5-flash thinking tokens count against maxOutputTokens; too low a cap
 // truncates the structured-output JSON before it closes. 16384 (the floor used

@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
-import { log } from './output';
+import { log } from '../scan/output';
 import type { TraversedFile } from '../drive/types';
 
 // ── Cursor + date-grouping helpers ───────────────────────────────────────────

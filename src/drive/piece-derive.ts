@@ -26,12 +26,12 @@
 import { z } from 'zod';
 import { SchemaType, type ResponseSchema } from '../ai';
 import { prisma } from '../prisma';
-import { defaultLlm, parseLlmJson } from '../ai';
+import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
 import { logger } from '../logger';
 import { assembleStatusMarkdown } from './status-synthesis';
 import { extractJobNumber } from './job-number';
 
-const MODEL = 'gemini-3.5-flash';
+const MODEL = DEFAULT_GEMINI_MODEL;
 const TEMPERATURE = 0.1;
 // gemini-3.5-flash thinking tokens count against this cap — keep generous.
 const MAX_OUTPUT_TOKENS = 16384;

@@ -1,5 +1,5 @@
-// Part of the backfill engine (see index.ts). Extracted verbatim from the
-// former scripts/backfill.ts monolith — behavior-preserving reorganization.
+// Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
+// by every driver (day-walk backfill today; the Activity forward driver next).
 // ── Concurrency helper ───────────────────────────────────────────────────────
 //
 // Worker-pool over an array. N workers race for the next index from a
