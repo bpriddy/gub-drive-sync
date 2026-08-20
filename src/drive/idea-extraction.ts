@@ -27,6 +27,7 @@ import { z } from 'zod';
 import { SchemaType, type ResponseSchema } from '../ai';
 import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
 import { logger } from '../logger';
+import { MARKER_GRAMMAR_PROMPT_NOTE } from './extract-markers';
 import type { TraversedFile } from './types';
 
 const MODEL = DEFAULT_GEMINI_MODEL;
@@ -102,6 +103,9 @@ FILE CONTENT:
 """
 ${args.fileText}
 """
+
+NOTE ON FILE CONTENT: ${MARKER_GRAMMAR_PROMPT_NOTE}
+For idea mining that means a [bracketed] creative visual can itself be the idea or carry its facets — a described key visual, poster, or chart is content the deck's authors presented, exactly like the copy around it. Do NOT discard bracketed lines, and treat "## Page N" in a PDF export the same as "## Slide N" in a native deck. The markers change nothing about the gate below: what counts as a pitch or creative-review deck is unchanged.
 
 STEP 1 — WHAT KIND OF DECK IS THIS?  (deck_type)
 Ideas live in exactly TWO kinds of artifact, and NOWHERE else:
