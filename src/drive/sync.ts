@@ -158,15 +158,20 @@ async function processFile(
   const outcome = await extractText(file);
 
   if (outcome.kind === 'skip') {
+    // out_of_scope_image (C2 / #35) buckets with the mime skips: it's the
+    // same "this file type isn't extracted here" family, and ScanLogCategory
+    // is DB-CHECK-constrained — a new category needs a migration. The real
+    // reason survives in the message + snapshot skipReason.
     const category: ScanLogCategory =
       outcome.reason === 'too_large'
         ? 'skipped_size'
-        : outcome.reason === 'unsupported_mime'
+        : outcome.reason === 'unsupported_mime' || outcome.reason === 'out_of_scope_image'
           ? 'skipped_mime'
           : 'diagnostic';
 
     if (outcome.reason === 'too_large') result.filesSkippedSize++;
-    else if (outcome.reason === 'unsupported_mime') result.filesSkippedMime++;
+    else if (outcome.reason === 'unsupported_mime' || outcome.reason === 'out_of_scope_image')
+      result.filesSkippedMime++;
     else if (outcome.reason === 'empty') result.filesEmpty++;
 
     // Folder/empty/etc. still deserve a snapshot for history; only log the

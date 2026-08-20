@@ -24,6 +24,13 @@
  *       extract-vision.ts for the gates and the failure posture
  *     - application/vnd.openxmlformats-…wordprocessingml.document  → mammoth (.docx)
  *     - text/* (plaintext, markdown, csv, etc.) → direct download (extractor='plaintext')
+ *     - image/* (PNG/JPEG/WEBP/HEIC/HEIF only) → Gemini image understanding
+ *       (extractor='vision-image'), issue C2 / #35. Scope-gated by the
+ *       CALLER via opts.allowImageVision — only the scan worker knows piece
+ *       scope — and by DRIVE_IMAGE_VISION_ENABLED (default off: dark launch
+ *       keeps the pre-C2 unsupported_mime behavior). Out-of-scope images
+ *       skip with reason='out_of_scope_image'. Unlike PDF vision there is
+ *       NO text fallback: vision gates/failures are skips, never throws.
  *
  *   Anything else → skip with reason='unsupported_mime'.
  *
@@ -44,7 +51,12 @@ import {
 import { config } from '../config';
 import { logger } from '../logger';
 import { downloadFileBuffer } from './client';
-import { tryVisionPdfExtraction } from './extract-vision';
+import {
+  imageVisionRuntimeAvailable,
+  tryVisionImageExtraction,
+  tryVisionPdfExtraction,
+} from './extract-vision';
+import { isVisionEligibleImageMime } from './image-mimes';
 import { buildBotOAuthClient } from '../workspace';
 import type { ExtractionOutcome, ExtractionSkip, TraversedFile } from './types';
 
@@ -136,6 +148,21 @@ function tooLargeForBinaryDownload(file: TraversedFile): ExtractionSkip | null {
 }
 
 /**
+ * Caller-supplied scope decision for image/* files (issue C2 / #35).
+ * Piece scope, count caps, and the relevance floor live in the scan
+ * worker — the only call site that knows which piece owns a file — so
+ * extractText can't compute them; it just honors the verdict. Callers
+ * that pass nothing get allowImageVision=false, i.e. images stay gated.
+ */
+export interface ExtractOptions {
+  /** True only when the scan worker granted this image the vision path. */
+  allowImageVision?: boolean;
+  /** Why the worker denied it — threaded into the out_of_scope_image
+   *  skip's detail (e.g. 'no_piece_scope', 'per_piece_cap'). */
+  imageSkipDetail?: string;
+}
+
+/**
  * Pure metadata-only check: would extractText skip this file without
  * doing any I/O? Returns the skip outcome if so, null if the file is
  * extraction-eligible (or would fail with a network/parse error, which
@@ -144,10 +171,13 @@ function tooLargeForBinaryDownload(file: TraversedFile): ExtractionSkip | null {
  * Mirrors the bail-outs in extractText so callers can predict the
  * outcome without any I/O.
  * Both predictExtractionSkip and extractText route through the same
- * decision tree — extractText calls this first, then proceeds to the
- * extraction switch only on null.
+ * decision tree — extractText calls this first (with the SAME opts),
+ * then proceeds to the extraction switch only on null.
  */
-export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | null {
+export function predictExtractionSkip(
+  file: TraversedFile,
+  opts?: ExtractOptions,
+): ExtractionSkip | null {
   if (file.isFolder) return { kind: 'skip', reason: 'folder' };
 
   // Shortcut resolution — mirror extractText's three early-exit cases.
@@ -211,6 +241,44 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
     }
 
     default:
+      // ── image/* (issue C2 / #35) ────────────────────────────────────
+      // Lockstep with extractText's image case AND the gates inside
+      // tryVisionImageExtraction: whatever skip the runtime would return
+      // for metadata-visible reasons is predicted here.
+      if (isVisionEligibleImageMime(effective.mimeType)) {
+        // Dark launch / mock driver: byte-identical to pre-C2 — a plain
+        // unsupported_mime with the mime as detail.
+        if (!imageVisionRuntimeAvailable()) {
+          return { kind: 'skip', reason: 'unsupported_mime', detail: effective.mimeType };
+        }
+        // Scope is the caller's verdict (piece folder + caps + relevance
+        // floor, computed in the scan worker). No opts = not granted.
+        if (!opts?.allowImageVision) {
+          return {
+            kind: 'skip',
+            reason: 'out_of_scope_image',
+            ...(opts?.imageSkipDetail ? { detail: opts.imageSkipDetail } : {}),
+          };
+        }
+        // Size gates, mirroring tryVisionImageExtraction's byte cap from
+        // Drive's size metadata (no fallback → out_of_scope_image, not
+        // too_large: the file still feeds the name-only asset path).
+        if (effective.size && effective.size > config.DRIVE_IMAGE_MAX_FILE_SIZE_BYTES) {
+          return {
+            kind: 'skip',
+            reason: 'out_of_scope_image',
+            detail: `over_size_cap size=${effective.size} limit=${config.DRIVE_IMAGE_MAX_FILE_SIZE_BYTES}`,
+          };
+        }
+        if (isShortcutFollow && effective.size == null) {
+          return {
+            kind: 'skip',
+            reason: 'shortcut_unverified_size',
+            detail: `${effective.mimeType} via shortcut (target id=${effective.id}); shortcutDetails has no size`,
+          };
+        }
+        return null;
+      }
       if (effective.mimeType.startsWith('text/')) {
         const tooLarge = tooLargeForBinaryDownload(effective);
         if (tooLarge) return tooLarge;
@@ -227,9 +295,12 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
   }
 }
 
-export async function extractText(file: TraversedFile): Promise<ExtractionOutcome> {
+export async function extractText(
+  file: TraversedFile,
+  opts?: ExtractOptions,
+): Promise<ExtractionOutcome> {
   // Single source of truth for skip-without-I/O decisions.
-  const predicted = predictExtractionSkip(file);
+  const predicted = predictExtractionSkip(file, opts);
   if (predicted) return predicted;
 
   // Resolve the shortcut to its target. predictExtractionSkip already
@@ -317,6 +388,19 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
         return ok(text, 'pptx');
       }
       default: {
+        // ── image/* (issue C2 / #35) ──────────────────────────────────
+        // Reaching here means predictExtractionSkip said eligible: the
+        // runtime gate is open AND the caller granted scope. Images have
+        // NO text fallback (unlike the PDF vision branch above), so every
+        // gate/failure inside tryVisionImageExtraction returns a SKIP,
+        // never a throw — an unreadable image must never fail the scan.
+        // downloadFileBuffer errors still propagate on purpose: a 403
+        // here feeds the restricted-file worklist like any other binary.
+        if (isVisionEligibleImageMime(effectiveFile.mimeType)) {
+          const buf = await downloadFileBuffer(effectiveFile.id);
+          const vision = await tryVisionImageExtraction(effectiveFile, buf);
+          return typeof vision === 'string' ? ok(vision, 'vision-image') : vision;
+        }
         if (effectiveFile.mimeType.startsWith('text/')) {
           const buf = await downloadFileBuffer(effectiveFile.id);
           return ok(buf.toString('utf-8'), 'plaintext');
