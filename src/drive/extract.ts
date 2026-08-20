@@ -189,7 +189,7 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
     // failures fall back to the text-layer path; they never produce a
     // skip, so the predictor's PDF answer is unchanged. If a future
     // change makes vision produce a skip outcome, it MUST be mirrored
-    // here (the lockstep test in extract.test.ts pins the agreement).
+    // here (the lockstep test in __tests__/extract.test.ts pins the agreement).
     case MIME.PDF:
     case MIME.DOCX:
     case MIME.PPTX: {

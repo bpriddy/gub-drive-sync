@@ -56,7 +56,7 @@ vi.mock('googleapis', () => ({
   },
 }));
 
-vi.mock('../workspace', () => ({
+vi.mock('../../workspace', () => ({
   buildBotOAuthClient: buildBotOAuthClientMock,
 }));
 
@@ -75,15 +75,15 @@ const { mockConfig, CONFIG_DEFAULTS } = vi.hoisted(() => {
   return { mockConfig: { ...CONFIG_DEFAULTS }, CONFIG_DEFAULTS };
 });
 
-vi.mock('../config', () => ({
+vi.mock('../../config', () => ({
   config: mockConfig,
 }));
 
-vi.mock('../logger', () => ({
+vi.mock('../../logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock('./client', () => ({
+vi.mock('../client', () => ({
   downloadFileBuffer: vi.fn(),
 }));
 
@@ -94,9 +94,9 @@ const { llmComplete, llmDriver } = vi.hoisted(() => {
   return { llmComplete, llmDriver: { name: 'gemini', complete: llmComplete } };
 });
 
-// Mocking '../ai' also keeps its prisma-importing preset service out of
+// Mocking '../../ai' also keeps its prisma-importing preset service out of
 // the unit suite (hermeticity — see the CI note in the repo history).
-vi.mock('../ai', () => ({
+vi.mock('../../ai', () => ({
   defaultLlm: llmDriver,
   DEFAULT_GEMINI_MODEL: 'gemini-3.5-flash',
 }));
@@ -166,9 +166,9 @@ import {
   extractGoogleDoc,
   extractGoogleSlides,
   extractGoogleSheets,
-} from './extract';
-import { downloadFileBuffer } from './client';
-import type { TraversedFile } from './types';
+} from '../extract';
+import { downloadFileBuffer } from '../client';
+import type { TraversedFile } from '../types';
 
 /** Minimal TraversedFile factory for the dispatch/vision/lockstep tests. */
 function makeFile(overrides: Partial<TraversedFile>): TraversedFile {
