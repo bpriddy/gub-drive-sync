@@ -54,6 +54,44 @@ const EnvSchema = z.object({
    */
   GEMINI_LOCATION: z.string().default('global'),
   GEMINI_MAX_INPUT_CHARS: z.string().default('40000').transform(Number),
+
+  // ── Vision extraction (issue C1 / #34) ──────────────────────────────────
+  // PDFs go through Gemini document understanding ("vision") first, with
+  // automatic fallback to the text-layer parser (unpdf) on ANY vision
+  // failure. Docs/Sheets/Slides are untouched (native APIs beat OCR).
+  /** Kill switch: 'false' routes all PDFs straight to the text-layer path. */
+  DRIVE_VISION_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  /** Override the vision model. Empty/unset → DEFAULT_GEMINI_MODEL. */
+  DRIVE_VISION_MODEL: z.string().optional(),
+  /**
+   * Raw-byte cap for the vision path (NOT the download cap — that stays
+   * DRIVE_MAX_FILE_SIZE_BYTES). The API rejects inline requests over
+   * 20 MB TOTAL and base64 inflates bytes by 4/3, so 14 MB raw ≈ 18.7 MB
+   * encoded + prompt headroom. Bigger PDFs fall back to the text path.
+   */
+  DRIVE_VISION_MAX_FILE_SIZE_BYTES: z.string().default('14680064').transform(Number),
+  /**
+   * Page cap for the vision path (API hard limit is 1000 pages; each page
+   * costs ~258 input tokens + output scales with density). Above the cap
+   * we fall back to the text path — long PDFs are overwhelmingly
+   * text-layer documents anyway; vision's win is dense visual decks.
+   */
+  DRIVE_VISION_MAX_PDF_PAGES: z.string().default('50').transform(Number),
+  /**
+   * Output cap for the vision transcription. gemini-3.5-flash thinking
+   * tokens count against this cap (see campaign-cluster-detector.ts for
+   * the truncation failure mode) — keep it generous; the model max is 65k.
+   */
+  DRIVE_VISION_MAX_OUTPUT_TOKENS: z.string().default('32768').transform(Number),
+  /**
+   * Per-file transport timeout for the vision call. A hung multimodal
+   * request must not stall the whole scan — on timeout we fall back to
+   * the text path like any other vision failure.
+   */
+  DRIVE_VISION_TIMEOUT_MS: z.string().default('180000').transform(Number),
   /**
    * Worker-pool concurrency for the per-entity distill+synth+write loop
    * inside processBatch. Each entity owns a discrete status_markdown blob

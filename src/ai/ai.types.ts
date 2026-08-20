@@ -36,6 +36,22 @@ export interface LlmCompletionRequest {
    * thinkingBudget — set at most one.
    */
   thinkingLevel?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH';
+  /**
+   * Inline binary media (e.g. a PDF for Gemini document understanding).
+   * Each entry is sent as an inlineData Part AHEAD of the text prompt.
+   * The API caps the TOTAL request (prompt + base64-encoded media) at
+   * 20 MB — callers must enforce a lower cap on raw bytes, since base64
+   * inflates by 4/3. The mock driver ignores media entirely, so callers
+   * that need real content (vision extraction) must not treat a mock
+   * response as an extraction.
+   */
+  media?: Array<{ mimeType: string; dataBase64: string }>;
+  /**
+   * Per-request transport timeout in ms. Bounds slow multimodal calls
+   * (vision extraction of many-page PDFs) without changing the
+   * client-wide default for ordinary text completions.
+   */
+  timeoutMs?: number;
 }
 
 export interface LlmUsage {
