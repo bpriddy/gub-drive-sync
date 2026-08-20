@@ -38,6 +38,12 @@
  * markers (slide titles, sheet names, doc title) so downstream Gemini sees
  * structural signal — slide boundaries, speaker notes, sheet boundaries —
  * not just a wall of text.
+ *
+ * The marker grammar the walkers emit ("# <title>", "## Slide N",
+ * "## Sheet: <name>", "### Speaker notes", tab-separated table rows) is
+ * documented in extract-markers.ts — the single source of truth shared
+ * with extract-vision.ts, the consumer prompts, and the contract test
+ * (issue C3 / #36). Keep the walkers and that grammar in lockstep.
  */
 
 import crypto from 'node:crypto';

@@ -32,7 +32,12 @@
  *
  * Output contract: the SAME flat marked-up text the Google-native
  * walkers emit (`# Title`, `## <section>` markers, tab-separated table
- * rows) so downstream interpret.ts consumes it unchanged.
+ * rows) so downstream interpret.ts consumes it unchanged. The full
+ * marker grammar — including `## Page N` as the PDF-side equivalent of
+ * `## Slide N`, and `[bracketed]` one-line visual descriptions — lives
+ * in extract-markers.ts (issue C3 / #36); the contract test pins that
+ * vision-shaped output satisfies it. Keep the prompts below and that
+ * grammar in lockstep.
  */
 
 import { config } from '../config';
