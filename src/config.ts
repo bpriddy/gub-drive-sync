@@ -92,6 +92,39 @@ const EnvSchema = z.object({
    * the text path like any other vision failure.
    */
   DRIVE_VISION_TIMEOUT_MS: z.string().default('180000').transform(Number),
+
+  // ── Image vision extraction (issue C2 / #35) ─────────────────────────────
+  // image/* files inside FOLDER-BACKED PIECE FOLDERS go through Gemini image
+  // understanding, behind size/count caps and a metadata relevance floor.
+  // Everything else skips as out_of_scope_image. Unlike the PDF path there
+  // is NO text fallback — a vision gate/failure is a skip, never a scan
+  // failure. Ships dark: widen scope only after the yield table justifies it.
+  /** Dark-launch master switch — default OFF. While off, image/* behaves
+   *  byte-identically to pre-C2 (plain unsupported_mime skips). */
+  DRIVE_IMAGE_VISION_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  /**
+   * Raw-byte cap for the image vision call. Same rationale (and default)
+   * as DRIVE_VISION_MAX_FILE_SIZE_BYTES: the API rejects inline requests
+   * over 20 MB TOTAL and base64 inflates by 4/3, so 14 MB raw ≈ 18.7 MB
+   * encoded + prompt headroom. Over-cap images skip (no fallback).
+   */
+  DRIVE_IMAGE_MAX_FILE_SIZE_BYTES: z.string().default('14680064').transform(Number),
+  /**
+   * Metadata relevance floor (the MVP relevance gate): images smaller than
+   * this are overwhelmingly chrome — icons, favicons, tiny logo cuts — not
+   * deliverables. They skip as out_of_scope_image without an LLM call. The
+   * batched LLM relevance classifier stays a documented later lever, gated
+   * on the yield measurement.
+   */
+  DRIVE_IMAGE_MIN_FILE_SIZE_BYTES: z.string().default('10240').transform(Number),
+  /** Count cap per piece per processed batch (= one scan day) — a piece
+   *  folder dumping 300 exports must not burn 300 vision calls. */
+  DRIVE_IMAGE_MAX_PER_PIECE: z.string().default('10').transform(Number),
+  /** Safety cap on image vision calls per processed batch, across pieces. */
+  DRIVE_IMAGE_MAX_PER_BATCH: z.string().default('50').transform(Number),
   /**
    * Worker-pool concurrency for the per-entity distill+synth+write loop
    * inside processBatch. Each entity owns a discrete status_markdown blob

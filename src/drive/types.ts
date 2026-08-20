@@ -61,6 +61,13 @@ export interface ExtractionSkip {
      *  size, and downloading a multi-hundred-MB binary just to discover
      *  it exceeds the cap is the OOM vector we're guarding. */
     | 'shortcut_unverified_size'
+    /** Image vision (issue C2 / #35) is scoped to folder-backed piece
+     *  folders behind size/count caps and a relevance floor. Any image the
+     *  worker did NOT grant scope to — outside a piece folder, over a cap,
+     *  under the relevance floor — skips with this reason (detail says
+     *  which gate). Only emitted while DRIVE_IMAGE_VISION_ENABLED is on;
+     *  dark-launched images keep skipping as plain unsupported_mime. */
+    | 'out_of_scope_image'
     | 'empty'
     | 'delta_unchanged';
   detail?: string;

@@ -45,6 +45,7 @@ import type { TraversedFile } from '../drive/types';
 import { config } from '../config';
 import { log, fmtBytes, fmtMs } from './output';
 import { timed } from './timing';
+import { planImageVision, NO_PIECE_SCOPE } from './image-vision-plan';
 import { runWithConcurrency } from './util';
 import { isForeignCampaignTag, routeCampaignObs, isDrivePermissionError, EMPTY_CAMPAIGN_STATE } from './routing';
 import {
@@ -224,6 +225,25 @@ export async function processBatch(
   /** Tagged campaign obs whose name fuzzy-matched (Levenshtein) to a known campaign — logged for visibility. */
   let fuzzyMatchedObs = 0;
 
+  // ── Image-vision yield counters (issue C2 / #35) ─────────────────────────
+  // The measurement that gates widening image scope beyond piece folders.
+  // Tracked even while DRIVE_IMAGE_VISION_ENABLED=false (dark), where they
+  // report what WOULD have been extracted.
+  /** Vision-eligible images whose piece scope resolved (the C2 population). */
+  let imagesInPieceScope = 0;
+  /** Images that extracted via vision (extractor='vision-image'). */
+  let imagesExtracted = 0;
+  /** Extracted images whose interpretation produced ≥1 observation. */
+  let imagesWithObs = 0;
+  /** out_of_scope_image skips from the scope gate (no piece folder). */
+  let imagesSkippedOutOfScope = 0;
+  /** out_of_scope_image skips from caps / the relevance floor. */
+  let imagesSkippedByCaps = 0;
+  /** Vision call failed (detail-tagged unsupported_mime — name-only path). */
+  let imagesVisionFailed = 0;
+  /** Vision returned an empty transcription (chrome — the implicit relevance check). */
+  let imagesVisionEmpty = 0;
+
   // Binaries-only folders: when EVERY file in a folder skips extraction on
   // mime (fonts, images, video), the per-file prompt never sees the folder
   // — but path + file names are still evidence ("Fonts/Louis-Bold.ttf"
@@ -328,10 +348,48 @@ export async function processBatch(
     };
   }
 
+  // ── Image-vision scope plan (issue C2 / #35) ──────────────────────────
+  // Computed for the WHOLE batch in file-index order BEFORE the pool runs,
+  // so per-piece/per-batch cap allocation never depends on worker
+  // scheduling (the pool's applyOutcome determinism doctrine). Piece scope
+  // comes from attribution.pieceId (account scans — piece-anchor overlay)
+  // or file.pieceId (campaign scans — tagged at discovery when gathering
+  // piece folders); both are folder-backed pieces. Content-born pieces
+  // (piece-derive.ts) have no driveFolderId → invisible to this gate.
+  const imageVisionPlan = planImageVision(
+    batch,
+    (file) => {
+      const attribution = resolveAttribution(file);
+      if (attribution.pieceId) return attribution.pieceId;
+      if (file.pieceId && piecesById?.has(file.pieceId)) return file.pieceId;
+      return null;
+    },
+    {
+      minFileSizeBytes: config.DRIVE_IMAGE_MIN_FILE_SIZE_BYTES,
+      maxFileSizeBytes: config.DRIVE_IMAGE_MAX_FILE_SIZE_BYTES,
+      maxPerPiece: config.DRIVE_IMAGE_MAX_PER_PIECE,
+      maxPerBatch: config.DRIVE_IMAGE_MAX_PER_BATCH,
+    },
+  );
+  for (const gate of imageVisionPlan.values()) {
+    if (gate.pieceId !== null) imagesInPieceScope += 1;
+  }
+
   async function runFileWorker(file: TraversedFile): Promise<WorkerOutcome> {
     const attribution = resolveAttribution(file);
+    const imageGate = imageVisionPlan.get(file.id);
     try {
-      const extraction = await timed('extract_text', () => extractText(file));
+      const extraction = await timed('extract_text', () =>
+        extractText(
+          file,
+          imageGate
+            ? {
+                allowImageVision: imageGate.allowImageVision,
+                ...(imageGate.skipDetail ? { imageSkipDetail: imageGate.skipDetail } : {}),
+              }
+            : undefined,
+        ),
+      );
       if (extraction.kind !== 'ok') {
         return {
           file,
@@ -410,7 +468,23 @@ export async function processBatch(
       const detail = o.skipDetail ? ` (${o.skipDetail})` : '';
       log(`    ⊘ ${file.name}  [${file.mimeType}]  skip: ${o.skipReason}${detail}`);
       filesSkipped++;
-      if (o.skipReason === 'unsupported_mime') {
+      // C2 yield accounting. Cap/floor denials carry a detail token from
+      // the plan; a bare (or no_piece_scope) out_of_scope_image is the
+      // scope gate. Vision failures and empty transcriptions are tagged
+      // by extract-vision / ok() respectively.
+      if (o.skipReason === 'out_of_scope_image') {
+        if (o.skipDetail && o.skipDetail !== NO_PIECE_SCOPE) imagesSkippedByCaps++;
+        else imagesSkippedOutOfScope++;
+      } else if (o.skipReason === 'empty' && o.skipDetail === 'extractor=vision-image') {
+        imagesVisionEmpty++;
+      } else if (o.skipReason === 'unsupported_mime' && o.skipDetail?.startsWith('image_vision_failed')) {
+        imagesVisionFailed++;
+      }
+      // out_of_scope_image joins unsupported_mime here ON PURPOSE: images
+      // C2 does not extract must keep feeding the name-only
+      // binaryOnlyFolders → interpretAssetFolder path exactly as before
+      // (their filenames are still evidence).
+      if (o.skipReason === 'unsupported_mime' || o.skipReason === 'out_of_scope_image') {
         const folderKey = file.parents?.[0] ?? parentPathOf(file);
         const rec = binaryOnlyFolders.get(folderKey);
         if (rec) {
@@ -506,6 +580,10 @@ export async function processBatch(
 
     try {
       const totalObs = res.account.length + res.campaign.length;
+      if (o.extractor === 'vision-image') {
+        imagesExtracted++;
+        if (totalObs > 0) imagesWithObs++;
+      }
       const symbol = totalObs > 0 ? '✓' : '○';
       const attrLabel =
         attribution.ownerType === 'campaign'
@@ -799,6 +877,19 @@ export async function processBatch(
   }
   if (filesRestored > 0) {
     log(`  🔓 ${filesRestored} previously restricted file(s) restored this scan`);
+  }
+  // C2 yield summary — the numbers that decide whether image scope widens
+  // beyond piece folders. Emitted whenever the batch held any vision-
+  // eligible image; in dark mode (flag off) it reports the would-be scope.
+  if (imageVisionPlan.size > 0) {
+    log(
+      `  🖼 Image vision (C2): eligible ${imageVisionPlan.size} · in piece scope ${imagesInPieceScope} · ` +
+        `extracted ${imagesExtracted} · non-empty obs ${imagesWithObs} · ` +
+        `out-of-scope skips ${imagesSkippedOutOfScope} · cap/floor skips ${imagesSkippedByCaps}` +
+        (imagesVisionEmpty > 0 ? ` · empty transcriptions ${imagesVisionEmpty}` : '') +
+        (imagesVisionFailed > 0 ? ` · vision failures ${imagesVisionFailed}` : '') +
+        (config.DRIVE_IMAGE_VISION_ENABLED ? '' : '  (dark — DRIVE_IMAGE_VISION_ENABLED=false)'),
+    );
   }
   log('');
 

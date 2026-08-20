@@ -1,6 +1,6 @@
 /**
  * extract-vision.ts — Gemini document-understanding ("vision") extraction
- * for PDFs (issue C1 / #34).
+ * for PDFs (issue C1 / #34) and piece-scoped images (issue C2 / #35).
  *
  * The text-layer parser (unpdf) reads only the PDF's embedded text: it
  * loses layout, charts, and everything in image-set decks (a designed
@@ -17,10 +17,18 @@
  *     exports (the common agency case). Google Slides stays on the
  *     native Slides API (structured text beats OCR; see extract.ts).
  *
- * Failure posture: a vision failure must NEVER fail the scan or drop a
- * file. Every gate and error here returns null, and extract.ts falls
- * back to the text-layer path. There is no `vision_failed` skip reason
- * by design — vision failing is a downgrade, not a skip.
+ * Failure posture (PDF): a vision failure must NEVER fail the scan or
+ * drop a file. Every gate and error here returns null, and extract.ts
+ * falls back to the text-layer path. There is no `vision_failed` skip
+ * reason by design — vision failing is a downgrade, not a skip.
+ *
+ * Failure posture (image, C2): images have NO text fallback, so the image
+ * path is not skip-neutral the way the PDF path is. A gate-off returns
+ * the pre-C2 unsupported_mime skip (dark launch stays a no-op), a vision
+ * error returns a detail-tagged unsupported_mime skip (the file still
+ * feeds the name-only asset-folder path), and an empty transcription
+ * becomes the ordinary `empty` skip. Nothing here ever throws or fails
+ * the scan.
  *
  * Output contract: the SAME flat marked-up text the Google-native
  * walkers emit (`# Title`, `## <section>` markers, tab-separated table
@@ -31,7 +39,7 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { defaultLlm, DEFAULT_GEMINI_MODEL } from '../ai';
 import type { LlmUsage } from '../ai';
-import type { TraversedFile } from './types';
+import type { ExtractionSkip, TraversedFile } from './types';
 
 /**
  * Mirrors the walkers' marker contract: `#` title, `##` per-page
@@ -143,5 +151,114 @@ export async function tryVisionPdfExtraction(
       '[drive.vision] vision_failed — falling back to text-layer path',
     );
     return null;
+  }
+}
+
+// ── Image extraction (issue C2 / #35) ───────────────────────────────────────
+
+/**
+ * Same marker contract as VISION_PROMPT (`#` title, bracketed one-line
+ * visual descriptions, flat text) so interpret.ts consumes image output
+ * unchanged. In an agency Drive the image often IS the deliverable — key
+ * visual, poster, mockup — so beyond legible text we ask for the brand /
+ * creative content a name-only pass would miss. Chrome (icons, UI
+ * fragments) transcribes to nothing → the ordinary `empty` skip; that
+ * emptiness is the implicit relevance backstop behind the metadata floor.
+ */
+const VISION_IMAGE_PROMPT = `You are a creative-asset transcription engine. Transcribe the attached image into flat, structured plain text for a marketing-intelligence pipeline.
+
+Rules:
+- If the image carries an evident title or headline, emit "# <headline>" as the first line.
+- Transcribe ALL legible text in natural reading order: headlines, body copy, captions, calls to action, disclaimers.
+- Add a one-line description of the visual in square brackets, e.g. [Poster: product bottle on a yellow field, bold retro typography].
+- Note identifiable brand and creative elements (logos, product shots, taglines, recurring campaign motifs) as plain text lines.
+- If the image is pure interface chrome, an icon, or a decorative fragment with no marketing or creative content, output nothing at all.
+- Output the transcription only — no preamble, no commentary, no code fences.`;
+
+/**
+ * Synchronous runtime gate for the image path, shared by extractText AND
+ * predictExtractionSkip so the two stay in lockstep: while this is false,
+ * every image/* file skips exactly as it did before C2 (unsupported_mime).
+ * The mock-driver check mirrors the PDF gate — a schema-shaped stub must
+ * not be stored as extracted text in dev.
+ */
+export function imageVisionRuntimeAvailable(): boolean {
+  return config.DRIVE_IMAGE_VISION_ENABLED && defaultLlm.name !== 'mock';
+}
+
+/**
+ * The raw image vision call — no gating, throws on error. Exposed
+ * separately (like visionExtractPdf) so an eval script can measure it
+ * without the skip semantics swallowing failures.
+ */
+export async function visionExtractImage(
+  mimeType: string,
+  buf: Buffer,
+): Promise<VisionExtractionResult> {
+  const model = config.DRIVE_VISION_MODEL || DEFAULT_GEMINI_MODEL;
+  const result = await defaultLlm.complete({
+    model,
+    temperature: 0,
+    prompt: VISION_IMAGE_PROMPT,
+    media: [{ mimeType, dataBase64: buf.toString('base64') }],
+    maxOutputTokens: config.DRIVE_VISION_MAX_OUTPUT_TOKENS,
+    // Same rationale as the PDF call: transcription doesn't need
+    // reasoning, and thinking tokens count against maxOutputTokens.
+    thinkingLevel: 'MINIMAL',
+    timeoutMs: config.DRIVE_VISION_TIMEOUT_MS,
+    tag: 'drive.image_vision_extraction.v1',
+  });
+  return { text: result.text.trim(), model, ...(result.usage ? { usage: result.usage } : {}) };
+}
+
+/**
+ * Image vision with the runtime gates applied. Returns the transcription
+ * text on success (possibly empty — extract.ts's ok() turns that into the
+ * ordinary `empty` skip), or an ExtractionSkip on any gate or failure.
+ * NEVER throws: images have no text fallback, so a vision problem must be
+ * a skip, not a scan failure. Scope/cap/relevance gating happened in the
+ * caller (the scan worker) before the bytes were ever downloaded — this
+ * function only enforces the gates that need the actual bytes or the
+ * runtime environment.
+ */
+export async function tryVisionImageExtraction(
+  file: Pick<TraversedFile, 'id' | 'name' | 'mimeType'>,
+  buf: Buffer,
+): Promise<string | ExtractionSkip> {
+  // Gate-off → the EXACT skip images produced before C2, so the dark
+  // launch (flag off) and dev (mock driver) are behavior no-ops.
+  if (!imageVisionRuntimeAvailable()) {
+    return { kind: 'skip', reason: 'unsupported_mime', detail: file.mimeType };
+  }
+  // Actual-byte cap (predict checked Drive's size metadata; this is the
+  // authoritative check on what we really downloaded).
+  if (buf.length > config.DRIVE_IMAGE_MAX_FILE_SIZE_BYTES) {
+    logger.debug(
+      { fileId: file.id, name: file.name, sizeBytes: buf.length },
+      '[drive.vision] image over vision size cap — skipping (no fallback)',
+    );
+    return {
+      kind: 'skip',
+      reason: 'out_of_scope_image',
+      detail: `over_size_cap size=${buf.length} limit=${config.DRIVE_IMAGE_MAX_FILE_SIZE_BYTES}`,
+    };
+  }
+
+  try {
+    const { text } = await visionExtractImage(file.mimeType, buf);
+    return text;
+  } catch (err) {
+    // Transient faults were already retried inside the LLM driver. The
+    // detail-tagged unsupported_mime keeps the file on the name-only
+    // asset-folder path — the filename still contributes evidence.
+    logger.warn(
+      { err, fileId: file.id, name: file.name, sizeBytes: buf.length, mimeType: file.mimeType },
+      '[drive.vision] image_vision_failed — skipping (images have no text fallback)',
+    );
+    return {
+      kind: 'skip',
+      reason: 'unsupported_mime',
+      detail: `image_vision_failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }

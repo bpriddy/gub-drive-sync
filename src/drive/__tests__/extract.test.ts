@@ -22,6 +22,16 @@
  *   - predictExtractionSkip ↔ extractText lockstep: across the whole MIME
  *     matrix, a predicted skip is returned verbatim by extractText and a
  *     predicted null extracts ok — the vision branch must stay skip-neutral
+ *
+ * Image vision path (issue C2 / #35): images have NO text fallback, so —
+ * unlike PDF — the image branch is skip-producing, and the lockstep matrix
+ * covers it under both allowImageVision=true and =false. We pin:
+ *   - in-scope success → extractor='vision-image'
+ *   - no scope granted → out_of_scope_image (worker detail threaded through)
+ *   - dark launch (flag off) and mock driver → pre-C2 unsupported_mime,
+ *     byte-identical detail
+ *   - vision error → detail-tagged unsupported_mime skip, never a throw
+ *   - empty transcription → ordinary 'empty' skip
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -71,6 +81,10 @@ const { mockConfig, CONFIG_DEFAULTS } = vi.hoisted(() => {
     DRIVE_VISION_MAX_PDF_PAGES: 50,
     DRIVE_VISION_MAX_OUTPUT_TOKENS: 32768,
     DRIVE_VISION_TIMEOUT_MS: 180000,
+    // Image vision (C2): the unit suite exercises the LIVE path; the
+    // dark-launch default (false) is pinned by an explicit test below.
+    DRIVE_IMAGE_VISION_ENABLED: true,
+    DRIVE_IMAGE_MAX_FILE_SIZE_BYTES: 14680064,
   };
   return { mockConfig: { ...CONFIG_DEFAULTS }, CONFIG_DEFAULTS };
 });
@@ -593,11 +607,103 @@ describe('extractText PDF vision path', () => {
   });
 });
 
+// ── Image vision path (issue C2 / #35) ──────────────────────────────────────
+// Images have no text fallback: every gate and failure must be a SKIP with
+// the pinned reason/detail, never a throw. Scope is the caller's verdict
+// (opts.allowImageVision) — extractText only honors it.
+
+describe('extractText image vision path (issue C2)', () => {
+  const imageFile = (overrides: Partial<TraversedFile> = {}): TraversedFile =>
+    makeFile({ mimeType: 'image/png', name: 'key-visual.png', ...overrides });
+  const ALLOW = { allowImageVision: true };
+
+  it('extracts an in-scope image via vision (extractor=vision-image)', async () => {
+    llmComplete.mockResolvedValue({
+      text: '# Key Visual\n[Poster: bottle on yellow field]',
+      driver: 'gemini',
+      model: 'gemini-3.5-flash',
+    });
+    const outcome = await extractText(imageFile(), ALLOW);
+    expect(outcome).toMatchObject({ kind: 'ok', extractor: 'vision-image' });
+    expect(llmComplete).toHaveBeenCalledTimes(1);
+    // The image's own mime rides the media part (PDF hardcodes application/pdf).
+    expect(llmComplete.mock.calls[0]![0]).toMatchObject({
+      media: [{ mimeType: 'image/png', dataBase64: expect.any(String) }],
+    });
+  });
+
+  it('skips out_of_scope_image when the caller granted no scope', async () => {
+    const outcome = await extractText(imageFile());
+    expect(outcome).toEqual({ kind: 'skip', reason: 'out_of_scope_image' });
+    expect(llmComplete).not.toHaveBeenCalled();
+    expect(downloadFileBuffer).not.toHaveBeenCalled();
+  });
+
+  it('threads the worker skip detail (per_piece_cap) into the skip', async () => {
+    const outcome = await extractText(imageFile(), {
+      allowImageVision: false,
+      imageSkipDetail: 'per_piece_cap',
+    });
+    expect(outcome).toEqual({
+      kind: 'skip',
+      reason: 'out_of_scope_image',
+      detail: 'per_piece_cap',
+    });
+  });
+
+  it('dark launch: flag off → pre-C2 unsupported_mime even when scope was granted', async () => {
+    mockConfig.DRIVE_IMAGE_VISION_ENABLED = false;
+    const outcome = await extractText(imageFile(), ALLOW);
+    expect(outcome).toEqual({ kind: 'skip', reason: 'unsupported_mime', detail: 'image/png' });
+    expect(llmComplete).not.toHaveBeenCalled();
+    expect(downloadFileBuffer).not.toHaveBeenCalled();
+  });
+
+  it('mock LLM driver → gate-off unsupported_mime (stub output must not become "text")', async () => {
+    llmDriver.name = 'mock';
+    const outcome = await extractText(imageFile(), ALLOW);
+    expect(outcome).toEqual({ kind: 'skip', reason: 'unsupported_mime', detail: 'image/png' });
+    expect(llmComplete).not.toHaveBeenCalled();
+  });
+
+  it('vision error → detail-tagged skip, never a throw (no fallback to lose to)', async () => {
+    llmComplete.mockRejectedValue(new Error('vision down'));
+    const outcome = await extractText(imageFile(), ALLOW);
+    expect(outcome).toMatchObject({ kind: 'skip', reason: 'unsupported_mime' });
+    expect((outcome as { detail?: string }).detail).toMatch(/^image_vision_failed: vision down/);
+  });
+
+  it('empty transcription (pure chrome) → ordinary empty skip', async () => {
+    llmComplete.mockResolvedValue({ text: '   ', driver: 'gemini', model: 'gemini-3.5-flash' });
+    const outcome = await extractText(imageFile(), ALLOW);
+    expect(outcome).toEqual({ kind: 'skip', reason: 'empty', detail: 'extractor=vision-image' });
+  });
+
+  it('enforces the byte cap on the ACTUAL download when metadata size is unknown', async () => {
+    mockConfig.DRIVE_IMAGE_MAX_FILE_SIZE_BYTES = 4;
+    vi.mocked(downloadFileBuffer).mockResolvedValue(Buffer.from('123456789'));
+    const outcome = await extractText(imageFile({ size: null }), ALLOW);
+    expect(outcome).toMatchObject({ kind: 'skip', reason: 'out_of_scope_image' });
+    expect((outcome as { detail?: string }).detail).toMatch(/^over_size_cap /);
+    expect(llmComplete).not.toHaveBeenCalled();
+  });
+
+  it('non-inline image mimes (SVG) stay plain unsupported_mime even with scope', async () => {
+    const outcome = await extractText(
+      imageFile({ mimeType: 'image/svg+xml', name: 'logo.svg' }),
+      ALLOW,
+    );
+    expect(outcome).toEqual({ kind: 'skip', reason: 'unsupported_mime', detail: 'image/svg+xml' });
+  });
+});
+
 // ── predictExtractionSkip ↔ extractText lockstep ────────────────────────────
 // The two functions walk one decision tree; this matrix pins that a
 // predicted skip is returned VERBATIM by extractText and a predicted null
 // really extracts. The vision branch must stay skip-neutral: PDFs predict
 // null whether vision or the text layer ends up producing the text.
+// Images (C2) are the opposite — the branch is skip-PRODUCING — so the
+// matrix pins agreement under both allowImageVision=true and =false.
 
 describe('predictExtractionSkip ↔ extractText lockstep', () => {
   const DOCX_MIME =
@@ -605,9 +711,53 @@ describe('predictExtractionSkip ↔ extractText lockstep', () => {
   const PPTX_MIME =
     'application/vnd.openxmlformats-officedocument.presentationml.presentation';
 
-  const matrix: Array<{ label: string; file: TraversedFile; setup?: () => void }> = [
+  const matrix: Array<{
+    label: string;
+    file: TraversedFile;
+    opts?: { allowImageVision?: boolean; imageSkipDetail?: string };
+    setup?: () => void;
+  }> = [
     { label: 'folder', file: makeFile({ isFolder: true, mimeType: 'application/vnd.google-apps.folder' }) },
-    { label: 'unsupported mime (image/png)', file: makeFile({ mimeType: 'image/png' }) },
+    { label: 'image/png without granted scope (out_of_scope_image)', file: makeFile({ mimeType: 'image/png' }) },
+    {
+      label: 'image/png with granted scope (vision on) — extracts',
+      file: makeFile({ mimeType: 'image/png', name: 'kv.png' }),
+      opts: { allowImageVision: true },
+    },
+    {
+      label: 'image/png with granted scope but vision dark (flag off)',
+      file: makeFile({ mimeType: 'image/png', name: 'kv.png' }),
+      opts: { allowImageVision: true },
+      setup: () => {
+        mockConfig.DRIVE_IMAGE_VISION_ENABLED = false;
+      },
+    },
+    {
+      label: 'image/png with granted scope under the mock LLM driver',
+      file: makeFile({ mimeType: 'image/png', name: 'kv.png' }),
+      opts: { allowImageVision: true },
+      setup: () => {
+        llmDriver.name = 'mock';
+      },
+    },
+    {
+      label: 'image/png with granted scope over the image size cap',
+      file: makeFile({ mimeType: 'image/png', name: 'kv.png', size: 14680065 }),
+      opts: { allowImageVision: true },
+    },
+    {
+      label: 'image denied with a worker detail (per_piece_cap)',
+      file: makeFile({ mimeType: 'image/png', name: 'kv.png' }),
+      opts: { allowImageVision: false, imageSkipDetail: 'per_piece_cap' },
+    },
+    { label: 'image mime the API rejects (image/svg+xml)', file: makeFile({ mimeType: 'image/svg+xml' }) },
+    {
+      label: 'shortcut to an image without granted scope',
+      file: makeFile({
+        mimeType: 'application/vnd.google-apps.shortcut',
+        shortcutTarget: { id: 't1', mimeType: 'image/png' },
+      }),
+    },
     { label: 'PDF over the download cap', file: makeFile({ size: 26214401 }) },
     { label: 'PDF within caps (vision on)', file: makeFile({}) },
     {
@@ -684,11 +834,11 @@ describe('predictExtractionSkip ↔ extractText lockstep', () => {
     },
   ];
 
-  for (const { label, file, setup } of matrix) {
+  for (const { label, file, opts, setup } of matrix) {
     it(`agrees on ${label}`, async () => {
       setup?.();
-      const predicted = predictExtractionSkip(file);
-      const actual = await extractText(file);
+      const predicted = predictExtractionSkip(file, opts);
+      const actual = await extractText(file, opts);
       if (predicted) {
         // Predicted skips must be returned verbatim — same reason AND detail.
         expect(actual).toEqual(predicted);
