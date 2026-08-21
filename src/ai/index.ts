@@ -1,5 +1,7 @@
 export { runPreset, parseLlmJson } from './prompt-preset.service';
 export { defaultLlm } from './gemini.client';
+export { embedTexts, defaultEmbedder, EMBEDDING_MODEL, EMBEDDING_DIM } from './embed';
+export type { EmbeddingDriver } from './embed';
 export type { LlmDriver, LlmCompletionRequest, LlmCompletionResult, LlmUsage } from './ai.types';
 // The SDK's schema surface, re-exported so consumers never import the vendor
 // package directly (one place to swap on the next SDK migration). SchemaType

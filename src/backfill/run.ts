@@ -2,6 +2,8 @@
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { writeFileSync } from 'node:fs';
 import { prisma } from '../prisma';
+import { config } from '../config';
+import { reconcileCandidates } from '../drive/insight-reconcile';
 import type { Attributor } from '../drive/structure';
 import type { TraversedFile } from '../drive/types';
 import { parseArgs, DEFAULT_CONCURRENCY, type Args, type BackfillRunResult } from './args';
@@ -341,6 +343,53 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
           log(`     │ ${line}`);
         }
         log('     └─────────────────────────────────────');
+      }
+    }
+
+    // D3 (#39): flag-gated reconciliation over the scan's aggregated
+    // candidates. Op producer only — zero DB writes in any mode. Fails
+    // soft (a missing preset on an unseeded dev DB must not kill the
+    // scan print).
+    if (config.INSIGHT_RECONCILE === 'dryrun' && outcome.candidates.length > 0) {
+      log('');
+      log(
+        `  ── Reconciliation ops (${outcome.candidates.length} candidate(s) — D3 dryrun, not persisted) ──`,
+      );
+      try {
+        const reconcileStart = Date.now();
+        const ops = await reconcileCandidates(outcome.candidates, {
+          warn: (m) => log(`     ⚠ ${m}`),
+        });
+        for (const op of ops) {
+          const c = op.candidate;
+          const text = c.text.length > 100 ? `${c.text.slice(0, 100)}…` : c.text;
+          const scope =
+            c.entityType === 'account'
+              ? `account ${c.entityId}`
+              : `campaign(${c.entityStatus ?? 'existing'}) ${c.entityId}`;
+          const targetIdx = op.targetInsightId
+            ? op.retrieval.neighborIds.indexOf(op.targetInsightId)
+            : -1;
+          const distance = targetIdx >= 0 ? op.retrieval.distances[targetIdx] : undefined;
+          const parts = [
+            `confidence ${op.confidence.toFixed(2)}`,
+            `retrieved ${op.retrieval.neighborIds.length}/${op.retrieval.k}`,
+          ];
+          if (op.targetInsightId) {
+            parts.unshift(
+              `target ${op.targetInsightId}${distance !== undefined ? ` (d=${distance.toFixed(3)})` : ''}`,
+            );
+          }
+          if (op.demotedFrom) parts.push(`demoted from ${op.demotedFrom}`);
+          if (op.unresolvedEntity) parts.push('unresolved entity');
+          log(`     · ${op.op}  "${text}"`);
+          log(`         ${scope}  ·  ${parts.join('  ·  ')}`);
+        }
+        log(`     ✓ ${ops.length} op(s) in ${fmtMs(Date.now() - reconcileStart)}`);
+      } catch (err) {
+        log(
+          `     ⚠ reconcile skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
 
