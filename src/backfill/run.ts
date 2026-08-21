@@ -314,6 +314,22 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
           `     distill: ${result.distillResult.proposalsCreated} field changes / ${result.distillResult.notesWritten} notes`,
         );
       }
+      // D2 (#38): candidate insights assembled from the distilled output.
+      // In-memory only — the acceptance surface until D4 persists them.
+      if (result.candidates.length > 0) {
+        log(`     candidates: ${result.candidates.length} insight candidate(s) (not persisted — D2)`);
+        for (const c of result.candidates) {
+          const scope =
+            c.entityType === 'account'
+              ? `account ${c.entityId}`
+              : `campaign(${c.entityStatus}) ${c.entityId}`;
+          const text = c.text.length > 100 ? `${c.text.slice(0, 100)}…` : c.text;
+          log(`       · [${c.origin}] "${text}"`);
+          log(
+            `         ${scope}  ·  account ${c.accountId}  ·  ${c.sourceFileIds.length} source file(s)  ·  confidence ${c.confidence.toFixed(2)}`,
+          );
+        }
+      }
       log('     ┌── status_markdown ──────────────────');
       for (const line of result.synthesizedMarkdown.split('\n')) {
         log(`     │ ${line}`);

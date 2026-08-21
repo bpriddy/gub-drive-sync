@@ -41,6 +41,7 @@ import {
   mergeIdeaCandidates,
 } from '../drive/idea-scan';
 import type { ExtractedIdea } from '../drive/idea-extraction';
+import { toCandidateInsights, type CandidateInsight } from '../drive/candidate-insight';
 import type { TraversedFile } from '../drive/types';
 import { config } from '../config';
 import { log, fmtBytes, fmtMs } from './output';
@@ -1152,6 +1153,7 @@ export async function processBatch(
       let distillResult: EntitySynthesisResult['distillResult'] = null;
       let validatedChanges: ValidatedChange[] = [];
       let distilledNotes: Array<{ text: string; source_file_ids: string[] }> = [];
+      let candidates: CandidateInsight[] = [];
       if (target.entityType === 'piece') {
         // Pieces are markdown-only: no writable fields → nothing to distill.
         // Observations flow straight into synthesis below.
@@ -1203,6 +1205,14 @@ export async function processBatch(
           ambiguousWritten: 0,
           driver: dry.driver,
         };
+
+        // D2 (#38): assemble candidate insights from the distilled output.
+        // Pure reshaping — scope comes off the Target the attributor built;
+        // no extra LLM call, nothing persisted (D4) or embedded (D3).
+        candidates = toCandidateInsights({ ...target, accountId: ctx.accountId }, dry, wlog);
+        if (candidates.length > 0) {
+          wlog(`      candidates: ${candidates.length} insight candidate(s) (in-memory — D2)`);
+        }
 
         // Validate every proposed field, drop no-ops + invalids. Same
         // gates production review uses on approve — backfill mirrors
@@ -1319,6 +1329,7 @@ export async function processBatch(
           synthesizedMarkdown: '(proposed for review — synthesis at applyDecisions)',
           synthesizedSensitiveMarkdown: null,
           synthesisMs: 0,
+          candidates,
         };
       }
 
@@ -1458,6 +1469,7 @@ export async function processBatch(
         synthesizedMarkdown,
         synthesizedSensitiveMarkdown,
         synthesisMs,
+        candidates,
       };
     };
 
@@ -1545,6 +1557,7 @@ export async function processBatch(
     accountLevelFiles,
     campaignObsDiscarded,
     synthesized,
+    candidates: synthesized.flatMap((r) => r.candidates),
     stage3Failures,
     ideaStats: ideaCtx?.stats ?? null,
   };
