@@ -72,10 +72,12 @@ jobs:
         run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
 
       - name: Build and push image
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/$JOB"
-          docker build -t "$IMAGE:$SHORT_SHA" -t "$IMAGE:latest" .
+          docker build --secret id=gh_packages_token,env=GH_PACKAGES_TOKEN -t "$IMAGE:$SHORT_SHA" -t "$IMAGE:latest" .
           docker push --all-tags "$IMAGE"
           echo "IMAGE_URI=$IMAGE:$SHORT_SHA" >> "$GITHUB_ENV"
 
