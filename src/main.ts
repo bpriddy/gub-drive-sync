@@ -49,6 +49,7 @@ import {
   startFullSync,
 } from './drive/runner';
 import { processBackfillQueue } from './drive/backfill-queue';
+import { DRIVE_SYNC_SYSTEM_STAFF_ID } from './drive/heal';
 import { seedEditStats } from './forward/seed';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
@@ -57,6 +58,7 @@ import { derivePiecesForAccount } from './drive/piece-derive';
 
 type Mode =
   | 'poll'
+  | 'forward-all'
   | 'run-full-sync'
   | 'continue'
   | 'cron'
@@ -71,6 +73,7 @@ type Mode =
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
+  'forward-all',
   'run-full-sync',
   'continue',
   'cron',
@@ -333,6 +336,67 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
       // entry (rows stuck in 'running' for >60min).
       const result = await processBackfillQueue();
       return result as unknown as Record<string, unknown>;
+    }
+
+    case 'forward-all': {
+      // Scheduled forward-sync-v2 driver. Replaces the legacy `mode=poll`
+      // path for the daily scheduler tick (see terraform/drive_poll.tf).
+      //
+      // Two steps in one execution:
+      //   1. Enqueue a `mode=forward` driveSyncRun for every account that
+      //      has finished bootstrap. Skip accounts that already have a
+      //      pending or running forward row — otherwise a slow prior
+      //      forward run would collect a duplicate every scheduler tick.
+      //   2. Drain via processBackfillQueue(), which is the same code
+      //      path a Backfill-button click uses. Reuses heartbeat, stale-
+      //      reclaim, per-row retry, error surfaces — no new engine
+      //      logic.
+      //
+      // requestedBy = DRIVE_SYNC_SYSTEM_STAFF_ID (the seeded system staff
+      // row) so the audit trail reads "scheduled system enqueue", not an
+      // operator's identity — same pattern the auto-continuation chain
+      // in backfill-queue already uses.
+      const eligible = await prisma.account.findMany({
+        where: {
+          driveBootstrapCompletedAt: { not: null },
+        },
+        select: { id: true, name: true },
+      });
+
+      let enqueued = 0;
+      let skippedInFlight = 0;
+      for (const acc of eligible) {
+        const inFlight = await prisma.driveSyncRun.findFirst({
+          where: {
+            accountId: acc.id,
+            mode: 'forward',
+            status: { in: ['pending', 'running'] },
+          },
+          select: { id: true },
+        });
+        if (inFlight) {
+          skippedInFlight += 1;
+          continue;
+        }
+        await prisma.driveSyncRun.create({
+          data: {
+            accountId: acc.id,
+            mode: 'forward',
+            requestedBy: DRIVE_SYNC_SYSTEM_STAFF_ID,
+            allRemaining: false,
+            logSummary: 'scheduled forward-all enqueue',
+          },
+        });
+        enqueued += 1;
+      }
+
+      const drain = await processBackfillQueue();
+      return {
+        eligibleAccounts: eligible.length,
+        enqueued,
+        skippedInFlight,
+        drain,
+      } as unknown as Record<string, unknown>;
     }
 
     case 'merge-campaign-dupes': {
