@@ -48,7 +48,7 @@ import type {
 const MAX_ATTEMPTS = 3;
 const BASE_BACKOFF_MS = 1000; // 1s → 3s → 9s (3^attempt)
 
-function isRetryable(err: unknown): boolean {
+export function isRetryable(err: unknown): boolean {
   if (!err) return false;
   // API-level errors carry a typed HTTP status (SDK-recommended handling):
   // retry rate limits + server-side failures, never other 4xx.
