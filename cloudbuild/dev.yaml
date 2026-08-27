@@ -47,9 +47,21 @@ substitutions:
   _GEMINI_SECRET: gub-drive-sync-gemini-api-key-dev
   _MAILGUN_SECRET: gub-drive-sync-mailgun-api-key-dev
   _CLOUDSQL_INSTANCE: gub-platform
-  _DRIVE_ROOT_FOLDER_ID: ""
-  _GUB_ADMIN_BASE_URL: http://localhost:5173
-  _GUB_REVIEW_BASE_URL: ""
+  # "CSC" folder — the dev sync root the drive bot credential is scoped to.
+  # Setting it does two things (see src/drive/{discover,poll}.ts): enables
+  # new-entity discovery AND narrows the poll's change filter to this tree.
+  # If a poll ever logs changesReturned>0 with changesInScope=0 consistently,
+  # the credential can't see this folder — clear the value and investigate.
+  # Applied to the live job directly on 2026-08-13 (gcloud run jobs update);
+  # this substitution keeps the next cloudbuild deploy consistent with that.
+  _DRIVE_ROOT_FOLDER_ID: "1kW8WUNh14AONTI5k9CcypS9uMX3Bou0V"
+  # Real dev URLs (were localhost:5173 / empty — harmless while dev mail is
+  # console-only, but every review magic-link in the logs pointed at
+  # localhost). Review links prefer _GUB_REVIEW_BASE_URL (public, no IAP);
+  # admin URL is the fallback + used for non-review admin links.
+  # Also applied to the live job on 2026-08-13, same as the folder id.
+  _GUB_ADMIN_BASE_URL: https://gub-admin-dev-843516467880.us-central1.run.app
+  _GUB_REVIEW_BASE_URL: https://gub-review-dev-843516467880.us-central1.run.app
 
 options:
   logging: CLOUD_LOGGING_ONLY
