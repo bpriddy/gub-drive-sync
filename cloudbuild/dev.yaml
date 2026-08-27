@@ -72,15 +72,24 @@ steps:
   - id: typecheck
     name: node:22-slim
     entrypoint: sh
+    secretEnv: [GH_PACKAGES_TOKEN]
     args:
       - -c
-      - npm ci && npx prisma generate && npx tsc --noEmit
+      # Token goes to ~/.npmrc (never the workspace copy — the Docker build
+      # context must stay token-free; the image gets it via BuildKit secret).
+      - echo "//npm.pkg.github.com/:_authToken=$$GH_PACKAGES_TOKEN" > ~/.npmrc && npm ci && npx prisma generate && npx tsc --noEmit
 
   # ── 2. Build image ────────────────────────────────────────────────────────
   - id: build
     name: gcr.io/cloud-builders/docker
+    env: [DOCKER_BUILDKIT=1]
+    secretEnv: [GH_PACKAGES_TOKEN]
     args:
       - build
+      # Dockerfile mounts this for its builder-stage npm ci and scrubs it —
+      # the token never lands in an image layer.
+      - --secret
+      - id=gh_packages_token,env=GH_PACKAGES_TOKEN
       - -t
       - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_JOB:$SHORT_SHA
       - -t
@@ -135,3 +144,13 @@ steps:
       - --set-env-vars=NODE_ENV=production,GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=$_REGION,DRIVE_SYNC_JOB_NAME=$_JOB,DRIVE_ROOT_FOLDER_ID=$_DRIVE_ROOT_FOLDER_ID,DRIVE_DELAY_BETWEEN_ACCOUNTS_MS=5000,DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS=2000,DRIVE_MAX_FILE_SIZE_BYTES=314572800,DRIVE_PROPOSAL_TTL_DAYS=14,GEMINI_MAX_INPUT_CHARS=40000,MAIL_DRIVER=console,MAIL_FROM_NAME=GUB,MAILGUN_REGION=us,GUB_ADMIN_BASE_URL=$_GUB_ADMIN_BASE_URL,GUB_REVIEW_BASE_URL=$_GUB_REVIEW_BASE_URL
       - --set-secrets=DATABASE_URL=$_DB_SECRET:latest,GUB_BOT_OAUTH_CLIENT_ID=$_BOT_CLIENT_ID_SEC:latest,GUB_BOT_OAUTH_CLIENT_SECRET=$_BOT_CLIENT_SEC_SEC:latest,GEMINI_API_KEY=$_GEMINI_SECRET:latest,MAILGUN_API_KEY=$_MAILGUN_SECRET:latest
     waitFor: [push]
+
+# @anomaly-technology/gub-schemas (devDependency) lives on GitHub Packages
+# (private registry), so the typecheck `npm ci` and the builder-stage
+# `npm ci` inside the Docker build need a read:packages token. Same token
+# as GHA CI's GH_PACKAGES_TOKEN repo secret; stored in Secret Manager.
+# See gub-schemas SETUP.md ("npm ci fails only in Cloud Build").
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/gub-gh-packages-token-dev/versions/latest
+      env: GH_PACKAGES_TOKEN
