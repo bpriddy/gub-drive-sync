@@ -166,12 +166,14 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
       bucket.filter((r) => r.kind === 'new_entity' && r.proposalGroupId).map((r) => r.proposalGroupId!),
     ).size;
     const fieldChanges = bucket.filter((r) => r.kind === 'field_change').length;
+    const insightOps = bucket.filter((r) => r.kind === 'insight_op').length;
 
     const { subject, text, html } = renderReviewEmail({
       reviewerName: staff.fullName,
       magicLink,
       fieldChanges,
       newEntityGroups,
+      insightOps,
       ttlDays: config.DRIVE_PROPOSAL_TTL_DAYS,
     });
 
@@ -240,6 +242,9 @@ interface RenderInput {
   magicLink: string;
   fieldChanges: number;
   newEntityGroups: number;
+  /** D4 (#40): pending insight_op cards in the bundle. Counted so an
+   *  insight-only batch doesn't render as a contentless "items" email. */
+  insightOps: number;
   ttlDays: number;
 }
 
@@ -250,6 +255,9 @@ function renderReviewEmail(i: RenderInput): { subject: string; text: string; htm
   }
   if (i.fieldChanges > 0) {
     parts.push(`${i.fieldChanges} ${i.fieldChanges === 1 ? 'change' : 'changes'}`);
+  }
+  if (i.insightOps > 0) {
+    parts.push(`${i.insightOps} insight ${i.insightOps === 1 ? 'update' : 'updates'}`);
   }
   const summary = parts.length > 0 ? parts.join(' and ') : 'items';
   const subject = `Drive sync: ${summary} need your review`;

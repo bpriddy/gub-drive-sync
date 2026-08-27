@@ -65,12 +65,15 @@ const EnvSchema = z.object({
    */
   SYNTH_CONCURRENCY: z.string().default('8').transform(Number),
   /**
-   * D3 (#39): reconcile the scan's candidate insights against the insight
-   * store. 'off' (default) skips reconciliation entirely; 'dryrun' embeds,
-   * retrieves top-K neighbors, and prints zod-validated ops after the D2
-   * candidate print — zero DB writes in any mode (persistence is D4).
+   * D3 (#39) / D4 (#40): reconcile the scan's candidate insights against the
+   * insight store. 'off' (default) skips reconciliation entirely; 'dryrun'
+   * embeds, retrieves top-K neighbors, and prints zod-validated ops after the
+   * D2 candidate print — zero DB writes. 'propose' (forward driver only)
+   * additionally emits each non-NOOP op as a kind='insight_op'
+   * drive_change_proposal — review-gated per the B1 ruling (2026-08-19);
+   * GUB's applyDecisions writes the insights store on approval.
    */
-  INSIGHT_RECONCILE: z.enum(['off', 'dryrun']).default('off'),
+  INSIGHT_RECONCILE: z.enum(['off', 'dryrun', 'propose']).default('off'),
 
   // ── Notify URLs ──────────────────────────────────────────────────────────
   GUB_ADMIN_BASE_URL: z.string().url().default('http://localhost:5173'),

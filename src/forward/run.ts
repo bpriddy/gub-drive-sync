@@ -27,6 +27,9 @@ import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
 import { queryActivityWindow, foldEvents, ymdUtc } from './activity';
 import { resolveActors } from './people';
 import { writeRunEditStats } from './stats';
+import { config } from '../config';
+import { reconcileCandidates } from '../drive/insight-reconcile';
+import { proposeInsightOps } from '../scan/propose';
 
 /** Absorbs Activity API ingestion lag at the window edge (design Q4). */
 const OVERLAP_MS = 2 * 60 * 1000;
@@ -226,6 +229,40 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
         `${outcome.stage3Failures} stage-3 failure(s) — cursor NOT advanced; retry re-runs this window`,
       );
     }
+
+    // D4 (#40): flag-gated insight-op emit — reconcile the window's
+    // candidates (D3) and propose each non-NOOP op as a review-gated
+    // insight_op card (B1 ruling). Fail-soft ON PURPOSE, unlike the field
+    // proposals above: insights are an additive dark-launched tier, and a
+    // reconcile/emit failure (missing preset, embed outage) must not stall
+    // the forward cursor for the main proposal pipeline. The cost of a
+    // missed window is bounded — the candidates' facts resurface when the
+    // entity's docs next change, and D5's seed/backfill replays history.
+    if (config.INSIGHT_RECONCILE === 'propose' && outcome.candidates.length > 0) {
+      try {
+        const ops = await timed('insight_reconcile', () =>
+          reconcileCandidates(outcome.candidates, {
+            warn: (m) => log(`  ⚠ ${m}`),
+          }),
+        );
+        const res = await proposeInsightOps({
+          ops,
+          reviewer: {
+            reviewerEmail: ctx.reviewerEmail ?? null,
+            reviewerStaffId: ctx.reviewerStaffId ?? null,
+          },
+          syncRunId: fargs.syncRunId,
+        });
+        log(
+          `  ◆ insight ops: ${res.emitted} proposed, ${res.duplicatesSkipped} already pending, ${res.noops} NOOP — from ${outcome.candidates.length} candidate(s)`,
+        );
+      } catch (err) {
+        log(
+          `  ⚠ insight-op emit failed (window still commits; facts re-surface on next doc change): ${summarizeError(err)}`,
+        );
+      }
+    }
+
     filesProcessed = files.length;
     scansProcessed = 1;
   }
