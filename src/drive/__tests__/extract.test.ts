@@ -46,19 +46,19 @@ vi.mock('googleapis', () => ({
   },
 }));
 
-vi.mock('../workspace', () => ({
+vi.mock('../../workspace', () => ({
   buildBotOAuthClient: buildBotOAuthClientMock,
 }));
 
-vi.mock('../config', () => ({
+vi.mock('../../config', () => ({
   config: { DRIVE_MAX_FILE_SIZE_BYTES: 26214400 },
 }));
 
-vi.mock('../logger', () => ({
+vi.mock('../../logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock('./client', () => ({
+vi.mock('../client', () => ({
   downloadFileBuffer: vi.fn(),
 }));
 
@@ -80,7 +80,7 @@ import {
   extractGoogleDoc,
   extractGoogleSlides,
   extractGoogleSheets,
-} from './extract';
+} from '../extract';
 
 // ── Google Docs walker ──────────────────────────────────────────────────────
 
