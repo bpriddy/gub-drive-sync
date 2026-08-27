@@ -28,6 +28,8 @@ import { log } from './output';
 import type { ValidatedChange } from './persist';
 import type { EntityCtx } from './batch-types';
 import { newCandidateMarker } from './note-marker';
+import { embedTexts } from '../ai';
+import type { InsightOp } from '../drive/insight-reconcile';
 
 export interface ProposeNoteItem {
   text: string;
@@ -209,6 +211,202 @@ export async function loadPendingNoteTexts(args: {
     }
   }
   return texts;
+}
+
+// ── insight_op proposals (D4 #40) ────────────────────────────────────────────
+//
+// Each non-NOOP D3 reconciliation op becomes ONE kind='insight_op'
+// drive_change_proposals row — review-gated per the B1 ruling (2026-08-19):
+// forward PROPOSES, review APPLIES. GUB's applyDecisions consumes the
+// proposed_value payload (parseInsightOpPayload on its side is the wire
+// contract) and writes insights + insight_changes transactionally on approve.
+// NOOP ops never become cards — they're telemetry at most (pitfall #7).
+
+/**
+ * Stable identity of an op for dedup + the day-one idempotency key.
+ *
+ * Hashes the op's SEMANTIC content only: verb, container scope, target id and
+ * final text. Volatile fields are deliberately excluded — confidence /
+ * reasoning / retrieval vary run to run for the same logical op, and
+ * targetUpdatedAt is the CAS snapshot, not identity (a re-scan that re-derives
+ * the same op against a moved target must still dedup against the pending
+ * card; a stale card self-heals at approve time via reject-and-regenerate).
+ */
+export function insightOpHash(op: InsightOp): string {
+  const canonical = JSON.stringify({
+    op: op.op,
+    entityType: op.candidate.entityType,
+    entityId: op.candidate.entityId,
+    targetInsightId: op.targetInsightId ?? null,
+    newText: op.op === 'UPDATE' ? op.newText ?? op.candidate.text : null,
+    text: op.candidate.text,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/** The op's final insight text — what lands in the store on approval
+ *  (and therefore what gets embedded). */
+export function insightOpFinalText(op: InsightOp): string {
+  return op.op === 'UPDATE' ? op.newText ?? op.candidate.text : op.candidate.text;
+}
+
+export interface InsightOpProposalRow {
+  kind: 'insight_op';
+  entityType: 'account' | 'campaign';
+  accountId: string;
+  campaignId: string | null;
+  property: string;
+  proposedValue: Record<string, unknown>;
+  reasoning: string;
+  sourceFileIds: string[];
+  confidence: number;
+  opHash: string;
+}
+
+/**
+ * Pure payload assembly (hermetic-suite seam — the DB writer below stays
+ * thin). `embedding` is the final text's vector, computed by the caller in
+ * one batch; GUB has no embedding stack, so the vector rides the proposal.
+ */
+export function buildInsightOpProposal(
+  op: InsightOp,
+  embedding: number[] | null,
+): InsightOpProposalRow {
+  const c = op.candidate;
+  const opHash = insightOpHash(op);
+  // An unresolved new-campaign candidate has a Drive folder ref as entityId —
+  // no campaign row yet, so the proposal anchors on the account (the CHECK
+  // requires an entity ref); GUB resolves folder → campaign id at approve.
+  const campaignId =
+    c.entityType === 'campaign' && c.entityStatus !== 'new' && !op.unresolvedEntity
+      ? c.entityId
+      : null;
+  return {
+    kind: 'insight_op',
+    entityType: c.entityType,
+    accountId: c.accountId,
+    campaignId,
+    // Sentinel — `property` is NOT NULL but names no column for this kind
+    // (same contract as additional_update's '__note__').
+    property: '__insight_op__',
+    proposedValue: {
+      op: op.op,
+      ...(op.targetInsightId !== undefined ? { targetInsightId: op.targetInsightId } : {}),
+      ...(op.targetUpdatedAt !== undefined ? { targetUpdatedAt: op.targetUpdatedAt } : {}),
+      ...(op.op === 'UPDATE' ? { newText: op.newText ?? c.text } : {}),
+      opHash,
+      ...(embedding ? { embedding } : {}),
+      candidate: c,
+      ...(op.unresolvedEntity ? { unresolvedEntity: true } : {}),
+      ...(op.demotedFrom !== undefined ? { demotedFrom: op.demotedFrom } : {}),
+      // Telemetry for apply-side debugging + the eval; never prompt input.
+      retrieval: op.retrieval,
+    },
+    reasoning: op.reasoning,
+    sourceFileIds: c.sourceFileIds,
+    confidence: op.confidence,
+    opHash,
+  };
+}
+
+export interface ProposeInsightOpsInput {
+  ops: InsightOp[];
+  reviewer: { reviewerEmail: string | null; reviewerStaffId: string | null };
+  /** Attached at emit — the op itself carries no run provenance (D3 contract). */
+  syncRunId: string;
+  /** Injectable seam: embedding client (fail-soft — see below). */
+  embed?: (texts: string[]) => Promise<number[][]>;
+}
+
+export interface ProposeInsightOpsResult {
+  emitted: number;
+  /** Ops skipped because an identical pending insight_op card exists. */
+  duplicatesSkipped: number;
+  noops: number;
+}
+
+export async function proposeInsightOps(
+  input: ProposeInsightOpsInput,
+): Promise<ProposeInsightOpsResult> {
+  const embed = input.embed ?? embedTexts;
+  const expiresAt = new Date(
+    Date.now() + config.DRIVE_PROPOSAL_TTL_DAYS * 24 * 60 * 60 * 1000,
+  );
+
+  const emittable = input.ops.filter((op) => op.op !== 'NOOP');
+  const noops = input.ops.length - emittable.length;
+  if (emittable.length === 0) {
+    return { emitted: 0, duplicatesSkipped: 0, noops };
+  }
+
+  // One embed call for the batch (the batch is the unit the API bills).
+  // Fail-soft: a proposal without a vector is still reviewable/appliable —
+  // GUB warns at apply and the row stays invisible to retrieval until
+  // re-embedded. Losing the card entirely would be worse.
+  let vectors: Array<number[] | null>;
+  try {
+    vectors = await embed(emittable.map((op) => insightOpFinalText(op)));
+  } catch (err) {
+    log(
+      `      ⚠ insight-op embedding failed — proposing without vectors: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    vectors = emittable.map(() => null);
+  }
+
+  let emitted = 0;
+  let duplicatesSkipped = 0;
+  for (const [i, op] of emittable.entries()) {
+    const row = buildInsightOpProposal(op, vectors[i] ?? null);
+
+    // Re-propose guard (the A1 duplicate-card lesson), keyed on
+    // (entity, op-hash): an identical pending card means the reviewer
+    // already has this op — every scan until they decide would stack
+    // another copy. The hash ignores volatile fields, so a re-derived op
+    // with only a fresher CAS snapshot still counts as identical; a stale
+    // pending card self-heals at approve (reject-as-stale → re-propose).
+    const pending = await prisma.driveChangeProposal.findFirst({
+      where: {
+        kind: 'insight_op',
+        entityType: row.entityType,
+        accountId: row.accountId,
+        campaignId: row.campaignId,
+        state: 'pending',
+        proposedValue: { path: ['opHash'], equals: row.opHash },
+      },
+      select: { id: true },
+    });
+    if (pending) {
+      duplicatesSkipped++;
+      continue;
+    }
+
+    await prisma.driveChangeProposal.create({
+      data: {
+        kind: row.kind,
+        entityType: row.entityType,
+        accountId: row.accountId,
+        campaignId: row.campaignId,
+        property: row.property,
+        currentValue: Prisma.JsonNull,
+        proposedValue: row.proposedValue as unknown as Prisma.InputJsonValue,
+        reasoning: row.reasoning,
+        sourceFileIds: row.sourceFileIds,
+        confidence: new Prisma.Decimal(row.confidence),
+        state: 'pending',
+        reviewToken: crypto.randomBytes(32).toString('hex'),
+        reviewerEmail: input.reviewer.reviewerEmail,
+        reviewerStaffId: input.reviewer.reviewerStaffId,
+        expiresAt,
+        syncRunId: input.syncRunId,
+      },
+    });
+    emitted++;
+  }
+
+  log(
+    `      → insight ops proposed for review: ${emitted}${duplicatesSkipped > 0 ? ` (${duplicatesSkipped} already pending)` : ''}${noops > 0 ? `, ${noops} NOOP (no card)` : ''}`,
+  );
+  return { emitted, duplicatesSkipped, noops };
 }
 
 async function writeNoteBatch(args: {
