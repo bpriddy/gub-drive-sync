@@ -18,7 +18,10 @@
  *                        values.batchGet                 (extractor='gsheet')
  *
  *   Binary:
- *     - application/pdf                     → pdf-parse           (extractor='pdf')
+ *     - application/pdf → Gemini document understanding (extractor='vision'),
+ *       with automatic fallback to the text-layer parser unpdf
+ *       (extractor='pdf') on any vision gate or failure — see
+ *       extract-vision.ts for the gates and the failure posture
  *     - application/vnd.openxmlformats-…wordprocessingml.document  → mammoth (.docx)
  *     - text/* (plaintext, markdown, csv, etc.) → direct download (extractor='plaintext')
  *
@@ -41,6 +44,7 @@ import {
 import { config } from '../config';
 import { logger } from '../logger';
 import { downloadFileBuffer } from './client';
+import { tryVisionPdfExtraction } from './extract-vision';
 import { buildBotOAuthClient } from '../workspace';
 import type { ExtractionOutcome, ExtractionSkip, TraversedFile } from './types';
 
@@ -180,6 +184,12 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
       return null;
 
     // Binary download paths share the same size guard.
+    // NOTE (C1 lockstep): the vision branch in extractText's PDF case is
+    // deliberately absent here — it is skip-NEUTRAL. Vision gates and
+    // failures fall back to the text-layer path; they never produce a
+    // skip, so the predictor's PDF answer is unchanged. If a future
+    // change makes vision produce a skip outcome, it MUST be mirrored
+    // here (the lockstep test in __tests__/extract.test.ts pins the agreement).
     case MIME.PDF:
     case MIME.DOCX:
     case MIME.PPTX: {
@@ -251,6 +261,16 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
       // ── Binary downloads: size cap already checked in predictExtractionSkip.
       case MIME.PDF: {
         const buf = await downloadFileBuffer(effectiveFile.id);
+        // Vision-first (issue C1): Gemini document understanding reads
+        // layout, charts, and image-set decks the text layer can't.
+        // Every gate and failure inside tryVisionPdfExtraction returns
+        // null and lands on the text-layer path below — the vision
+        // branch never skips and never throws, which is what keeps
+        // predictExtractionSkip's decision tree untouched (the
+        // predictor's PDF answer is identical whether vision or the
+        // text layer ends up producing the text).
+        const visionText = await tryVisionPdfExtraction(effectiveFile, buf);
+        if (visionText !== null) return ok(visionText, 'vision');
         // Import lazily to keep the parser off the module init path.
         //
         // `unpdf` is a thin modern wrapper over `pdfjs-dist`'s legacy
@@ -284,9 +304,14 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
         // Import lazily to keep officeparser off the module init path —
         // it has a heavy zlib/xml unpack chain we'd rather defer.
         // officeparser flattens to plain text; slide boundaries and
-        // speaker notes are mostly preserved as runs of lines. For
-        // richer visual understanding (charts/photos/layout), see the
-        // future "rich pipeline" plan in docs/status-markdown-plan.md.
+        // speaker notes are mostly preserved as runs of lines.
+        //
+        // PPTX does NOT get the vision path (C1): Gemini inline document
+        // understanding accepts PDF only — PPTX would need a PDF
+        // conversion step first. Decks benefit from vision when they're
+        // PDF exports (the common agency case, covered above). For a
+        // PPTX conversion pipeline see the future "rich pipeline" plan
+        // in docs/status-markdown-plan.md.
         const { parseOfficeAsync } = await import('officeparser');
         const text = await parseOfficeAsync(buf);
         return ok(text, 'pptx');

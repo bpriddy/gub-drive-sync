@@ -99,12 +99,23 @@ class GeminiLlmDriver implements LlmDriver {
   }
 
   async complete(req: LlmCompletionRequest): Promise<LlmCompletionResult> {
+    // Multimodal requests put the inlineData parts FIRST, then the text
+    // prompt — the order the document-understanding docs use. Text-only
+    // requests keep the plain-string shape (identical wire behavior).
+    const contents = req.media?.length
+      ? [
+          ...req.media.map((m) => ({
+            inlineData: { data: m.dataBase64, mimeType: m.mimeType },
+          })),
+          req.prompt,
+        ]
+      : req.prompt;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         const res = await this.client.models.generateContent({
           model: req.model,
-          contents: req.prompt,
+          contents,
           config: {
             temperature: req.temperature,
             ...(req.responseSchema
@@ -116,6 +127,12 @@ class GeminiLlmDriver implements LlmDriver {
               : req.thinkingLevel !== undefined
                 ? { thinkingConfig: { thinkingLevel: req.thinkingLevel as ThinkingLevel } }
                 : {}),
+            // Per-request httpOptions REPLACE the client-level ones, so
+            // re-pin retryOptions.attempts=1 — otherwise the SDK's own
+            // retry would stack on top of this loop for these requests.
+            ...(req.timeoutMs
+              ? { httpOptions: { timeout: req.timeoutMs, retryOptions: { attempts: 1 } } }
+              : {}),
           },
         });
         const text = res.text ?? '';
