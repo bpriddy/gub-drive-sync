@@ -23,7 +23,8 @@
     "probe-revision-content": "tsx -r dotenv/config scripts/probe-revision-content.ts",
     "lint": "eslint src",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
     "@google/genai": "^2.11.0",
