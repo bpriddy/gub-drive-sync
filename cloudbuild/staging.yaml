@@ -1,3 +1,9 @@
+# ============================================================================
+# NO LONGER AUTO-RUN — the Cloud Build trigger was disabled at the CD cutover
+# (2026-08-28). CD lives in .github/workflows/deploy.yml, which is the single
+# source of truth for runtime config (env vars, secrets, scaling, probes).
+# This file is kept as a provisioning / history reference only.
+# ============================================================================
 ###############################################################################
 # Cloud Build — staging environment
 # Trigger: push to `staging` branch (added when staging env exists).

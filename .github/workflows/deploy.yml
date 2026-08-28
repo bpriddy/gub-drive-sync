@@ -1,20 +1,16 @@
-# Deploy — build the image with the repo Dockerfile, push to Artifact
-# Registry, update the Cloud Run **Job** (not a Service — no HTTP surface).
-#
-# The job is only STARTED by Cloud Scheduler (mode=poll), gub-admin's
-# "Sync now", its own chunked continuation, or an operator — this workflow
-# never executes it; the next `jobs:run` picks up the new image.
+# Deploy — typecheck gate, build the image, push to Artifact Registry, update
+# the Cloud Run JOB (executions are started by gub-admin's Sync page / the
+# scheduler, not by this workflow).
 #
 # Auth is Workload Identity Federation (OIDC) — no service-account keys.
+# Required GitHub repository variables: GCP_REGION, GCP_PROJECT_ID,
+# GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT_EMAIL.
+# Required secret: GH_PACKAGES_TOKEN (read:packages).
 #
-# This workflow updates the IMAGE ONLY. Env vars, secrets, Cloud SQL
-# attachment, task/retry/timeout posture stay whatever the last
-# cloudbuild/<env>.yaml deploy set — those files remain the config source of
-# truth, and first-time provisioning still goes through them.
-#
-# Manual trigger only for now: the existing Cloud Build trigger fires on push
-# to main; enabling a push trigger here too would double-deploy. Once the
-# Cloud Build trigger is disabled, uncomment `push:`.
+# THIS WORKFLOW IS THE SINGLE SOURCE OF TRUTH FOR RUNTIME CONFIG (the FLAGS
+# array below). cloudbuild/<env>.yaml files are frozen provisioning/history
+# references; their Cloud Build triggers are disabled (CD cutover 2026-08-28).
+# Only dev is ported — staging/prod arms fail loudly until provisioned.
 
 name: Deploy
 
@@ -22,12 +18,12 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: Target environment (must already be provisioned via cloudbuild/<env>.yaml)
+        description: Target environment (only dev is ported; see the FLAGS case)
         type: choice
         default: dev
         options: [dev, staging, prod]
-  # push:
-  #   branches: [main]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -45,7 +41,31 @@ env:
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
 
 jobs:
+  # Mirrors the retired cloudbuild typecheck step.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # @anomaly-technology/gub-schemas lives on GitHub Packages under the
+      # Anomaly-Technology org — GITHUB_TOKEN cannot read it.
+      - name: Authenticate npm to GitHub Packages
+        run: echo "//npm.pkg.github.com/:_authToken=${{ secrets.GH_PACKAGES_TOKEN }}" >> ~/.npmrc
+
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      - run: npx tsc --noEmit
+
   deploy:
+    needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -61,12 +81,23 @@ jobs:
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      # An image-only deploy must never CREATE the job — a bare create would
-      # come up without its secrets, runtime SA, or Cloud SQL socket.
+      # Unported environments fail HERE, before anything is touched.
+      - name: Resolve environment config
+        run: |
+          case "$ENVIRONMENT" in
+            dev) ;;
+            *)
+              echo "::error::environment '$ENVIRONMENT' is not ported to this workflow — cloudbuild/$ENVIRONMENT.yaml is the provisioning reference (note: prod differs — 1Gi memory, MAIL_DRIVER=mailgun)."
+              exit 1
+              ;;
+          esac
+          echo "RUNTIME_SA=sa-$JOB@$PROJECT_ID.iam.gserviceaccount.com" >> "$GITHUB_ENV"
+          echo "CLOUDSQL=$PROJECT_ID:$REGION:gub-platform" >> "$GITHUB_ENV"
+
       - name: Verify target job is provisioned
         run: |
           gcloud run jobs describe "$JOB" --region "$REGION" --format='value(metadata.name)' >/dev/null \
-            || { echo "::error::Cloud Run job $JOB does not exist in $PROJECT_ID/$REGION. Provision '$ENVIRONMENT' first with cloudbuild/$ENVIRONMENT.yaml."; exit 1; }
+            || { echo "::error::Cloud Run job $JOB does not exist in $PROJECT_ID/$REGION. Provision '$ENVIRONMENT' deliberately first."; exit 1; }
 
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
@@ -81,10 +112,31 @@ jobs:
           docker push --all-tags "$IMAGE"
           echo "IMAGE_URI=$IMAGE:$SHORT_SHA" >> "$GITHUB_ENV"
 
-      # `jobs deploy` has no traffic/promotion step; the next `jobs:run`
-      # (Scheduler / gub-admin / continuation) uses the new image.
-      - name: Update Cloud Run job image
-        run: gcloud run jobs deploy "$JOB" --image "$IMAGE_URI" --region "$REGION"
+      # FLAGS = the ported cloudbuild/dev.yaml args, verbatim. The container
+      # entrypoint is the runner — no --command/--args, deliberately.
+      - name: Update Cloud Run job
+        run: |
+          case "$ENVIRONMENT" in
+            dev)
+              FLAGS=(
+                --tasks=1
+                --parallelism=1
+                --max-retries=0
+                --task-timeout=86400s
+                --memory=2Gi
+                --cpu=1
+                "--service-account=$RUNTIME_SA"
+                "--set-cloudsql-instances=$CLOUDSQL"
+                "--set-env-vars=NODE_ENV=production,GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=$REGION,DRIVE_SYNC_JOB_NAME=$JOB,DRIVE_ROOT_FOLDER_ID=1kW8WUNh14AONTI5k9CcypS9uMX3Bou0V,DRIVE_DELAY_BETWEEN_ACCOUNTS_MS=5000,DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS=2000,DRIVE_MAX_FILE_SIZE_BYTES=314572800,DRIVE_PROPOSAL_TTL_DAYS=14,GEMINI_MAX_INPUT_CHARS=40000,MAIL_DRIVER=console,MAIL_FROM_NAME=GUB,MAILGUN_REGION=us,GUB_ADMIN_BASE_URL=https://gub-admin-dev-843516467880.us-central1.run.app,GUB_REVIEW_BASE_URL=https://gub-review-dev-843516467880.us-central1.run.app"
+                "--set-secrets=DATABASE_URL=gub-drive-sync-db-url-dev:latest,GUB_BOT_OAUTH_CLIENT_ID=gub-drive-sync-bot-oauth-client-id-dev:latest,GUB_BOT_OAUTH_CLIENT_SECRET=gub-drive-sync-bot-oauth-client-secret-dev:latest,GEMINI_API_KEY=gub-drive-sync-gemini-api-key-dev:latest,MAILGUN_API_KEY=gub-drive-sync-mailgun-api-key-dev:latest"
+              )
+              ;;
+            *)
+              echo "::error::no FLAGS ported for '$ENVIRONMENT'"
+              exit 1
+              ;;
+          esac
+          gcloud run jobs deploy "$JOB" --image "$IMAGE_URI" --region "$REGION" "${FLAGS[@]}"
 
       - name: Report job image
         run: |
