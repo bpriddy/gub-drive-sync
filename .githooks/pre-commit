@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# GUB pre-commit hook — fast, staged-only. Keep commits instant; the heavy
+# checks (typecheck, tests) run in pre-push.
+#
+#   1. gitleaks     — block secrets from ever landing
+#   2. eslint       — lint staged src/ JS-TS (check only, no auto-fix)
+#   3. prettier     — codestyle check on staged JS-TS
+#   4. lint:schema  — validate prisma/schema.prisma when it is staged
+#
+# Setup is auto-wired by the package.json "prepare" script on `npm install`,
+# or run once manually:
+#
+#   git config core.hooksPath .githooks
+#
+# Escape hatch for a one-off commit (justify it in the message):
+#
+#   git commit --no-verify           # skip every hook
+#   SKIP_GITLEAKS=1 git commit ...   # skip only the secret scan
+
+set -e
+
+# ---- 1. secrets -----------------------------------------------------------
+if [ "$SKIP_GITLEAKS" = "1" ]; then
+  echo "gitleaks: skipped via SKIP_GITLEAKS=1" >&2
+elif command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --staged --redact --no-banner
+else
+  echo "gitleaks not installed — refusing to commit." >&2
+  echo "  install: https://github.com/gitleaks/gitleaks#installation" >&2
+  echo "  bypass:  SKIP_GITLEAKS=1 git commit ..." >&2
+  exit 1
+fi
+
+# ---- 2/3. staged lint + codestyle (skips cleanly if deps not installed) ---
+CODE=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(ts|tsx|js|jsx|mjs|cjs)$' || true)
+if [ -n "$CODE" ]; then
+  SRC=$(printf '%s\n' "$CODE" | grep -E '^(src|scripts)/' || true)
+  if [ -n "$SRC" ] && [ -x node_modules/.bin/eslint ]; then
+    echo "pre-commit: eslint (staged)"
+    printf '%s\n' "$SRC" | xargs node_modules/.bin/eslint
+  fi
+  if [ -x node_modules/.bin/prettier ]; then
+    echo "pre-commit: prettier --check (staged)"
+    printf '%s\n' "$CODE" | xargs node_modules/.bin/prettier --check
+  fi
+fi
+
+# ---- 4. schema lint when the canonical schema is staged -------------------
+if git diff --cached --name-only --diff-filter=ACMR | grep -q 'prisma/schema.prisma'; then
+  if node -e "process.exit((require('./package.json').scripts||{})['lint:schema']?0:1)" 2>/dev/null; then
+    echo "pre-commit: lint:schema"
+    npm run --silent lint:schema
+  fi
+fi

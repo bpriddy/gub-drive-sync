@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# GUB pre-push hook — heavy checks, runs on push (not on every commit) so type
+# errors and red tests never leave the branch, while commits stay instant.
+#
+#   - typecheck  (tsc --noEmit)
+#   - test suite (where the repo has one)
+#   - lint:schema / schema checks (schema repo)
+#
+# Skipped entirely until `npm install` has been run (CI still enforces).
+# Bypass a blocked push (justify it): git push --no-verify
+
+set -e
+
+if [ ! -d node_modules ]; then
+  echo "pre-push: node_modules missing — run 'npm install' to enable typecheck/tests (skipping)." >&2
+  exit 0
+fi
+
+has() { node -e "process.exit((require('./package.json').scripts||{})['$1']?0:1)" 2>/dev/null; }
+
+if has typecheck; then
+  echo "pre-push: npm run typecheck"
+  npm run --silent typecheck
+fi
+if has test; then
+  echo "pre-push: npm test"
+  npm test
+fi
+if has lint:schema; then
+  echo "pre-push: npm run lint:schema"
+  npm run --silent lint:schema
+fi
