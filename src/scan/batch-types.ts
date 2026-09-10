@@ -7,6 +7,7 @@ import type {
 import type { CampaignObservation } from '../drive/interpret';
 import type { EntityMap } from '../drive/structure';
 import type { IdeaScanStats } from '../drive/idea-scan';
+import type { CandidateInsight } from '../drive/candidate-insight';
 
 // ── Per-batch processing ────────────────────────────────────────────────────
 
@@ -149,6 +150,13 @@ export interface EntitySynthesisResult {
   /** Sensitive companion blob, null when no sensitive content this scan. */
   synthesizedSensitiveMarkdown: string | null;
   synthesisMs: number;
+  /**
+   * D2 (#38): zod-validated candidate insights assembled from this
+   * entity's distilled output, scoped by its Target. In-memory only —
+   * persistence is D4, embedding D3. Empty for pieces (distillation
+   * skipped) and when distillation failed.
+   */
+  candidates: CandidateInsight[];
 }
 
 export interface BatchOutcome {
@@ -167,6 +175,8 @@ export interface BatchOutcome {
   campaignObsDiscarded: number;
   /** Stage 3: one entry per entity that got distill+synth. */
   synthesized: EntitySynthesisResult[];
+  /** D2 (#38): all entities' candidate insights, flattened. In-memory only. */
+  candidates: CandidateInsight[];
   /**
    * Stage-3 synthesis/apply/propose failures. Non-zero means at least
    * one entity's day did NOT land (in the DB or the review queue) —
