@@ -218,6 +218,7 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
       application: 'propose',
       editedAt: scanDate,
       concurrency: DEFAULT_CONCURRENCY,
+      syncRunId: fargs.syncRunId,
     });
     // Window-commit gate: don't advance the cursor unless every entity's
     // proposals landed — the queue retry re-runs the identical window.

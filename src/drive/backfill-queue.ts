@@ -364,6 +364,7 @@ async function processOne(req: {
             structureOnly: false,
             dryrun: false,
             captureLog,
+            syncRunId: req.id,
           });
     // Bookkeeping persist gets its own guard: the scan already committed
     // (cursor included), so a transient DB error HERE must not flow into

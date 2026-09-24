@@ -286,6 +286,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       application: args.dryrun ? 'dryrun' : 'apply',
       editedAt: nextDay.date,
       concurrency: args.concurrency ?? DEFAULT_CONCURRENCY,
+      syncRunId: args.syncRunId ?? null,
     });
     const scanMs = Date.now() - scanStart;
 

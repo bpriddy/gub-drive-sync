@@ -21,6 +21,10 @@
  *                                                    PROPOSE for review)
  *   seed-edit-stats          → seedEditStats (one-shot ~1y historical
  *     [--account-id X]         drive_edit_stats seed; stats only)
+ *   refresh-snapshots        → refreshFileSnapshots (operator gcloud; one-
+ *     [--account-id X]         shot catch-up of the drive_file_snapshots
+ *     [--confirm]              name index — Drive listing only, no LLM.
+ *                              No --confirm = dry-run counts.)
  *   merge-campaign-dupes     → runCampaignMerge  (operator gcloud; one-shot
  *     --account-name X [--confirm]                 detect + merge duplicate
  *     [--min-confidence 0..1]                      campaigns. No --confirm =
@@ -51,6 +55,7 @@ import {
 import { processBackfillQueue } from './drive/backfill-queue';
 import { DRIVE_SYNC_SYSTEM_STAFF_ID } from './drive/heal';
 import { seedEditStats } from './forward/seed';
+import { refreshFileSnapshots } from './drive/snapshot-refresh';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
 import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
@@ -69,7 +74,8 @@ type Mode =
   | 'clear-account'
   | 'extract-ideas'
   | 'derive-pieces'
-  | 'seed-edit-stats';
+  | 'seed-edit-stats'
+  | 'refresh-snapshots';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -85,6 +91,7 @@ const ALL_MODES: readonly Mode[] = [
   'extract-ideas',
   'derive-pieces',
   'seed-edit-stats',
+  'refresh-snapshots',
 ];
 
 interface ParsedArgs {
@@ -247,6 +254,17 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
+  if (mode === 'refresh-snapshots') {
+    // [--account-id X]  (absent = every account with a drive_folder_id)
+    // --confirm         (write rows; absent = dry-run counts)
+    for (let i = 1; i < positional.length; i++) {
+      const arg = positional[i]!;
+      if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
+      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
+      else if (arg === '--confirm') out.confirm = true;
+    }
+  }
+
   return out;
 }
 
@@ -326,6 +344,16 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
     case 'seed-edit-stats': {
       const result = await seedEditStats({
         ...(args.accountId ? { accountId: args.accountId } : {}),
+      });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'refresh-snapshots': {
+      // Orthogonal to sync state — no reapStaleSyncs(). Writes only
+      // drive_file_snapshots rows, and only with --confirm.
+      const result = await refreshFileSnapshots({
+        ...(args.accountId ? { accountId: args.accountId } : {}),
+        confirm: args.confirm === true,
       });
       return result as unknown as Record<string, unknown>;
     }

@@ -2,6 +2,7 @@
 // by every driver (day-walk backfill today; the Activity forward driver next).
 import { prisma } from '../prisma';
 import { extractText } from '../drive/extract';
+import { snapshotForScanOutcome, writeSnapshot } from '../drive/snapshot';
 import { interpretAssetFolder } from '../drive/asset-folder';
 import {
   interpretFile,
@@ -118,6 +119,12 @@ export interface ProcessBatchOptions {
    * scan-parallelism doctrine at the pool below: days never overlap.
    */
   concurrency: number;
+  /**
+   * The run this batch belongs to, stamped on every drive_file_snapshots row
+   * the batch writes. Null when the caller has no run row (a local backfill
+   * invoked from the CLI).
+   */
+  syncRunId: string | null;
 }
 
 export async function processBatch(
@@ -134,6 +141,7 @@ export async function processBatch(
     application,
     editedAt,
     concurrency,
+    syncRunId,
   } = opts;
   // Dossier auto-apply is 'apply' only; infrastructure + automatic-ratchet
   // writes (restricted worklist, ideas, piece markdown) happen in 'propose'
@@ -217,6 +225,8 @@ export async function processBatch(
   let campaignObsDiscarded = 0;
   /** Stage-3 synthesis/apply/propose failures — see BatchOutcome.stage3Failures. */
   let stage3Failures = 0;
+  /** drive_file_snapshots rows that failed to write — those files stay stale in the name index. */
+  let snapshotWriteFailures = 0;
   /** Obs about a DIFFERENT campaign found inside a campaign zone — misfiled content, dropped. */
   let foreignObsDropped = 0;
   /** Account-zone obs naming an UNKNOWN campaign → converted to account observations (no phantoms). */
@@ -305,6 +315,7 @@ export async function processBatch(
     error?: unknown;
     extractor?: string;
     textLength?: number;
+    contentHash?: string;
     res?: InterpretFileOutput;
     /** Deck-gated candidates from the worker; null = not a deck (or no idea
      *  context); 'failed' = extraction errored (already counted). */
@@ -392,6 +403,7 @@ export async function processBatch(
         kind: 'ok',
         extractor: extraction.extractor,
         textLength: extraction.text.length,
+        contentHash: extraction.contentHash,
         res,
         ideaCandidates,
       };
@@ -712,6 +724,36 @@ export async function processBatch(
     }
   }
 
+  // One drive_file_snapshots row per scanned file — the Drive name index GUB
+  // reads (GET /org/files/search, the `_sources` lists). The v1 scanFolder
+  // path wrote these; the scan core did not, so once the scheduler moved to
+  // forward-all the index stopped at the last v1 run (2026-08-13). The row is
+  // telemetry, not dossier content, so it rides infraWrites like the
+  // restricted worklist and is written in 'propose' mode too. Campaign is the
+  // file's FOLDER attribution (where it lives in Drive), the same expression
+  // the restricted worklist uses — not the campaign an LLM tag routed its
+  // observations to. Guarded: a failed row must not reject applyChain and
+  // discard the batch's extraction spend.
+  async function recordSnapshot(o: WorkerOutcome): Promise<void> {
+    if (!infraWrites) return;
+    try {
+      await writeSnapshot(
+        snapshotForScanOutcome(
+          o,
+          {
+            accountId: ctx.accountId,
+            campaignId:
+              o.attribution.matchedCampaignId ?? (ctx.type === 'campaign' ? ctx.id : null),
+          },
+          syncRunId,
+        ),
+      );
+    } catch (err) {
+      snapshotWriteFailures++;
+      log(`      ✗ snapshot write failed for ${o.file.name}: ${summarizeError(err)}`);
+    }
+  }
+
   // Pool driver: N workers pull files by index; results are applied
   // strictly in file-index order through a serialized promise chain, so
   // every shared-state mutation happens in the same order as a serial run.
@@ -729,6 +771,7 @@ export async function processBatch(
         outcomes[nextApply] = undefined; // claimed — release for GC
         nextApply++;
         await applyOutcome(o);
+        await recordSnapshot(o);
       }
     });
     return applyChain;
@@ -792,6 +835,11 @@ export async function processBatch(
   log(
     `  → Extracted OK: ${filesExtracted}  Skipped: ${filesSkipped}  Errored: ${filesErrored}  Restricted: ${filesRestricted}  Zero obs: ${filesZeroObs}`,
   );
+  if (snapshotWriteFailures > 0) {
+    log(
+      `  ⚠ ${snapshotWriteFailures} snapshot write(s) failed — those files are missing from the Drive name index until their next change`,
+    );
+  }
   if (filesRestricted > 0) {
     log(
       `  ⛔ ${filesRestricted} restricted file(s) on the worklist — re-probed each scan; fix sharing or mark Ignore in gub-admin`,
