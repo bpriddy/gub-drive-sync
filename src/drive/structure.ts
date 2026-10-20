@@ -116,7 +116,7 @@ const StructureResponseSchema = z.object({
  * Gather the account's folder skeleton, choosing the cheap path when
  * possible:
  *   - Shared-drive root  → ONE flat paginated sweep of all folders, then
- *     reconstruct the tree in memory. O(folders/200) API calls.
+ *     reconstruct the tree in memory. O(folders/1000) API calls.
  *   - Folder inside a drive / My Drive → recursive per-folder walk.
  *     O(folders) sequential calls (slow, but the only option there).
  *

@@ -177,6 +177,13 @@ export const FILE_FIELDS =
   'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType)';
 
 /**
+ * Items per `files.list` page: the documented maximum. Drive may still
+ * return a short or empty page before the end, so every caller follows
+ * nextPageToken until it is absent.
+ */
+export const LIST_PAGE_SIZE = 1000;
+
+/**
  * List immediate children of a folder, following pagination.
  * Includes both files and subfolders. Trashed items excluded.
  */
@@ -189,7 +196,7 @@ export async function listFolderChildren(folderId: string): Promise<drive_v3.Sch
       client.files.list({
         q: `'${folderId}' in parents and trashed = false`,
         fields: `nextPageToken, files(${FILE_FIELDS})`,
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -221,7 +228,7 @@ export async function listSubfolders(folderId: string): Promise<SubfolderNode[]>
       client.files.list({
         q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
         fields: 'nextPageToken, files(id,name)',
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -240,7 +247,7 @@ export async function listSubfolders(folderId: string): Promise<SubfolderNode[]>
  * (`corpora=drive`, mimeType=folder). ONLY valid for shared-drive ids.
  *
  * The recursive folders-only walk (listSubfolders per folder) is O(folders)
- * sequential round-trips — minutes on a big drive. This is O(folders/200)
+ * sequential round-trips — minutes on a big drive. This is O(folders/1000)
  * paginated calls. The caller reconstructs the tree in memory from the
  * `parentId` pointers. Mirrors listSharedDriveFiles for the folder skeleton.
  */
@@ -265,7 +272,7 @@ export async function listAllFoldersInDrive(
         driveId,
         q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
         fields: 'nextPageToken, files(id,name,parents)',
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -358,7 +365,7 @@ export async function listSharedDriveFiles(
         q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
         orderBy,
         fields: `nextPageToken, files(${FILE_FIELDS})`,
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
