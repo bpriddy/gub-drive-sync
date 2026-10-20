@@ -53,7 +53,12 @@ vi.mock('../../prisma', () => {
     r.status === 'pending' && (!r.nextAttemptAt || r.nextAttemptAt.getTime() <= Date.now());
   return {
     prisma: {
-      driveSyncRun: { updateMany: vi.fn(async () => ({ count: 0 })), update },
+      driveSyncRun: {
+        updateMany: vi.fn(async () => ({ count: 0 })),
+        update,
+        count: async ({ where }: { where: { id: { in: string[] }; status: string } }) =>
+          db.rows.filter((r) => where.id.in.includes(r.id) && r.status === where.status).length,
+      },
       $transaction: async (cb: (tx: unknown) => unknown) =>
         cb({
           // claimNext: oldest due pending row (FOR UPDATE SKIP LOCKED in SQL).
@@ -81,6 +86,7 @@ vi.mock('../../forward/run', () => ({ runForward: m.runForward }));
 vi.mock('../../backfill', () => ({ runBackfill: m.runBackfill }));
 
 import { processBackfillQueue } from '../backfill-queue';
+import { exitCodeFor } from '../../exit-code';
 
 const RESULT = {
   scansProcessed: 1,
@@ -197,5 +203,55 @@ describe('processBackfillQueue — same-execution retry', () => {
   it('exits at once when nothing is pending', async () => {
     const summary = await drain();
     expect(summary).toMatchObject({ processed: 0, backoffWaitMs: 0 });
+  });
+});
+
+describe("processBackfillQueue — the execution's exit code", () => {
+  it('a row that fails terminally makes the execution exit non-zero', async () => {
+    addRow();
+    m.runForward.mockRejectedValue(new Error('still down'));
+    const summary = await drain();
+    expect(summary).toMatchObject({ failed: 1, requeuedAtExit: 0 });
+    expect(exitCodeFor('backfill-pending', { ...summary })).toBe(1);
+    expect(exitCodeFor('forward-all', { drain: summary })).toBe(1);
+  });
+
+  it('a row that recovers within the execution exits zero, and its log keeps the error', async () => {
+    const row = addRow();
+    m.runForward.mockRejectedValueOnce(new Error('transient boom')).mockResolvedValue(RESULT);
+    const summary = await drain();
+    expect(summary).toMatchObject({ recovered: 1, failed: 0, requeuedAtExit: 0 });
+    expect(exitCodeFor('backfill-pending', { ...summary })).toBe(0);
+    expect(row.errorMessage).toBeNull();
+    expect(row.logSummary).toContain('[recovered on attempt 2/3; previous error: transient boom]');
+  });
+
+  it('a row still re-queued when the wait budget runs out makes it exit non-zero', async () => {
+    // A row from an earlier execution, due in 9.5 min, eats most of the
+    // 10 min budget; when it then fails, its 60 s backoff no longer fits.
+    const row = addRow({ attempts: 1, nextAttemptAt: new Date(Date.now() + 570_000) });
+    m.runForward.mockRejectedValue(new Error('down again'));
+    const summary = await drain();
+    expect(summary).toMatchObject({ processed: 1, retriedLater: 1, requeuedAtExit: 1, failed: 0 });
+    expect(row.status).toBe('pending');
+    expect(row.errorMessage).toBe('down again');
+    expect(exitCodeFor('backfill-pending', { ...summary })).toBe(1);
+  });
+
+  it('does not count a row that a concurrent execution finished meanwhile', async () => {
+    const row = addRow();
+    m.runForward.mockImplementationOnce(async () => {
+      // While this execution waits out the backoff, another one claims the
+      // row and completes it.
+      setTimeout(() => {
+        row.status = 'completed';
+        row.nextAttemptAt = null;
+      }, 20_000);
+      throw new Error('transient boom');
+    });
+    const summary = await drain();
+    expect(m.runForward).toHaveBeenCalledTimes(1);
+    expect(summary).toMatchObject({ retriedLater: 1, requeuedAtExit: 0 });
+    expect(exitCodeFor('backfill-pending', { ...summary })).toBe(0);
   });
 });

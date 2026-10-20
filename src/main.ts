@@ -31,9 +31,11 @@
  *                                                    --confirm = dry-run counts.)
  *
  * Every work mode runs the reaper first — same self-heal as the original
- * router. Exit code: 0 success / 1 fatal. Cloud Run Jobs marks the
- * execution failed on non-zero, surfacing in the job history without any
- * extra monitoring surface.
+ * router. Exit code: 0 success / 1 fatal, or a queue drain
+ * (backfill-pending, forward-all) that left a row failed or still
+ * re-queued — see exit-code.ts. Cloud Run Jobs marks the execution failed
+ * on non-zero, surfacing in the job history without any extra monitoring
+ * surface.
  */
 
 import { config } from './config';
@@ -55,6 +57,7 @@ import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
 import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
 import { derivePiecesForAccount } from './drive/piece-derive';
+import { drainCountsFor, exitCodeFor } from './exit-code';
 
 type Mode =
   | 'poll'
@@ -490,7 +493,7 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
   }
 }
 
-async function main(): Promise<void> {
+async function main(): Promise<number> {
   const startedAt = Date.now();
   const args = parseArgs(process.argv);
 
@@ -504,6 +507,7 @@ async function main(): Promise<void> {
   );
 
   const outcome = await runMode(args);
+  const exitCode = exitCodeFor(args.mode, outcome);
 
   console.log(
     JSON.stringify({
@@ -511,14 +515,26 @@ async function main(): Promise<void> {
       mode: args.mode,
       outcome,
       durationMs: Date.now() - startedAt,
+      exitCode,
     }),
   );
+  if (exitCode !== 0) {
+    console.error(
+      JSON.stringify({
+        msg: 'gub-drive-sync finished with failed rows',
+        mode: args.mode,
+        ...drainCountsFor(args.mode, outcome),
+        exitCode,
+      }),
+    );
+  }
+  return exitCode;
 }
 
 main()
-  .then(async () => {
+  .then(async (exitCode) => {
     await prisma.$disconnect();
-    process.exit(0);
+    process.exit(exitCode);
   })
   .catch(async (err) => {
     console.error(

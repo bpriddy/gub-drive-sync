@@ -93,6 +93,12 @@ export interface ProcessBackfillQueueResult {
   hitMaxRequests: boolean;
   /** Rows re-queued by this execution that then completed in it. */
   recovered: number;
+  /**
+   * Rows this execution re-queued that were still pending when it ended
+   * (backoff past the wait budget, or the drain stopped early). With
+   * `failed`, what makes the execution exit non-zero (see exit-code.ts).
+   */
+  requeuedAtExit: number;
   /** Total time this execution slept waiting out row backoffs. */
   backoffWaitMs: number;
 }
@@ -162,6 +168,7 @@ async function claimNext(): Promise<{
   mode: string;
   attempts: number;
   allRemaining: boolean;
+  errorMessage: string | null;
 } | null> {
   return prisma.$transaction(async (tx) => {
     const rows = await tx.$queryRaw<Array<{ id: string }>>`
@@ -194,6 +201,9 @@ async function claimNext(): Promise<{
         mode: true,
         attempts: true,
         allRemaining: true,
+        // The previous attempt's error, read before it is cleared — so a
+        // recovered run's log_summary can still say what went wrong.
+        errorMessage: true,
       },
     });
   });
@@ -214,6 +224,23 @@ async function msUntilNextBackoffEnds(): Promise<number | null> {
   `;
   const waitMs = rows[0]?.wait_ms;
   return waitMs === null || waitMs === undefined ? null : Math.max(0, Number(waitMs));
+}
+
+/**
+ * How many of `ids` are still pending. A concurrent execution may have
+ * claimed and finished a row this one re-queued (SKIP LOCKED makes that
+ * safe), so the in-memory set alone would over-count. On a DB error, assume
+ * the worst: every id is still pending.
+ */
+async function stillPending(ids: ReadonlySet<string>): Promise<number> {
+  if (ids.size === 0) return 0;
+  try {
+    return await prisma.driveSyncRun.count({
+      where: { id: { in: [...ids] }, status: 'pending' },
+    });
+  } catch {
+    return ids.size;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -354,6 +381,7 @@ async function processOne(req: {
   mode: string;
   attempts: number;
   allRemaining: boolean;
+  errorMessage: string | null;
 }): Promise<ProcessOutcome> {
   console.log(
     JSON.stringify({
@@ -410,7 +438,14 @@ async function processOne(req: {
     // row stays 'running'; the stale-running reaper reclaims it and the
     // retry simply continues from the already-advanced cursor.
     // errorMessage is cleared — a success must not keep displaying a
-    // stale failure from an earlier attempt or reclaim.
+    // stale failure from an earlier attempt or reclaim. What that failure
+    // was stays readable in log_summary: a recovered run says so.
+    if (req.attempts > 1 && req.errorMessage) {
+      captureLog.push(
+        '',
+        `[recovered on attempt ${req.attempts}/${MAX_ATTEMPTS}; previous error: ${req.errorMessage}]`,
+      );
+    }
     let completedPersisted = true;
     await prisma.driveSyncRun
       .update({
@@ -580,6 +615,7 @@ export async function processBackfillQueue(
     retriedLater: 0,
     hitMaxRequests: false,
     recovered: 0,
+    requeuedAtExit: 0,
     backoffWaitMs: 0,
   };
   /** Rows this execution re-queued and has not yet seen complete or fail. */
@@ -648,6 +684,7 @@ export async function processBackfillQueue(
   if (summary.processed === MAX_REQUESTS_PER_INVOCATION) {
     summary.hitMaxRequests = true;
   }
+  summary.requeuedAtExit = await stillPending(backingOff);
 
   return summary;
 }
