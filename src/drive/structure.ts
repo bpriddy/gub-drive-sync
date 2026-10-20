@@ -203,14 +203,23 @@ async function walkFoldersRecursive(
       subs = await listSubfolders(folderId);
     } catch (err) {
       if (depth === 0) throw err;
-      logger.debug({ err, folderId, folderPath }, '[drive.structure] subfolder list failed — skipping');
+      logger.debug(
+        { err, folderId, folderPath },
+        '[drive.structure] subfolder list failed — skipping',
+      );
       return;
     }
     for (const sub of subs) {
       const subPath = `${folderPath} / ${sub.name}`;
       // parentId is null when the immediate parent IS the account root.
       const parentIdField = folderId === rootFolderId ? null : folderId;
-      out.push({ id: sub.id, name: sub.name, path: subPath, depth: depth + 1, parentId: parentIdField });
+      out.push({
+        id: sub.id,
+        name: sub.name,
+        path: subPath,
+        depth: depth + 1,
+        parentId: parentIdField,
+      });
       if (onProgress) onProgress(out.length);
       await recurse(sub.id, subPath, depth + 1);
     }
@@ -417,9 +426,7 @@ export interface EntityAttribution {
   pieceFolderId: string | null;
 }
 
-export type Attributor = (
-  parentFolderId: string | null | undefined,
-) => EntityAttribution;
+export type Attributor = (parentFolderId: string | null | undefined) => EntityAttribution;
 
 /**
  * Build a function that maps a file's immediate parent folder id to its
@@ -534,4 +541,3 @@ export function buildAttributor(map: EntityMap, pieces: PieceAnchor[] = []): Att
     return accountAttribution;
   };
 }
-

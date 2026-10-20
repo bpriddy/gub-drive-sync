@@ -26,18 +26,23 @@ const MAX_DEPTH = 100;
  * rest of the tree. Failures on the ROOT folder still throw — there's
  * nothing meaningful to scan if we can't read the root.
  */
-export type OnFolderError = (
-  args: { folderId: string; folderPath: string; depth: number; err: unknown },
-) => void | Promise<void>;
+export type OnFolderError = (args: {
+  folderId: string;
+  folderPath: string;
+  depth: number;
+  err: unknown;
+}) => void | Promise<void>;
 
 /**
  * Called when traversal hits MAX_DEPTH and refuses to descend further.
  * Lets callers surface a count of skipped-due-to-depth subfolders so
  * operators know files deeper than the cap may have been missed.
  */
-export type OnDepthCap = (
-  args: { folderId: string; folderPath: string; depth: number },
-) => void | Promise<void>;
+export type OnDepthCap = (args: {
+  folderId: string;
+  folderPath: string;
+  depth: number;
+}) => void | Promise<void>;
 
 export interface TraverseFolderOptions {
   onFolderError?: OnFolderError;
@@ -81,7 +86,10 @@ async function* walk(
     // Subfolder unreachable: surface via callback, then skip this branch
     // and continue with siblings. One bad-permission subfolder shouldn't
     // tank the whole entity scan.
-    logger.debug({ err, folderId, folderPath, depth }, '[drive] subfolder listFolderChildren failed — skipping');
+    logger.debug(
+      { err, folderId, folderPath, depth },
+      '[drive] subfolder listFolderChildren failed — skipping',
+    );
     if (options.onFolderError) {
       await options.onFolderError({ folderId, folderPath, depth, err });
     }

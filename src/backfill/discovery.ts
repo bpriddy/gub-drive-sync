@@ -47,8 +47,12 @@ export async function gatherFilesRecursive(
     process.stdout.write('\r' + line.padEnd(100).slice(0, 100));
   };
   for await (const f of traverseFolder(folderId, label, {
-    onFolderError: () => { subfolderErrors++; },
-    onDepthCap: () => { depthCapHits++; },
+    onFolderError: () => {
+      subfolderErrors++;
+    },
+    onDepthCap: () => {
+      depthCapHits++;
+    },
   })) {
     if (f.isFolder) {
       folderCount++;
@@ -60,7 +64,8 @@ export async function gatherFilesRecursive(
   }
   if (isTTY) process.stdout.write('\r' + ' '.repeat(100) + '\r');
   if (subfolderErrors > 0) log(`  ⚠ ${subfolderErrors} subfolder(s) unreadable (skipped)`);
-  if (depthCapHits > 0) log(`  ⚠ ${depthCapHits} subfolder(s) past depth cap — files beneath NOT listed`);
+  if (depthCapHits > 0)
+    log(`  ⚠ ${depthCapHits} subfolder(s) past depth cap — files beneath NOT listed`);
   files.sort((a, b) => {
     const at = a.createdTime ? new Date(a.createdTime).getTime() : 0;
     const bt = b.createdTime ? new Date(b.createdTime).getTime() : 0;
