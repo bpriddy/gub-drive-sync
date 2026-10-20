@@ -20,6 +20,8 @@ import { google, type driveactivity_v2 } from 'googleapis';
 import { config } from '../config';
 import { logger } from '../logger';
 import { buildBotOAuthClient } from '../workspace';
+import { runThroughDriveLimiter } from '../drive/client';
+import { withTransientRetry } from '../drive/retry';
 
 const ACTIVITY_SCOPE = 'https://www.googleapis.com/auth/drive.activity.readonly';
 
@@ -90,14 +92,20 @@ export async function queryActivityWindow(
   const events: ActivityEvent[] = [];
   let pageToken: string | undefined;
   do {
-    const res = await client.activity.query({
-      requestBody: {
-        ancestorName: `items/${rootFolderId}`,
-        filter: `time > "${fromIso}" AND time <= "${toIso}"`,
-        pageSize: 500,
-        ...(pageToken ? { pageToken } : {}),
-      },
-    });
+    // A query is a POST, which gaxios never retries, so one 429/5xx or
+    // timeout used to fail the whole run (and the row waited a day). It is
+    // an idempotent read: the limiter paces it and retries rate limits,
+    // withTransientRetry retries 5xx, dropped sockets and timeouts. Each
+    // page retries on its own; pageToken makes a repeated page harmless.
+    const requestBody = {
+      ancestorName: `items/${rootFolderId}`,
+      filter: `time > "${fromIso}" AND time <= "${toIso}"`,
+      pageSize: 500,
+      ...(pageToken ? { pageToken } : {}),
+    };
+    const res = await withTransientRetry(() =>
+      runThroughDriveLimiter(() => client.activity.query({ requestBody })),
+    );
     for (const activity of res.data.activities ?? []) {
       const ts = activity.timestamp ?? activity.timeRange?.endTime ?? null;
       if (!ts) continue;

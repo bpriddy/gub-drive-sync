@@ -132,6 +132,16 @@ class DriveRateLimiter {
  */
 const driveLimiter = new DriveRateLimiter(4);
 
+/**
+ * Run a call through the shared limiter (pacing + rate-limit retry) — for
+ * Drive-family calls made outside this module, e.g. the Activity query.
+ * Compose a transient retry OUTSIDE it, never inside (see ./retry):
+ *   withTransientRetry(() => runThroughDriveLimiter(() => call()))
+ */
+export function runThroughDriveLimiter<T>(fn: () => Promise<T>): Promise<T> {
+  return driveLimiter.run(fn);
+}
+
 // ── Drive API client (lazy singleton, OAuth-backed) ──────────────────────────
 
 let cachedClient: drive_v3.Drive | null = null;
