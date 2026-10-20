@@ -16,7 +16,6 @@ import type { AccountObservation, CampaignObservation } from '../drive/interpret
 import { log } from './output';
 import type { EntityCtx } from './batch-types';
 
-
 // ── Distillation (the engine's structured-field step) ───────────────────────
 //
 // Runs the drive.distillation.v1 preset over an entity's observation bucket
@@ -250,7 +249,9 @@ export async function persistTarget(args: {
     });
     return;
   }
-  throw new Error(`persistTarget: unsupported target shape (${target.entityType}/${target.entityStatus})`);
+  throw new Error(
+    `persistTarget: unsupported target shape (${target.entityType}/${target.entityStatus})`,
+  );
 }
 
 /**
@@ -421,10 +422,7 @@ async function persistNewCampaignTarget(args: {
   } = args;
   const initialFields: Record<string, unknown> = {};
   for (const vc of validatedChanges) {
-    initialFields[vc.spec.entityColumn] = castToEntity(
-      vc.spec.changeKind,
-      vc.validatedValue,
-    );
+    initialFields[vc.spec.entityColumn] = castToEntity(vc.spec.changeKind, vc.validatedValue);
   }
 
   await prisma.$transaction(async (tx) => {

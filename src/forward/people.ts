@@ -23,9 +23,7 @@ const DIRECTORY_SCOPE = 'https://www.googleapis.com/auth/directory.readonly';
  * successes are cached for the next run. The synthetic '(unattributed)'
  * actor passes through untouched.
  */
-export async function resolveActors(
-  resources: ReadonlySet<string>,
-): Promise<Map<string, string>> {
+export async function resolveActors(resources: ReadonlySet<string>): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const pending: string[] = [];
 
@@ -91,7 +89,12 @@ export async function resolveActors(
     }
   }
   logger.info(
-    { requested: resources.size, cacheHits: pending.length - misses.length, resolved, unresolved: misses.length - resolved },
+    {
+      requested: resources.size,
+      cacheHits: pending.length - misses.length,
+      resolved,
+      unresolved: misses.length - resolved,
+    },
     '[forward.people] actor resolution complete',
   );
   return out;

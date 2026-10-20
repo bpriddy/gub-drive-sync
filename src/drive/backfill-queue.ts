@@ -249,8 +249,7 @@ async function scheduleContinuation(
   }
 
   const url =
-    `https://run.googleapis.com/v2/projects/${project}` +
-    `/locations/${region}/jobs/${job}:run`;
+    `https://run.googleapis.com/v2/projects/${project}` + `/locations/${region}/jobs/${job}:run`;
   const body = {
     overrides: {
       containerOverrides: [

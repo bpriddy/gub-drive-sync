@@ -32,12 +32,7 @@
 
 import crypto from 'node:crypto';
 import mammoth from 'mammoth';
-import {
-  google,
-  type docs_v1,
-  type slides_v1,
-  type sheets_v4,
-} from 'googleapis';
+import { google, type docs_v1, type slides_v1, type sheets_v4 } from 'googleapis';
 import { config } from '../config';
 import { logger } from '../logger';
 import { downloadFileBuffer } from './client';
@@ -151,7 +146,11 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
   let isShortcutFollow = false;
   if (file.mimeType === MIME.SHORTCUT) {
     if (!file.shortcutTarget) {
-      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut without resolved target' };
+      return {
+        kind: 'skip',
+        reason: 'unsupported_mime',
+        detail: 'shortcut without resolved target',
+      };
     }
     if (file.shortcutTarget.mimeType === MIME.GOOGLE_FOLDER) {
       return {
@@ -161,7 +160,11 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
       };
     }
     if (file.shortcutTarget.mimeType === MIME.SHORTCUT) {
-      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut chain (single-level follow only)' };
+      return {
+        kind: 'skip',
+        reason: 'unsupported_mime',
+        detail: 'shortcut chain (single-level follow only)',
+      };
     }
     effective = {
       ...file,
@@ -351,9 +354,7 @@ function walkDocStructuralElement(el: docs_v1.Schema$StructuralElement): string 
 function walkDocParagraph(p: docs_v1.Schema$Paragraph): string {
   // Each paragraph element already ends with \n in Google's content (the
   // textRun's content string includes the trailing newline). Just join.
-  return (p.elements ?? [])
-    .map((e) => e.textRun?.content ?? '')
-    .join('');
+  return (p.elements ?? []).map((e) => e.textRun?.content ?? '').join('');
 }
 
 function walkDocTable(t: docs_v1.Schema$Table): string {
@@ -406,10 +407,7 @@ export async function extractGoogleSlides(presentationId: string): Promise<strin
     // (a separate page entirely). We section them off so Gemini sees them
     // as notes, not main slide content.
     const notesEls = slide.slideProperties?.notesPage?.pageElements ?? [];
-    const notes = notesEls
-      .map(walkSlidesPageElement)
-      .join('')
-      .trim();
+    const notes = notesEls.map(walkSlidesPageElement).join('').trim();
     if (notes) {
       parts.push(`\n### Speaker notes\n${notes}\n`);
     }
@@ -422,9 +420,7 @@ export async function extractGoogleSlides(presentationId: string): Promise<strin
 
 function walkSlidesPageElement(el: slides_v1.Schema$PageElement): string {
   if (el.shape?.text) {
-    const text = (el.shape.text.textElements ?? [])
-      .map((te) => te.textRun?.content ?? '')
-      .join('');
+    const text = (el.shape.text.textElements ?? []).map((te) => te.textRun?.content ?? '').join('');
     return text ? text.replace(/\n+$/, '') + '\n' : '';
   }
   if (el.table) {

@@ -39,10 +39,7 @@ describe('withTransientRetry', () => {
   it('retries through a transient fault and succeeds', async () => {
     vi.useFakeTimers();
     try {
-      const fn = vi
-        .fn()
-        .mockRejectedValueOnce({ code: 503 })
-        .mockResolvedValue('ok');
+      const fn = vi.fn().mockRejectedValueOnce({ code: 503 }).mockResolvedValue('ok');
       const promise = withTransientRetry(fn);
       await vi.advanceTimersByTimeAsync(1000);
       await expect(promise).resolves.toBe('ok');

@@ -54,7 +54,9 @@ export function isTransientTransportError(err: unknown): boolean {
   ) {
     return true;
   }
-  return typeof e.message === 'string' && /socket hang up|network socket disconnected/i.test(e.message);
+  return (
+    typeof e.message === 'string' && /socket hang up|network socket disconnected/i.test(e.message)
+  );
 }
 
 /**

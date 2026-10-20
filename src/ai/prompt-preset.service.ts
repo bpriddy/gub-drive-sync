@@ -36,7 +36,9 @@ function renderTemplate(template: string, variables: RunPresetOptions['variables
   });
 }
 
-export async function runPreset(opts: RunPresetOptions): Promise<LlmCompletionResult & { prompt: string }> {
+export async function runPreset(
+  opts: RunPresetOptions,
+): Promise<LlmCompletionResult & { prompt: string }> {
   const preset = await prisma.promptPreset.findUnique({ where: { key: opts.key } });
   if (!preset) {
     throw new Error(`[prompt-preset] no preset found with key=${opts.key}`);
@@ -66,7 +68,7 @@ export function parseLlmJson<T = unknown>(raw: string): T {
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   const candidate = fenced ? fenced[1] : raw;
   if (!candidate) throw new Error('[prompt-preset] empty LLM response');
-  const firstBrace = candidate.search(/[\[{]/);
+  const firstBrace = candidate.search(/[[{]/);
   const sliced = firstBrace >= 0 ? candidate.slice(firstBrace) : candidate;
   return JSON.parse(sliced) as T;
 }

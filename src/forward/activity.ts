@@ -22,14 +22,7 @@ import { buildBotOAuthClient } from '../workspace';
 
 const ACTIVITY_SCOPE = 'https://www.googleapis.com/auth/drive.activity.readonly';
 
-export type ActivityAction =
-  | 'edit'
-  | 'create'
-  | 'delete'
-  | 'move'
-  | 'rename'
-  | 'restore'
-  | 'other';
+export type ActivityAction = 'edit' | 'create' | 'delete' | 'move' | 'rename' | 'restore' | 'other';
 
 export interface ActivityEvent {
   fileId: string;
@@ -101,20 +94,18 @@ export async function queryActivityWindow(
       },
     });
     for (const activity of res.data.activities ?? []) {
-      const ts =
-        activity.timestamp ?? activity.timeRange?.endTime ?? null;
+      const ts = activity.timestamp ?? activity.timeRange?.endTime ?? null;
       if (!ts) continue;
       // One actor per normalized event: the first user actor. Multi-actor
       // consolidated activities are rare; per-actor fidelity comes from
       // the fact that co-editing sessions produce per-actor activities.
       const actorResource =
-        activity.actors?.find((a) => a.user?.knownUser?.personName)?.user
-          ?.knownUser?.personName ?? null;
+        activity.actors?.find((a) => a.user?.knownUser?.personName)?.user?.knownUser?.personName ??
+        null;
       for (const action of activity.actions ?? []) {
         const kind = classifyAction(action.detail);
         // Action-level target wins; fall back to the activity's targets.
-        const targets =
-          action.target ? [action.target] : (activity.targets ?? []);
+        const targets = action.target ? [action.target] : (activity.targets ?? []);
         for (const t of targets) {
           const { id, title } = targetFileId(t);
           if (!id) continue;

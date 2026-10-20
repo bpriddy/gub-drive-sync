@@ -25,12 +25,7 @@
 import { ApiError, GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google/genai';
 import { config } from '../config';
 import { logger } from '../logger';
-import type {
-  LlmCompletionRequest,
-  LlmCompletionResult,
-  LlmDriver,
-  LlmUsage,
-} from './ai.types';
+import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } from './ai.types';
 
 /**
  * Retry posture for Gemini calls.
@@ -129,10 +124,7 @@ class GeminiLlmDriver implements LlmDriver {
             }
           : undefined;
         if (usage) {
-          logger.debug(
-            { model: req.model, tag: req.tag, ...usage },
-            '[gemini] usage',
-          );
+          logger.debug({ model: req.model, tag: req.tag, ...usage }, '[gemini] usage');
         }
         if (attempt > 1) {
           logger.info(
@@ -172,9 +164,7 @@ class MockLlmDriver implements LlmDriver {
 
   async complete(req: LlmCompletionRequest): Promise<LlmCompletionResult> {
     logger.info({ tag: req.tag, model: req.model }, '[llm:mock] returning stub response');
-    const text = req.responseSchema
-      ? JSON.stringify(emptyInstance(req.responseSchema))
-      : '[]';
+    const text = req.responseSchema ? JSON.stringify(emptyInstance(req.responseSchema)) : '[]';
     return { text, driver: this.name, model: req.model };
   }
 }

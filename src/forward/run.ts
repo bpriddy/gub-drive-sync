@@ -173,7 +173,9 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
       meta = await timed('file_metadata', () => getFileMetadata(id));
     } catch (err) {
       filesUnfetchable++;
-      log(`    ⚠ metadata unreadable for ${id} after retries: ${summarizeError(err)} — file dropped from this window`);
+      log(
+        `    ⚠ metadata unreadable for ${id} after retries: ${summarizeError(err)} — file dropped from this window`,
+      );
       continue;
     }
     if (!meta?.id || !meta.name) {
