@@ -30,7 +30,16 @@
 import { z } from 'zod';
 import { logger } from '../logger';
 import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
-import { listAllFoldersInDrive, listSubfolders, probeFolder, type DriveFolderRec } from './client';
+import {
+  FlatListingUnavailableError,
+  isListingUnavailableError,
+  listAllFoldersInDrive,
+  listingFailureCause,
+  listSubfolders,
+  probeFolder,
+  type DriveFolderRec,
+} from './client';
+import { buildTreeFromFlat } from './folder-tree';
 import { structureResolutionResponseSchema } from './structured-output';
 
 // Folders are shallow in practice; this is a defense-in-depth rail against
@@ -115,10 +124,17 @@ const StructureResponseSchema = z.object({
 /**
  * Gather the account's folder skeleton, choosing the cheap path when
  * possible:
- *   - Shared-drive root  → ONE flat paginated sweep of all folders, then
- *     reconstruct the tree in memory. O(folders/1000) API calls.
- *   - Folder inside a drive / My Drive → recursive per-folder walk.
- *     O(folders) sequential calls (slow, but the only option there).
+ *   - Any root inside a shared drive (the drive itself or a folder in it)
+ *     → ONE flat paginated sweep of the drive's folders, then cut the
+ *     root's subtree out in memory (buildTreeFromFlat). O(drive folders /
+ *     1000) API calls, whatever the subtree's size.
+ *   - My Drive root → recursive per-folder walk. O(folders) sequential
+ *     calls: `corpora=drive` needs a shared drive, and My Drive has no
+ *     listing scoped to one folder's descendants.
+ *
+ * A folder inside a shared drive falls back to the walk when the drive
+ * listing is refused (isListingUnavailableError): the bot can hold access to
+ * a folder without being a member of its drive.
  *
  * Returns folder nodes with breadcrumb paths + depth, depth-first ordered.
  */
@@ -133,58 +149,37 @@ export async function gatherFolders(
   opts: GatherFoldersOptions = {},
 ): Promise<FolderNode[]> {
   const probe = await probeFolder(rootFolderId);
-  if (probe.isSharedDriveRoot && probe.driveId) {
-    const flat = await listAllFoldersInDrive(probe.driveId, {
-      ...(opts.onProgress ? { onPage: opts.onProgress } : {}),
-    });
-    return buildTreeFromFlat(rootFolderId, rootLabel, flat);
+  if (probe.driveId) {
+    let flat: DriveFolderRec[] | null = null;
+    try {
+      const listed = await listAllFoldersInDrive(probe.driveId, {
+        ...(opts.onProgress ? { onPage: opts.onProgress } : {}),
+      });
+      // A listing without the root folder cannot be cut to its subtree, and
+      // an empty cut would read as "no subfolders". Same as a refusal.
+      if (!probe.isSharedDriveRoot && !listed.some((f) => f.id === rootFolderId)) {
+        throw new FlatListingUnavailableError('root folder is not in the drive listing');
+      }
+      flat = listed;
+    } catch (err) {
+      // The drive root has no other path. Anything but a refusal (a 5xx
+      // after retries, a rate limit after backoff) would fail the walk too.
+      if (probe.isSharedDriveRoot || !isListingUnavailableError(err)) throw err;
+      logger.warn(
+        { fallback: 'recursive', cause: listingFailureCause(err) },
+        '[drive.structure] flat listing unavailable — walking recursively',
+      );
+    }
+    if (flat) return buildTreeFromFlat(rootFolderId, rootLabel, flat);
   }
   return walkFoldersRecursive(rootFolderId, rootLabel, opts.onProgress);
 }
 
 /**
- * Reconstruct a depth-first folder tree from a flat folder list (each with
- * an immediate parentId). Cycle-safe (visited set) and depth-capped.
- */
-function buildTreeFromFlat(
-  rootId: string,
-  rootLabel: string,
-  flat: DriveFolderRec[],
-): FolderNode[] {
-  const childrenByParent = new Map<string, DriveFolderRec[]>();
-  for (const f of flat) {
-    const p = f.parentId ?? '';
-    const bucket = childrenByParent.get(p);
-    if (bucket) bucket.push(f);
-    else childrenByParent.set(p, [f]);
-  }
-
-  const out: FolderNode[] = [];
-  const visited = new Set<string>();
-
-  const descend = (parentFolderId: string, parentPath: string, depth: number): void => {
-    if (depth > MAX_DEPTH) return;
-    const kids = childrenByParent.get(parentFolderId) ?? [];
-    for (const k of kids) {
-      if (visited.has(k.id)) continue; // defensive against multi-parent / cycles
-      visited.add(k.id);
-      const path = `${parentPath} / ${k.name}`;
-      // parentId is the FolderNode parent — null when the parent is the
-      // account root itself (we don't model the root as a FolderNode).
-      const parentIdField = parentFolderId === rootId ? null : parentFolderId;
-      out.push({ id: k.id, name: k.name, path, depth: depth + 1, parentId: parentIdField });
-      descend(k.id, path, depth + 1);
-    }
-  };
-
-  descend(rootId, rootLabel, 0);
-  return out;
-}
-
-/**
- * Recursive folders-only walk — fallback for non-shared-drive roots, where
- * the flat `corpora=drive` sweep isn't available. Subfolder errors are
- * swallowed (one unreadable subfolder shouldn't tank the whole read).
+ * Recursive folders-only walk — for My Drive roots, where the flat
+ * `corpora=drive` sweep isn't available, and for a folder inside a shared
+ * drive whose drive listing is refused. Subfolder errors are swallowed (one
+ * unreadable subfolder shouldn't tank the whole read).
  */
 async function walkFoldersRecursive(
   rootFolderId: string,
