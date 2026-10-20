@@ -20,11 +20,14 @@
  * costs nothing).
  *
  * Retry policy: a row that errors during processing is re-queued with
- * exponential backoff (60s → 120s → 240s, capped at 30min) and stays
- * eligible for the next claim cycle WITHIN THIS Job execution OR a future
- * one. After MAX_ATTEMPTS the row is marked terminal-failed; the operator
- * resolves it through the UI (re-queue or investigate). No periodic retry
- * infra — a human is in the loop for permanent failures.
+ * exponential backoff (60s → 120s → 240s, capped at 30min) and is retried
+ * WITHIN THIS Job execution: when nothing is claimable but a row is backing
+ * off, the drain sleeps until its next_attempt_at instead of exiting (total
+ * sleep bounded by MAX_BACKOFF_WAIT_MS; a row still backing off after that
+ * waits for a future execution). After MAX_ATTEMPTS the row is marked
+ * terminal-failed; the operator resolves it through the UI (re-queue or
+ * investigate). No periodic retry infra — a human is in the loop for
+ * permanent failures.
  *
  * Trigger model: this is invoked by `triggerDriveSyncJob({ mode:
  * 'backfill-pending' })` in gub-admin's POST handler when the operator
@@ -60,6 +63,17 @@ const MAX_ATTEMPTS = 3;
 /** Exponential backoff base: 60s → 120s → 240s, capped at BACKOFF_MAX_MS. */
 const BACKOFF_BASE_MS = 60 * 1_000;
 const BACKOFF_MAX_MS = 30 * 60 * 1_000;
+/**
+ * Most the drain sleeps in total, per execution, waiting out row backoffs.
+ * One row's worst case before it goes terminal is 60s + 120s; 10 min covers
+ * a few failing rows without letting a flapping queue hold the job open.
+ */
+const MAX_BACKOFF_WAIT_MS = 10 * 60 * 1_000;
+/**
+ * Added to each wait: the claim compares next_attempt_at to the DB's NOW(),
+ * so wake a little after it, not on it.
+ */
+const BACKOFF_WAIT_SLACK_MS = 2_000;
 const LOG_SUMMARY_TAIL_LINES = 40;
 const LOG_SUMMARY_MAX_BYTES = 2_000;
 /**
@@ -77,6 +91,10 @@ export interface ProcessBackfillQueueResult {
   failed: number;
   retriedLater: number;
   hitMaxRequests: boolean;
+  /** Rows re-queued by this execution that then completed in it. */
+  recovered: number;
+  /** Total time this execution slept waiting out row backoffs. */
+  backoffWaitMs: number;
 }
 
 function tailLogSummary(capture: string[]): string {
@@ -179,6 +197,27 @@ async function claimNext(): Promise<{
       },
     });
   });
+}
+
+/**
+ * Milliseconds until the earliest backing-off pending row becomes
+ * claimable, or null when no pending row is waiting on a backoff. Measured
+ * against the DB clock — the same NOW() claimNext compares to — so app/DB
+ * clock skew can't make the drain wake too early.
+ */
+async function msUntilNextBackoffEnds(): Promise<number | null> {
+  const rows = await prisma.$queryRaw<Array<{ wait_ms: number | null }>>`
+    SELECT CEIL(EXTRACT(EPOCH FROM (MIN(next_attempt_at) - NOW())) * 1000)::float8 AS wait_ms
+    FROM drive_sync_runs
+    WHERE status = 'pending'
+      AND next_attempt_at > NOW()
+  `;
+  const waitMs = rows[0]?.wait_ms;
+  return waitMs === null || waitMs === undefined ? null : Math.max(0, Number(waitMs));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -515,14 +554,22 @@ async function processOne(req: {
 
 /**
  * Single-invocation drain. Loops claim → process → claim … until either:
- *   - claimNext() returns null (queue empty or all eligible rows already
- *     claimed by a parallel execution, OR backoff-deferred)
+ *   - claimNext() returns null and no pending row is backing off (queue
+ *     empty, or all eligible rows already claimed by a parallel execution)
+ *   - the next backoff would push the total wait past MAX_BACKOFF_WAIT_MS
  *   - MAX_REQUESTS_PER_INVOCATION is reached (runaway-safety backstop)
+ *
+ * A row that fails is re-queued with a backoff; when it is the only work
+ * left, the drain sleeps until it is due and retries it here — before, the
+ * drain exited and the retry waited for the next day's tick.
  *
  * Returns a structured summary so the Job's outcome log captures what
  * was done.
  */
-export async function processBackfillQueue(): Promise<ProcessBackfillQueueResult> {
+export async function processBackfillQueue(
+  opts: { sleep?: (ms: number) => Promise<void> } = {},
+): Promise<ProcessBackfillQueueResult> {
+  const pause = opts.sleep ?? sleep;
   const reclaimed = await reclaimStaleRunning();
 
   const summary: ProcessBackfillQueueResult = {
@@ -532,16 +579,51 @@ export async function processBackfillQueue(): Promise<ProcessBackfillQueueResult
     failed: 0,
     retriedLater: 0,
     hitMaxRequests: false,
+    recovered: 0,
+    backoffWaitMs: 0,
   };
+  /** Rows this execution re-queued and has not yet seen complete or fail. */
+  const backingOff = new Set<string>();
 
   while (summary.processed < MAX_REQUESTS_PER_INVOCATION) {
     const claimed = await claimNext();
-    if (!claimed) break;
+    if (!claimed) {
+      const dueInMs = await msUntilNextBackoffEnds();
+      if (dueInMs === null) break;
+      const waitMs = dueInMs + BACKOFF_WAIT_SLACK_MS;
+      if (summary.backoffWaitMs + waitMs > MAX_BACKOFF_WAIT_MS) {
+        console.warn(
+          JSON.stringify({
+            msg: 'backfill-queue.backoff_wait_budget_exhausted',
+            nextDueInMs: dueInMs,
+            waitedMs: summary.backoffWaitMs,
+            budgetMs: MAX_BACKOFF_WAIT_MS,
+            hint: 'a row is still backing off; a later execution retries it',
+          }),
+        );
+        break;
+      }
+      console.log(
+        JSON.stringify({
+          msg: 'backfill-queue.waiting_for_backoff',
+          waitMs,
+          waitedMs: summary.backoffWaitMs,
+        }),
+      );
+      await pause(waitMs);
+      summary.backoffWaitMs += waitMs;
+      continue;
+    }
     const outcome = await processOne(claimed);
     summary.processed += 1;
     if (outcome.kind === 'completed') summary.completed += 1;
     else if (outcome.kind === 'retried') summary.retriedLater += 1;
     else summary.failed += 1;
+    if (outcome.kind === 'retried') {
+      backingOff.add(claimed.id);
+    } else if (backingOff.delete(claimed.id) && outcome.kind === 'completed') {
+      summary.recovered += 1;
+    }
 
     // If this iteration triggered a continuation (all_remaining +
     // budget exhausted), STOP draining in this Job. A new Job was
