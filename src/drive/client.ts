@@ -27,9 +27,15 @@
 
 import { google, type drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
+import { config } from '../config';
 import { logger } from '../logger';
-import { withTransientRetry } from './retry';
+import { jitteredDelayMs } from '../backoff';
+import { isRateLimitError, RequestTimeoutError, withTransientRetry } from './retry';
 import { buildBotOAuthClient } from '../workspace';
+
+// Re-exported: the classifier lives in the config-free ./retry so the scan
+// core can classify a failure without the client's auth imports.
+export { isRateLimitError };
 
 const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 
@@ -54,31 +60,7 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 // calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
 // burst. Acceptable, and we never get a 403 in steady state.
 
-export function isRateLimitError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as {
-    code?: number;
-    status?: number;
-    errors?: Array<{ reason?: string }>;
-    response?: { status?: number; data?: { error?: { errors?: Array<{ reason?: string }> } } };
-  };
-  const status = e.code ?? e.status ?? e.response?.status;
-  if (status !== 403 && status !== 429) return false;
-  const reasons: string[] = [
-    ...(e.errors ?? []).map((x) => x.reason ?? ''),
-    ...(e.response?.data?.error?.errors ?? []).map((x) => x.reason ?? ''),
-  ];
-  // Reasons that mean "rate-limited, try again." Other 403s (auth, perms)
-  // are NOT retryable and should propagate immediately.
-  return reasons.some(
-    (r) =>
-      r === 'userRateLimitExceeded' ||
-      r === 'rateLimitExceeded' ||
-      r === 'quotaExceeded',
-  );
-}
-
-class DriveRateLimiter {
+export class DriveRateLimiter {
   private chainTail: Promise<void> = Promise.resolve();
   private lastCallEndAt = 0;
   private readonly minIntervalMs: number;
@@ -109,8 +91,9 @@ class DriveRateLimiter {
     // Defense in depth: even with pacing, transient quota throttles can
     // slip through (bot user has tighter-than-documented quota,
     // cumulative effects, concurrent processes sharing the bot user).
-    // Retry rate-limit errors with exponential backoff: 2s → 4s → 8s →
-    // 16s → 30s. Non-rate-limit errors propagate immediately.
+    // Retry rate-limit errors with exponential backoff: nominal 2s → 4s →
+    // 8s → 16s (cap 30s), jittered ×[0.5, 1.5). Non-rate-limit errors
+    // propagate immediately.
     const MAX_ATTEMPTS = 5;
     let lastErr: unknown;
     try {
@@ -120,7 +103,7 @@ class DriveRateLimiter {
         } catch (err) {
           lastErr = err;
           if (!isRateLimitError(err) || attempt === MAX_ATTEMPTS) throw err;
-          const backoffMs = Math.min(2000 * Math.pow(2, attempt - 1), 30_000);
+          const backoffMs = jitteredDelayMs(Math.min(2000 * Math.pow(2, attempt - 1), 30_000));
           logger.warn(
             { attempt, MAX_ATTEMPTS, backoffMs },
             '[drive.client] rate-limited despite pacing — backing off and retrying',
@@ -151,6 +134,16 @@ class DriveRateLimiter {
  */
 const driveLimiter = new DriveRateLimiter(4);
 
+/**
+ * Run a call through the shared limiter (pacing + rate-limit retry) — for
+ * Drive-family calls made outside this module, e.g. the Activity query.
+ * Compose a transient retry OUTSIDE it, never inside (see ./retry):
+ *   withTransientRetry(() => runThroughDriveLimiter(() => call()))
+ */
+export function runThroughDriveLimiter<T>(fn: () => Promise<T>): Promise<T> {
+  return driveLimiter.run(fn);
+}
+
 // ── Drive API client (lazy singleton, OAuth-backed) ──────────────────────────
 
 let cachedClient: drive_v3.Drive | null = null;
@@ -169,7 +162,9 @@ export async function driveClient(): Promise<drive_v3.Drive> {
   const auth = await buildBotOAuthClient('drive', [DRIVE_READONLY_SCOPE]);
   logger.info('[drive.client] initialized Drive client (bot-user OAuth)');
 
-  cachedClient = google.drive({ version: 'v3', auth });
+  // Service-level gaxios timeout: every metadata/list call aborts after
+  // DRIVE_READ_TIMEOUT_MS (gaxios then retries a timed-out GET twice).
+  cachedClient = google.drive({ version: 'v3', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedClient;
 }
 
@@ -406,9 +401,7 @@ export async function listSharedDriveFiles(
  * that has had sufficient effort spent on it and propagates — callers
  * decide whether to lose the file or fail the run.
  */
-export async function getFileMetadata(
-  fileId: string,
-): Promise<drive_v3.Schema$File | null> {
+export async function getFileMetadata(fileId: string): Promise<drive_v3.Schema$File | null> {
   const client = await driveClient();
   try {
     const res = await withTransientRetry(() =>
@@ -432,13 +425,35 @@ export async function getFileMetadata(
  */
 export async function downloadFileBuffer(fileId: string): Promise<Buffer> {
   const client = await driveClient();
-  const res = await driveLimiter.run(() =>
-    client.files.get(
-      { fileId, alt: 'media', supportsAllDrives: true },
-      { responseType: 'stream' },
-    ),
-  );
-  return streamToBuffer(res.data as Readable);
+  // One deadline for the whole download. gaxios' `timeout` stops at the
+  // response headers; the abort signal also covers a body that stalls
+  // mid-stream. The per-request `timeout` overrides the service-level read
+  // timeout, which is far too short for a large binary. The deadline is
+  // armed when the request starts, inside the limiter, so time spent
+  // queued behind other Drive calls never counts against it.
+  const timeoutMs = config.DRIVE_MEDIA_TIMEOUT_MS;
+  const abort = new AbortController();
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    const res = await driveLimiter.run(() => {
+      if (timer) clearTimeout(timer); // a rate-limit retry re-arms
+      if (timeoutMs > 0) timer = setTimeout(() => abort.abort(), timeoutMs);
+      return client.files.get(
+        { fileId, alt: 'media', supportsAllDrives: true },
+        { responseType: 'stream', timeout: timeoutMs, signal: abort.signal },
+      );
+    });
+    return await streamToBuffer(res.data as Readable);
+  } catch (err) {
+    if (abort.signal.aborted) {
+      throw new RequestTimeoutError(`media download timed out after ${timeoutMs} ms`, {
+        cause: err,
+      });
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function streamToBuffer(stream: Readable): Promise<Buffer> {
@@ -573,10 +588,7 @@ function isPageTokenExpired(err: unknown): boolean {
  * folder shape (3–5 levels deep). If trees get truly deep, add a parent-id
  * cache.
  */
-export async function isInsideFolder(
-  fileId: string,
-  rootFolderId: string,
-): Promise<boolean> {
+export async function isInsideFolder(fileId: string, rootFolderId: string): Promise<boolean> {
   if (fileId === rootFolderId) return true;
   const client = await driveClient();
   const visited = new Set<string>();

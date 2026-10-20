@@ -46,12 +46,14 @@ import { config } from '../config';
 import { log, fmtBytes, fmtMs } from './output';
 import { timed } from './timing';
 import { runWithConcurrency } from './util';
-import { isForeignCampaignTag, routeCampaignObs, isDrivePermissionError, EMPTY_CAMPAIGN_STATE } from './routing';
+import { isTransientFailure } from './failure-class';
 import {
-  runDistillation,
-  persistTarget,
-  type ValidatedChange,
-} from './persist';
+  isForeignCampaignTag,
+  routeCampaignObs,
+  isDrivePermissionError,
+  EMPTY_CAMPAIGN_STATE,
+} from './routing';
+import { runDistillation, persistTarget, type ValidatedChange } from './persist';
 import { loadPendingNoteTexts, proposeTarget } from './propose';
 import { hasNewCandidateMarker, stripNewCandidateMarker } from './note-marker';
 
@@ -151,7 +153,8 @@ export async function processBatch(
   const campaignBuckets = new Map<string, CampaignBucket>();
   // Legacy single campaign bucket — used when attributor is null (campaign
   // scans, or if structure hasn't been resolved for any reason).
-  const legacyCampaignBucket: Array<{ observation: CampaignObservation; sourceFileId: string }> = [];
+  const legacyCampaignBucket: Array<{ observation: CampaignObservation; sourceFileId: string }> =
+    [];
   // Per-piece buckets — files under a piece's folder bucket to the PIECE
   // (fine detail); their high-level rolls up to the owning campaign at
   // synthesis time (absorb-up). Keyed by pieceId. Populated in account scans
@@ -208,6 +211,15 @@ export async function processBatch(
   let filesExtracted = 0;
   let filesSkipped = 0;
   let filesErrored = 0;
+  /** Of filesErrored, the transient ones (rate limit, 5xx, timeout, dropped
+   *  connection) whose observations a re-run can recover — see
+   *  BatchOutcome.transientFileErrors. */
+  let transientFileErrors = 0;
+  /** Count one lost file (or lost stage-2 observation set) by failure class. */
+  const countLostToError = (err: unknown): void => {
+    filesErrored++;
+    if (isTransientFailure(err)) transientFileErrors++;
+  };
   /** Files visible in listings but 403 on content export → worklist rows. */
   let filesRestricted = 0;
   /** Previously restricted files that became readable this scan (rows resolved). */
@@ -431,7 +443,9 @@ export async function processBatch(
       // restricted — probing is cheap and the operator can Ignore it.
       if (o.skipReason === 'empty' && restrictedRowIds.has(file.id)) {
         filesRestored++;
-        log(`      🔓 previously restricted — now reachable (no extractable text); worklist row resolved`);
+        log(
+          `      🔓 previously restricted — now reachable (no extractable text); worklist row resolved`,
+        );
         if (infraWrites) {
           // Guarded like the main body's writes: a transient DB error on
           // one worklist row must not reject applyChain and discard the
@@ -453,6 +467,7 @@ export async function processBatch(
       log(`    ⛔ ${file.name}  RESTRICTED (403 — visible in listings, content not readable)`);
       filesRestricted++;
       if (infraWrites) {
+        let firstSighting = false;
         try {
           const existing = await prisma.driveRestrictedFile.findUnique({
             where: { accountId_fileId: { accountId: ctx.accountId, fileId: file.id } },
@@ -463,6 +478,7 @@ export async function processBatch(
               data: { lastProbedAt: new Date() },
             });
           } else {
+            firstSighting = true;
             await prisma.driveRestrictedFile.create({
               data: {
                 accountId: ctx.accountId,
@@ -490,7 +506,11 @@ export async function processBatch(
             );
           }
         } catch (err) {
-          filesErrored++;
+          // A failed first sighting never reached its bucket — a lost
+          // observation. A failed lastProbedAt bump on a known row loses
+          // nothing, so it never holds the cursor.
+          if (firstSighting) countLostToError(err);
+          else filesErrored++;
           log(`      ✗ restricted-worklist write failed: ${summarizeError(err)}`);
         }
       }
@@ -498,7 +518,7 @@ export async function processBatch(
     }
     if (o.kind === 'error') {
       log(`    ✗ ${file.name}  ERROR: ${summarizeError(o.error)}`);
-      filesErrored++;
+      countLostToError(o.error);
       return;
     }
     foldersWithText.add(file.parents?.[0] ?? parentPathOf(file));
@@ -545,7 +565,9 @@ export async function processBatch(
         for (const obs of res.campaign) {
           if (isForeignCampaignTag(obs.entity_campaign_name ?? '', ownIdentityNames)) {
             foreignObsDropped += 1;
-            log(`      ⊘ foreign-campaign obs dropped ("${(obs.entity_campaign_name ?? '').slice(0, 60)}")`);
+            log(
+              `      ⊘ foreign-campaign obs dropped ("${(obs.entity_campaign_name ?? '').slice(0, 60)}")`,
+            );
             continue;
           }
           if (file.pieceId && !piecesById?.has(file.pieceId)) {
@@ -591,7 +613,9 @@ export async function processBatch(
                 : undefined) ?? (attribution.campaignName ? [attribution.campaignName] : []);
             if (isForeignCampaignTag(obs.entity_campaign_name ?? '', family)) {
               foreignObsDropped += 1;
-              log(`      ⊘ foreign-campaign obs dropped ("${(obs.entity_campaign_name ?? '').slice(0, 60)}")`);
+              log(
+                `      ⊘ foreign-campaign obs dropped ("${(obs.entity_campaign_name ?? '').slice(0, 60)}")`,
+              );
               continue;
             }
             if (attribution.pieceId && attribution.matchedCampaignId) {
@@ -708,7 +732,7 @@ export async function processBatch(
       filesExtracted++;
     } catch (err) {
       log(`    ✗ ${file.name}  ERROR: ${summarizeError(err)}`);
-      filesErrored++;
+      countLostToError(err);
     }
   }
 
@@ -716,7 +740,9 @@ export async function processBatch(
   // strictly in file-index order through a serialized promise chain, so
   // every shared-state mutation happens in the same order as a serial run.
   if (concurrency > 1 && batch.length > 1) {
-    log(`  (pool: ${Math.min(concurrency, batch.length)} workers within this day's batch — days stay serial)`);
+    log(
+      `  (pool: ${Math.min(concurrency, batch.length)} workers within this day's batch — days stay serial)`,
+    );
   }
   const outcomes: Array<WorkerOutcome | undefined> = new Array(batch.length);
   let nextIssue = 0;
@@ -742,7 +768,9 @@ export async function processBatch(
     }
   };
   await Promise.all(
-    Array.from({ length: Math.max(1, Math.min(concurrency, batch.length || 1)) }, () => workerLoop()),
+    Array.from({ length: Math.max(1, Math.min(concurrency, batch.length || 1)) }, () =>
+      workerLoop(),
+    ),
   );
   await enqueueDrain();
 
@@ -778,6 +806,10 @@ export async function processBatch(
       }
     } catch (err) {
       log(`    ✗ asset-folder interpret failed for ${bf.folderPath}: ${summarizeError(err)}`);
+      // Not a file error (the files themselves skipped on mime), but the
+      // folder's asset observations are lost the same way — count only the
+      // transient class toward the re-run gate.
+      if (isTransientFailure(err)) transientFileErrors++;
     }
   }
 
@@ -792,6 +824,11 @@ export async function processBatch(
   log(
     `  → Extracted OK: ${filesExtracted}  Skipped: ${filesSkipped}  Errored: ${filesErrored}  Restricted: ${filesRestricted}  Zero obs: ${filesZeroObs}`,
   );
+  if (transientFileErrors > 0) {
+    log(
+      `  ⚠ ${transientFileErrors} transient error(s) (rate limit / 5xx / timeout / connection) — a re-run of this batch can recover their observations`,
+    );
+  }
   if (filesRestricted > 0) {
     log(
       `  ⛔ ${filesRestricted} restricted file(s) on the worklist — re-probed each scan; fix sharing or mark Ignore in gub-admin`,
@@ -831,16 +868,24 @@ export async function processBatch(
   }
 
   for (const pb of pieceBuckets.values()) {
-    log(`    Piece "${pb.pieceName}" (campaign "${pb.campaignName}")  ·  ${pb.observations.length} obs`);
+    log(
+      `    Piece "${pb.pieceName}" (campaign "${pb.campaignName}")  ·  ${pb.observations.length} obs`,
+    );
   }
   if (foreignObsDropped > 0) {
-    log(`    ⚠ ${foreignObsDropped} foreign-campaign obs dropped (misfiled content — the campaign zone is locked)`);
+    log(
+      `    ⚠ ${foreignObsDropped} foreign-campaign obs dropped (misfiled content — the campaign zone is locked)`,
+    );
   }
   if (unknownCampaignToAccount > 0) {
-    log(`    ↑ ${unknownCampaignToAccount} unknown-campaign obs converted to account observations (no phantoms)`);
+    log(
+      `    ↑ ${unknownCampaignToAccount} unknown-campaign obs converted to account observations (no phantoms)`,
+    );
   }
   if (assetFoldersChecked > 0) {
-    log(`    ◈ Binaries-only folders: ${assetFoldersChecked} checked → ${assetFolderObs} asset obs`);
+    log(
+      `    ◈ Binaries-only folders: ${assetFoldersChecked} checked → ${assetFolderObs} asset obs`,
+    );
   }
   if (ideaCtx && ideaCtx.stats.deckFiles > 0) {
     const i = ideaCtx.stats;
@@ -919,8 +964,9 @@ export async function processBatch(
     // their prior status_markdown so the merge-on-subsequent-scans path
     // can layer today's bullets on top of yesterday's.
     const existingIds = campaignBucketsList
-      .filter((b): b is CampaignBucket & { matchedCampaignId: string } =>
-        b.campaignStatus === 'existing' && !!b.matchedCampaignId,
+      .filter(
+        (b): b is CampaignBucket & { matchedCampaignId: string } =>
+          b.campaignStatus === 'existing' && !!b.matchedCampaignId,
       )
       .map((b) => b.matchedCampaignId);
 
@@ -946,11 +992,11 @@ export async function processBatch(
           : EMPTY_CAMPAIGN_STATE;
       const priorStatusMarkdown =
         bucket.matchedCampaignId && statusMdByCampaignId.has(bucket.matchedCampaignId)
-          ? statusMdByCampaignId.get(bucket.matchedCampaignId) ?? null
+          ? (statusMdByCampaignId.get(bucket.matchedCampaignId) ?? null)
           : null;
       const priorSensitiveMarkdown =
         bucket.matchedCampaignId && sensitiveMdByCampaignId.has(bucket.matchedCampaignId)
-          ? sensitiveMdByCampaignId.get(bucket.matchedCampaignId) ?? null
+          ? (sensitiveMdByCampaignId.get(bucket.matchedCampaignId) ?? null)
           : null;
       targets.push({
         entityType: 'campaign',
@@ -960,7 +1006,7 @@ export async function processBatch(
         campaignFolderId: bucket.campaignFolderId,
         campaignFolderPath:
           bucket.campaignFolderId !== null
-            ? folderPathById?.get(bucket.campaignFolderId) ?? null
+            ? (folderPathById?.get(bucket.campaignFolderId) ?? null)
             : null,
         accountState: ctx.accountState,
         campaignState,
@@ -1133,11 +1179,16 @@ export async function processBatch(
 
       wlog('');
       const statusTag =
-        target.entityStatus === 'account' ? 'account'
-        : target.entityStatus === 'existing' ? 'existing campaign'
-        : target.entityStatus === 'piece' ? `piece of "${target.pieceCampaignName ?? '?'}"`
-        : 'NEW campaign candidate';
-      wlog(`  • ${statusTag}: "${target.entityName}"  ·  ${target.observations.length} obs / ${target.fileIds.size} file(s)`);
+        target.entityStatus === 'account'
+          ? 'account'
+          : target.entityStatus === 'existing'
+            ? 'existing campaign'
+            : target.entityStatus === 'piece'
+              ? `piece of "${target.pieceCampaignName ?? '?'}"`
+              : 'NEW campaign candidate';
+      wlog(
+        `  • ${statusTag}: "${target.entityName}"  ·  ${target.observations.length} obs / ${target.fileIds.size} file(s)`,
+      );
 
       // ── Distill (uniform across all entity kinds) ──────────────────────
       // Every target — account, existing campaign, new candidate — runs the
@@ -1150,137 +1201,164 @@ export async function processBatch(
       // persistTarget). distillAndEmit/proposeNewEntity are the v1
       // review-gated pipeline's writers, not this engine's.
       let distillResult: EntitySynthesisResult['distillResult'] = null;
-      let validatedChanges: ValidatedChange[] = [];
+      const validatedChanges: ValidatedChange[] = [];
       let distilledNotes: Array<{ text: string; source_file_ids: string[] }> = [];
+      // A failed distill is a stage-3 failure: on the propose path the
+      // observations reach review ONLY through distillation, so carrying on
+      // would advance the cursor past them. Nothing for this target is
+      // proposed or applied; the driver's gate re-runs the window/day.
+      let distillFailed = false;
       if (target.entityType === 'piece') {
         // Pieces are markdown-only: no writable fields → nothing to distill.
         // Observations flow straight into synthesis below.
         wlog('      (piece — markdown-only; distillation skipped)');
       } else
-      try {
-        // Captured OUTSIDE the closure: property narrowing ('piece' excluded
-        // by the guard above) doesn't propagate into callbacks.
-        const distillEntityType: 'account' | 'campaign' =
-          target.entityType === 'account' ? 'account' : 'campaign';
-        const baseState =
-          target.entityType === 'account'
-            ? target.accountState
-            : (target.campaignState ?? EMPTY_CAMPAIGN_STATE);
-        // ── Already-on-record set (propose path only) ─────────────────
-        // Review sits between distillation and synthesis on the propose
-        // path, so the synthesis merge — which is what normally drops a
-        // re-observed fact (status-synthesis "Merge operations (D25)"
-        // rule A) — no longer runs before a human is asked. Hand the
-        // recorded facts to distillation instead, so a restatement never
-        // becomes a card. Two sources: the entity's stored bullets, and
-        // note items already awaiting a decision.
-        //
-        // Deliberately empty on the apply/dryrun paths: synthesis runs in
-        // the same pass there and already handles this, and backfill
-        // output stays byte-faithful for the dryrun tool.
-        const knownFacts =
-          application === 'propose'
-            ? await timed('known-facts', () =>
-                collectKnownFacts(target, distillEntityType),
-              )
-            : [];
-        if (knownFacts.length > 0) {
-          wlog(`      already on record: ${knownFacts.length} fact(s) — restatements suppressed`);
-        }
-
-        const dry = await timed('distill', () =>
-          runDistillation(
-            distillEntityType,
-            target.observations,
-            baseState,
-            knownFacts,
-          ),
-        );
-        distilledNotes = dry.notes.map((n) => ({ text: n.text, source_file_ids: n.source_file_ids }));
-        distillResult = {
-          proposalsCreated: dry.field_changes.length,
-          notesWritten: dry.notes.length,
-          ambiguousWritten: 0,
-          driver: dry.driver,
-        };
-
-        // Validate every proposed field, drop no-ops + invalids. Same
-        // gates production review uses on approve — backfill mirrors
-        // them so auto-applied state matches what a reviewer-approved
-        // sync would produce.
-        const writeSpecs =
-          target.entityType === 'account'
-            ? (ACCOUNT_FIELD_WRITE as Record<string, FieldWriteSpec>)
-            : (CAMPAIGN_FIELD_WRITE as Record<string, FieldWriteSpec>);
-
-        let invalidCount = 0;
-        let noOpCount = 0;
-        for (const fc of dry.field_changes) {
-          const spec = writeSpecs[fc.field];
-          if (!spec) {
-            invalidCount += 1;
-            continue;
-          }
-          const validation = validateProposedValue(
-            target.entityType,
-            fc.field,
-            fc.proposed_value ?? null,
-          );
-          if (!validation.ok) {
-            invalidCount += 1;
-            wlog(`        ⚠ skip "${fc.field}": ${validation.reason}`);
-            continue;
-          }
-          const currentValue =
+        try {
+          // Captured OUTSIDE the closure: property narrowing ('piece' excluded
+          // by the guard above) doesn't propagate into callbacks.
+          const distillEntityType: 'account' | 'campaign' =
+            target.entityType === 'account' ? 'account' : 'campaign';
+          const baseState =
             target.entityType === 'account'
-              ? target.accountState[fc.field as keyof AccountCurrentState] ?? null
-              : (target.campaignState ?? EMPTY_CAMPAIGN_STATE)[fc.field as keyof CampaignCurrentState] ?? null;
-          if (isNoOpChange(target.entityType, fc.field, currentValue, validation.value)) {
-            noOpCount += 1;
-            continue;
+              ? target.accountState
+              : (target.campaignState ?? EMPTY_CAMPAIGN_STATE);
+          // ── Already-on-record set (propose path only) ─────────────────
+          // Review sits between distillation and synthesis on the propose
+          // path, so the synthesis merge — which is what normally drops a
+          // re-observed fact (status-synthesis "Merge operations (D25)"
+          // rule A) — no longer runs before a human is asked. Hand the
+          // recorded facts to distillation instead, so a restatement never
+          // becomes a card. Two sources: the entity's stored bullets, and
+          // note items already awaiting a decision.
+          //
+          // Deliberately empty on the apply/dryrun paths: synthesis runs in
+          // the same pass there and already handles this, and backfill
+          // output stays byte-faithful for the dryrun tool.
+          const knownFacts =
+            application === 'propose'
+              ? await timed('known-facts', () => collectKnownFacts(target, distillEntityType))
+              : [];
+          if (knownFacts.length > 0) {
+            wlog(`      already on record: ${knownFacts.length} fact(s) — restatements suppressed`);
           }
-          validatedChanges.push({
-            field: fc.field,
-            spec,
-            validatedValue: validation.value,
-            previousValue: currentValue,
-            proposedValueRaw: fc.proposed_value ?? null,
-            confidence: fc.confidence,
-            reasoning: fc.reasoning ?? null,
-            sourceFileIds: fc.source_file_ids ?? [],
-          });
-        }
 
-        const verb = target.entityStatus === 'new' ? 'would propose' : 'would update';
-        const persistTag = applyToDb ? '' : application === 'propose' ? ' (→ review proposals)' : ' (dryrun — not persisted)';
-        wlog(
-          `      ${verb}: ${validatedChanges.length} field changes${invalidCount > 0 ? ` (${invalidCount} invalid)` : ''}${noOpCount > 0 ? ` (${noOpCount} no-op)` : ''}, ${dry.notes.length} notes  [${dry.driver}]${persistTag}`,
-        );
-
-        // Layer validated proposed values onto the rendering state so
-        // synthesis sees the post-apply at-a-glance.
-        if (target.entityType === 'account') {
-          const populated: AccountCurrentState = { ...target.accountState };
-          for (const vc of validatedChanges) {
-            (populated as Record<string, string | null>)[vc.field] = vc.proposedValueRaw;
-          }
-          target.accountState = populated;
-        } else {
-          const populated: CampaignCurrentState = {
-            ...(target.campaignState ?? EMPTY_CAMPAIGN_STATE),
+          const dry = await timed('distill', () =>
+            runDistillation(distillEntityType, target.observations, baseState, knownFacts),
+          );
+          distilledNotes = dry.notes.map((n) => ({
+            text: n.text,
+            source_file_ids: n.source_file_ids,
+          }));
+          distillResult = {
+            proposalsCreated: dry.field_changes.length,
+            notesWritten: dry.notes.length,
+            ambiguousWritten: 0,
+            driver: dry.driver,
           };
-          for (const vc of validatedChanges) {
-            (populated as Record<string, string | null>)[vc.field] = vc.proposedValueRaw;
+
+          // Validate every proposed field, drop no-ops + invalids. Same
+          // gates production review uses on approve — backfill mirrors
+          // them so auto-applied state matches what a reviewer-approved
+          // sync would produce.
+          const writeSpecs =
+            target.entityType === 'account'
+              ? (ACCOUNT_FIELD_WRITE as Record<string, FieldWriteSpec>)
+              : (CAMPAIGN_FIELD_WRITE as Record<string, FieldWriteSpec>);
+
+          let invalidCount = 0;
+          let noOpCount = 0;
+          for (const fc of dry.field_changes) {
+            const spec = writeSpecs[fc.field];
+            if (!spec) {
+              invalidCount += 1;
+              continue;
+            }
+            const validation = validateProposedValue(
+              target.entityType,
+              fc.field,
+              fc.proposed_value ?? null,
+            );
+            if (!validation.ok) {
+              invalidCount += 1;
+              wlog(`        ⚠ skip "${fc.field}": ${validation.reason}`);
+              continue;
+            }
+            const currentValue =
+              target.entityType === 'account'
+                ? (target.accountState[fc.field as keyof AccountCurrentState] ?? null)
+                : ((target.campaignState ?? EMPTY_CAMPAIGN_STATE)[
+                    fc.field as keyof CampaignCurrentState
+                  ] ?? null);
+            if (isNoOpChange(target.entityType, fc.field, currentValue, validation.value)) {
+              noOpCount += 1;
+              continue;
+            }
+            validatedChanges.push({
+              field: fc.field,
+              spec,
+              validatedValue: validation.value,
+              previousValue: currentValue,
+              proposedValueRaw: fc.proposed_value ?? null,
+              confidence: fc.confidence,
+              reasoning: fc.reasoning ?? null,
+              sourceFileIds: fc.source_file_ids ?? [],
+            });
           }
-          target.campaignState = populated;
+
+          const verb = target.entityStatus === 'new' ? 'would propose' : 'would update';
+          const persistTag = applyToDb
+            ? ''
+            : application === 'propose'
+              ? ' (→ review proposals)'
+              : ' (dryrun — not persisted)';
+          wlog(
+            `      ${verb}: ${validatedChanges.length} field changes${invalidCount > 0 ? ` (${invalidCount} invalid)` : ''}${noOpCount > 0 ? ` (${noOpCount} no-op)` : ''}, ${dry.notes.length} notes  [${dry.driver}]${persistTag}`,
+          );
+
+          // Layer validated proposed values onto the rendering state so
+          // synthesis sees the post-apply at-a-glance.
+          if (target.entityType === 'account') {
+            const populated: AccountCurrentState = { ...target.accountState };
+            for (const vc of validatedChanges) {
+              (populated as Record<string, string | null>)[vc.field] = vc.proposedValueRaw;
+            }
+            target.accountState = populated;
+          } else {
+            const populated: CampaignCurrentState = {
+              ...(target.campaignState ?? EMPTY_CAMPAIGN_STATE),
+            };
+            for (const vc of validatedChanges) {
+              (populated as Record<string, string | null>)[vc.field] = vc.proposedValueRaw;
+            }
+            target.campaignState = populated;
+          }
+
+          for (const vc of validatedChanges) {
+            const val = vc.proposedValueRaw ?? '(null)';
+            wlog(`        · ${vc.field} = ${val}  (${(vc.confidence * 100).toFixed(0)}%)`);
+          }
+        } catch (err) {
+          distillFailed = true;
+          stage3Failures++;
+          wlog(`      distill failed: ${summarizeError(err)}`);
         }
 
-        for (const vc of validatedChanges) {
-          const val = vc.proposedValueRaw ?? '(null)';
-          wlog(`        · ${vc.field} = ${val}  (${(vc.confidence * 100).toFixed(0)}%)`);
-        }
-      } catch (err) {
-        wlog(`      distill failed: ${summarizeError(err)}`);
+      if (distillFailed) {
+        wlog(
+          '      ✗ NOT proposed or applied — distill failed; counted as a stage-3 failure so the batch re-runs',
+        );
+        for (const line of lineBuffer) log(line);
+        return {
+          entityType: target.entityType,
+          entityName: target.entityName,
+          entityStatus: target.entityStatus,
+          observationsCount: target.observations.length,
+          filesCount: target.fileIds.size,
+          distillResult,
+          synthesizedMarkdown: '(distill failed — not proposed or synthesized)',
+          synthesizedSensitiveMarkdown: null,
+          synthesisMs: 0,
+        };
       }
 
       // ── Synthesize (dual-output: general + sensitive) ───────────────
@@ -1296,8 +1374,7 @@ export async function processBatch(
             proposeTarget({
               ctx,
               entityType: target.entityType === 'account' ? 'account' : 'campaign',
-              entityStatus:
-                target.entityStatus === 'piece' ? 'existing' : target.entityStatus,
+              entityStatus: target.entityStatus === 'piece' ? 'existing' : target.entityStatus,
               entityId: target.entityId,
               entityName: target.entityName,
               validatedChanges,
@@ -1362,7 +1439,8 @@ export async function processBatch(
                 : null,
           // Merge per-tier × per-durability against prior bullets (D25 + D23).
           currentContextBullets: extractContextSection(target.priorStatusMarkdown ?? '') ?? null,
-          currentSensitiveBullets: extractContextSection(target.priorSensitiveMarkdown ?? '') ?? null,
+          currentSensitiveBullets:
+            extractContextSection(target.priorSensitiveMarkdown ?? '') ?? null,
           currentGeneralTransientBullets: priorGeneralTransient,
           currentSensitiveTransientBullets: priorSensitiveTransient,
           scanDay: editedAt,
@@ -1386,7 +1464,12 @@ export async function processBatch(
           ...(target.entityType === 'account'
             ? { accountState: target.accountState }
             : target.entityType === 'piece'
-              ? { pieceFields: { Name: target.entityName, Campaign: target.pieceCampaignName ?? '—' } }
+              ? {
+                  pieceFields: {
+                    Name: target.entityName,
+                    Campaign: target.pieceCampaignName ?? '—',
+                  },
+                }
               : { campaignState: target.campaignState ?? EMPTY_CAMPAIGN_STATE }),
         });
         synthesizedMarkdown = assembleStatusMarkdown({
@@ -1423,7 +1506,9 @@ export async function processBatch(
       // account/campaign only in 'apply' mode (propose returned above).
       if (target.entityType === 'piece' ? infraWrites : applyToDb) {
         if (synthFailed) {
-          wlog("      ✗ NOT applied — synthesis failed; keeping the entity's prior status_markdown");
+          wlog(
+            "      ✗ NOT applied — synthesis failed; keeping the entity's prior status_markdown",
+          );
         } else {
           try {
             await timed('db_writes', () =>
@@ -1538,6 +1623,7 @@ export async function processBatch(
     filesExtracted,
     filesSkipped,
     filesErrored,
+    transientFileErrors,
     filesZeroObs,
     accountObsTotal: accountBucket.length,
     campaignObsTotal,

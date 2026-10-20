@@ -32,15 +32,11 @@
 
 import crypto from 'node:crypto';
 import mammoth from 'mammoth';
-import {
-  google,
-  type docs_v1,
-  type slides_v1,
-  type sheets_v4,
-} from 'googleapis';
+import { google, type docs_v1, type slides_v1, type sheets_v4 } from 'googleapis';
 import { config } from '../config';
 import { logger } from '../logger';
 import { downloadFileBuffer } from './client';
+import { pacedCall } from './pacing';
 import { buildBotOAuthClient } from '../workspace';
 import type { ExtractionOutcome, ExtractionSkip, TraversedFile } from './types';
 
@@ -78,21 +74,21 @@ let cachedSheets: sheets_v4.Sheets | null = null;
 async function docsClient(): Promise<docs_v1.Docs> {
   if (cachedDocs) return cachedDocs;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedDocs = google.docs({ version: 'v1', auth });
+  cachedDocs = google.docs({ version: 'v1', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedDocs;
 }
 
 async function slidesClient(): Promise<slides_v1.Slides> {
   if (cachedSlides) return cachedSlides;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedSlides = google.slides({ version: 'v1', auth });
+  cachedSlides = google.slides({ version: 'v1', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedSlides;
 }
 
 async function sheetsClient(): Promise<sheets_v4.Sheets> {
   if (cachedSheets) return cachedSheets;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedSheets = google.sheets({ version: 'v4', auth });
+  cachedSheets = google.sheets({ version: 'v4', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedSheets;
 }
 
@@ -151,7 +147,11 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
   let isShortcutFollow = false;
   if (file.mimeType === MIME.SHORTCUT) {
     if (!file.shortcutTarget) {
-      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut without resolved target' };
+      return {
+        kind: 'skip',
+        reason: 'unsupported_mime',
+        detail: 'shortcut without resolved target',
+      };
     }
     if (file.shortcutTarget.mimeType === MIME.GOOGLE_FOLDER) {
       return {
@@ -161,7 +161,11 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
       };
     }
     if (file.shortcutTarget.mimeType === MIME.SHORTCUT) {
-      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut chain (single-level follow only)' };
+      return {
+        kind: 'skip',
+        reason: 'unsupported_mime',
+        detail: 'shortcut chain (single-level follow only)',
+      };
     }
     effective = {
       ...file,
@@ -320,7 +324,7 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
 
 export async function extractGoogleDoc(documentId: string): Promise<string> {
   const client = await docsClient();
-  const res = await client.documents.get({ documentId });
+  const res = await pacedCall('docs', () => client.documents.get({ documentId }));
   const doc = res.data;
   const parts: string[] = [];
 
@@ -351,9 +355,7 @@ function walkDocStructuralElement(el: docs_v1.Schema$StructuralElement): string 
 function walkDocParagraph(p: docs_v1.Schema$Paragraph): string {
   // Each paragraph element already ends with \n in Google's content (the
   // textRun's content string includes the trailing newline). Just join.
-  return (p.elements ?? [])
-    .map((e) => e.textRun?.content ?? '')
-    .join('');
+  return (p.elements ?? []).map((e) => e.textRun?.content ?? '').join('');
 }
 
 function walkDocTable(t: docs_v1.Schema$Table): string {
@@ -381,7 +383,7 @@ function walkDocTable(t: docs_v1.Schema$Table): string {
 
 export async function extractGoogleSlides(presentationId: string): Promise<string> {
   const client = await slidesClient();
-  const res = await client.presentations.get({ presentationId });
+  const res = await pacedCall('slides', () => client.presentations.get({ presentationId }));
   const pres = res.data;
   const parts: string[] = [];
 
@@ -406,10 +408,7 @@ export async function extractGoogleSlides(presentationId: string): Promise<strin
     // (a separate page entirely). We section them off so Gemini sees them
     // as notes, not main slide content.
     const notesEls = slide.slideProperties?.notesPage?.pageElements ?? [];
-    const notes = notesEls
-      .map(walkSlidesPageElement)
-      .join('')
-      .trim();
+    const notes = notesEls.map(walkSlidesPageElement).join('').trim();
     if (notes) {
       parts.push(`\n### Speaker notes\n${notes}\n`);
     }
@@ -422,9 +421,7 @@ export async function extractGoogleSlides(presentationId: string): Promise<strin
 
 function walkSlidesPageElement(el: slides_v1.Schema$PageElement): string {
   if (el.shape?.text) {
-    const text = (el.shape.text.textElements ?? [])
-      .map((te) => te.textRun?.content ?? '')
-      .join('');
+    const text = (el.shape.text.textElements ?? []).map((te) => te.textRun?.content ?? '').join('');
     return text ? text.replace(/\n+$/, '') + '\n' : '';
   }
   if (el.table) {
@@ -464,10 +461,12 @@ export async function extractGoogleSheets(spreadsheetId: string): Promise<string
   const client = await sheetsClient();
 
   // Step 1: enumerate sheets.
-  const meta = await client.spreadsheets.get({
-    spreadsheetId,
-    fields: 'properties.title,sheets.properties(title,sheetId)',
-  });
+  const meta = await pacedCall('sheets', () =>
+    client.spreadsheets.get({
+      spreadsheetId,
+      fields: 'properties.title,sheets.properties(title,sheetId)',
+    }),
+  );
 
   const workbookTitle = meta.data.properties?.title;
   const sheetTitles = (meta.data.sheets ?? [])
@@ -477,11 +476,13 @@ export async function extractGoogleSheets(spreadsheetId: string): Promise<string
   if (sheetTitles.length === 0) return '';
 
   // Step 2: batch values fetch. One range per sheet, naming the whole sheet.
-  const values = await client.spreadsheets.values.batchGet({
-    spreadsheetId,
-    ranges: sheetTitles,
-    valueRenderOption: 'FORMATTED_VALUE',
-  });
+  const values = await pacedCall('sheets', () =>
+    client.spreadsheets.values.batchGet({
+      spreadsheetId,
+      ranges: sheetTitles,
+      valueRenderOption: 'FORMATTED_VALUE',
+    }),
+  );
 
   const parts: string[] = [];
   if (workbookTitle) parts.push(`# ${workbookTitle}\n\n`);
