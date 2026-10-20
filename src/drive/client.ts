@@ -175,6 +175,13 @@ export const FILE_FIELDS =
   'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType)';
 
 /**
+ * Items per `files.list` page: the documented maximum. Drive may still
+ * return a short or empty page before the end, so every caller follows
+ * nextPageToken until it is absent.
+ */
+export const LIST_PAGE_SIZE = 1000;
+
+/**
  * List immediate children of a folder, following pagination.
  * Includes both files and subfolders. Trashed items excluded.
  */
@@ -187,7 +194,7 @@ export async function listFolderChildren(folderId: string): Promise<drive_v3.Sch
       client.files.list({
         q: `'${folderId}' in parents and trashed = false`,
         fields: `nextPageToken, files(${FILE_FIELDS})`,
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -219,7 +226,7 @@ export async function listSubfolders(folderId: string): Promise<SubfolderNode[]>
       client.files.list({
         q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
         fields: 'nextPageToken, files(id,name)',
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -234,19 +241,88 @@ export async function listSubfolders(folderId: string): Promise<SubfolderNode[]>
 }
 
 /**
+ * HTTP status of a googleapis error, however it is shaped: `code` (the API
+ * body's error code), `status` (gaxios) or `response.status`. Undefined for
+ * a transport fault, whose `code` is a string such as ECONNRESET.
+ */
+export function httpStatusOf(err: unknown): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const e = err as { code?: unknown; status?: unknown; response?: { status?: unknown } };
+  if (typeof e.code === 'number') return e.code;
+  if (typeof e.status === 'number') return e.status;
+  if (typeof e.response?.status === 'number') return e.response.status;
+  return undefined;
+}
+
+/** Every `reason` a googleapis error carries, from either body shape. */
+function errorReasons(err: unknown): string[] {
+  if (!err || typeof err !== 'object') return [];
+  const e = err as {
+    errors?: Array<{ reason?: string }>;
+    response?: { data?: { error?: { errors?: Array<{ reason?: string }> } } };
+  };
+  return [...(e.errors ?? []), ...(e.response?.data?.error?.errors ?? [])]
+    .map((x) => x.reason ?? '')
+    .filter((r) => r !== '');
+}
+
+/**
+ * A flat drive listing that came back without the root folder in it: the bot
+ * sees part of the drive, not this root's subtree. Handled as a refusal.
+ */
+export class FlatListingUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FlatListingUnavailableError';
+  }
+}
+
+/**
+ * The bot was refused a flat drive listing: 404 (no such drive for this
+ * user), a 403 that names no limit (for example, not a member of the drive),
+ * or a listing without the root in it. The root folder itself may still be
+ * shared with the bot, so a root inside the drive falls back to walking it.
+ *
+ * A 403 whose reason names a limit or a quota (userRateLimitExceeded,
+ * dailyLimitExceeded, sharingRateLimitExceeded, quotaExceeded, …) is NOT a
+ * refusal: the limiter has already backed off where it could, and a walk
+ * would only hit the same limit harder.
+ */
+export function isListingUnavailableError(err: unknown): boolean {
+  if (err instanceof FlatListingUnavailableError) return true;
+  const status = httpStatusOf(err);
+  if (status === 404) return true;
+  if (status !== 403) return false;
+  return !errorReasons(err).some((r) => /limit|quota/i.test(r));
+}
+
+/** Why a flat listing was unavailable, for a log line: status and reasons only. */
+export function listingFailureCause(err: unknown): string {
+  if (err instanceof FlatListingUnavailableError) return 'root not in the drive listing';
+  return [`HTTP ${httpStatusOf(err) ?? '?'}`, ...errorReasons(err)].join(' ');
+}
+
+/**
  * Flat-list EVERY folder in a shared drive in one paginated sweep
  * (`corpora=drive`, mimeType=folder). ONLY valid for shared-drive ids.
  *
  * The recursive folders-only walk (listSubfolders per folder) is O(folders)
- * sequential round-trips — minutes on a big drive. This is O(folders/200)
+ * sequential round-trips — minutes on a big drive. This is O(folders/1000)
  * paginated calls. The caller reconstructs the tree in memory from the
- * `parentId` pointers. Mirrors listSharedDriveFiles for the folder skeleton.
+ * `parentId` pointers and cuts out the subtree of any root in the drive
+ * (drive/folder-tree.ts). Mirrors listSharedDriveFiles for the folder
+ * skeleton.
+ *
+ * Each page retries transient faults (5xx, dropped sockets): one failed page
+ * fails the whole sweep, where a walk would have skipped one subfolder.
  */
 export interface DriveFolderRec {
   id: string;
   name: string;
   /** Immediate parent id (shared-drive folders have at most one parent). */
   parentId: string | null;
+  /** How many parents Drive listed; parentId is the first. Above 1 is a legacy multi-parent item. */
+  parentCount: number;
 }
 
 export async function listAllFoldersInDrive(
@@ -257,21 +333,28 @@ export async function listAllFoldersInDrive(
   const out: DriveFolderRec[] = [];
   let pageToken: string | undefined;
   do {
-    const res = await driveLimiter.run(() =>
-      client.files.list({
-        corpora: 'drive',
-        driveId,
-        q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
-        fields: 'nextPageToken, files(id,name,parents)',
-        pageSize: 200,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-        ...(pageToken ? { pageToken } : {}),
-      }),
+    const res = await withTransientRetry(() =>
+      driveLimiter.run(() =>
+        client.files.list({
+          corpora: 'drive',
+          driveId,
+          q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
+          fields: 'nextPageToken, files(id,name,parents)',
+          pageSize: LIST_PAGE_SIZE,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          ...(pageToken ? { pageToken } : {}),
+        }),
+      ),
     );
     for (const f of res.data.files ?? []) {
       if (!f.id || !f.name) continue;
-      out.push({ id: f.id, name: f.name, parentId: f.parents?.[0] ?? null });
+      out.push({
+        id: f.id,
+        name: f.name,
+        parentId: f.parents?.[0] ?? null,
+        parentCount: f.parents?.length ?? 0,
+      });
     }
     if (opts.onPage) opts.onPage(out.length);
     pageToken = res.data.nextPageToken ?? undefined;
@@ -289,11 +372,12 @@ export async function listAllFoldersInDrive(
  *   - folder in shared drive → driveId !== id (and is present)
  *   - folder in My Drive → driveId is absent
  *
- * Knowing this matters for performance: a shared-drive root supports
- * `files.list(corpora='drive', driveId=X, orderBy=...)` returning the
- * entire drive's contents in one paginated query. Folders (in either
- * kind of drive) only support `'X' in parents` — direct children only —
- * forcing recursive traversal.
+ * Knowing this matters for performance: any folder with a driveId can use
+ * `files.list(corpora='drive', driveId=X, orderBy=...)`, which returns the
+ * entire drive's contents in one paginated query; a folder inside the drive
+ * then cuts its own subtree out in memory (drive/folder-tree.ts). Only a My
+ * Drive folder (no driveId) is limited to `'X' in parents` — direct
+ * children only — forcing recursive traversal.
  */
 export interface SharedDriveProbe {
   isSharedDriveRoot: boolean;
@@ -324,13 +408,13 @@ export async function probeFolder(folderId: string): Promise<SharedDriveProbe> {
 
 /**
  * Flat-list every non-folder file in a shared drive, paginated and
- * (optionally) ordered. ONLY valid for shared-drive-root ids — for
- * folders inside drives, you must walk recursively (`traverseFolder`).
+ * (optionally) ordered. ONLY valid for shared-drive ids. A folder inside a
+ * drive uses listSubtreeFiles (drive/subtree.ts) instead, which lists the
+ * drive flat and cuts the folder's subtree out with breadcrumb paths.
  *
- * Used by backfill to skip the recursive walk for shared-drive entities.
- * Returns TraversedFile shape with `path = name` (no breadcrumb; the flat
- * query gives parent ids, not paths, and reconstructing paths costs
- * more API calls than it's usually worth at this layer).
+ * Used by backfill to skip the recursive walk for shared-drive-root entities.
+ * Returns TraversedFile shape with `path = name` (no breadcrumb). The
+ * per-file interpret prompt reads that path, so it stays as it is.
  */
 export interface FlatListOptions {
   /** Stop after this many files. Use for capped iteration. */
@@ -356,7 +440,7 @@ export async function listSharedDriveFiles(
         q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
         orderBy,
         fields: `nextPageToken, files(${FILE_FIELDS})`,
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -385,6 +469,58 @@ export async function listSharedDriveFiles(
           : {}),
       });
       if (maxFiles !== null && out.length >= maxFiles) return out;
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+/**
+ * Fields for the flat file listing: FILE_FIELDS plus Drive's content markers
+ * (`version`, and `md5Checksum` for binary files) for a later check of
+ * which files really changed.
+ */
+export const FLAT_FILE_FIELDS = `${FILE_FIELDS},version,md5Checksum`;
+
+/**
+ * Flat-list every non-folder file in a shared drive, keeping only the files
+ * `keep` accepts. ONLY valid for shared-drive ids. The filter runs page by
+ * page, so a small root inside a big drive holds its own files, not the
+ * drive's. Each page retries transient faults, as listAllFoldersInDrive does.
+ *
+ * Ordered by createdTime, which an edit does not change, so a file edited
+ * while the sweep pages cannot shift to another page and be listed twice or
+ * skipped; an id seen twice is kept once all the same. The caller still
+ * sorts (direction, ties).
+ */
+export async function listDriveFilesFlat(
+  driveId: string,
+  keep: (file: drive_v3.Schema$File) => boolean,
+): Promise<drive_v3.Schema$File[]> {
+  const client = await driveClient();
+  const out: drive_v3.Schema$File[] = [];
+  const seen = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const res = await withTransientRetry(() =>
+      driveLimiter.run(() =>
+        client.files.list({
+          corpora: 'drive',
+          driveId,
+          q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
+          orderBy: 'createdTime',
+          fields: `nextPageToken, files(${FLAT_FILE_FIELDS})`,
+          pageSize: LIST_PAGE_SIZE,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          ...(pageToken ? { pageToken } : {}),
+        }),
+      ),
+    );
+    for (const f of res.data.files ?? []) {
+      if (f.id && seen.has(f.id)) continue;
+      if (f.id) seen.add(f.id);
+      if (keep(f)) out.push(f);
     }
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);

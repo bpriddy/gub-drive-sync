@@ -41,6 +41,13 @@ export interface TraversedFile {
    * greedy coverage of content that's only reachable via shortcut.
    */
   shortcutTarget?: { id: string; mimeType: string };
+  /**
+   * Drive's content markers, set only by the flat drive listing
+   * (drive/subtree.ts): the file's version counter and, for binary files,
+   * the MD5 of its content. Absent on every other discovery path.
+   */
+  version?: string;
+  md5Checksum?: string;
 }
 
 export interface ExtractionResult {
