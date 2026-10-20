@@ -222,3 +222,34 @@ describe('GeminiLlmDriver per-attempt deadline', () => {
     expect(headerOf(init, 'X-Server-Timeout')).toBeNull();
   });
 });
+
+describe('GeminiLlmDriver finish logging', () => {
+  it('logs finishReason for every completed call at INFO', async () => {
+    fetchMock.mockResolvedValue(okResponse('{"truncat', 'MAX_TOKENS'));
+    await driver().complete(REQ);
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: 'gemini-test',
+        tag: 'unit.test',
+        attempt: 1,
+        finishReason: 'MAX_TOKENS',
+        blockReason: null,
+        promptTokens: 10,
+        outputTokens: 3,
+        durationMs: expect.any(Number),
+      }),
+      '[gemini] generateContent finished',
+    );
+  });
+
+  it('logs it on the attempt that finally succeeded', async () => {
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(503, 'Service Unavailable'))
+      .mockResolvedValueOnce(okResponse());
+    await driver().complete(REQ);
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      expect.objectContaining({ attempt: 2, finishReason: 'STOP' }),
+      '[gemini] generateContent finished',
+    );
+  });
+});

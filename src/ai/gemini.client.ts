@@ -95,6 +95,7 @@ export class GeminiLlmDriver implements LlmDriver {
     const timeoutMs = req.timeoutMs ?? config.GEMINI_TIMEOUT_DEFAULT_MS;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const attemptStartedAt = Date.now();
       try {
         const res = await this.client.models.generateContent({
           model: req.model,
@@ -126,6 +127,23 @@ export class GeminiLlmDriver implements LlmDriver {
         if (usage) {
           logger.debug({ model: req.model, tag: req.tag, ...usage }, '[gemini] usage');
         }
+        // One INFO line per completed call. finishReason tells a clean STOP
+        // from a MAX_TOKENS truncation or a SAFETY block — the cases that
+        // later surface only as a JSON parse failure in the caller.
+        logger.info(
+          {
+            model: req.model,
+            tag: req.tag,
+            attempt,
+            finishReason: res.candidates?.[0]?.finishReason ?? null,
+            blockReason: res.promptFeedback?.blockReason ?? null,
+            durationMs: Date.now() - attemptStartedAt,
+            promptTokens: usage?.promptTokens ?? null,
+            thoughtsTokens: usage?.thoughtsTokens ?? null,
+            outputTokens: usage?.outputTokens ?? null,
+          },
+          '[gemini] generateContent finished',
+        );
         if (attempt > 1) {
           logger.info(
             { model: req.model, tag: req.tag, attempt },
