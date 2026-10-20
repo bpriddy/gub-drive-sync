@@ -22,6 +22,7 @@ import { loadEntity } from '../backfill/entity';
 import { DEFAULT_CONCURRENCY, type Args, type BackfillRunResult } from '../backfill/args';
 import { resolveAccountStructure } from '../backfill/structure-stage';
 import { processBatch } from '../scan/process-batch';
+import { isTransientFailure } from '../scan/failure-class';
 import { log, rule, fmtMs, getLogCapture, setLogCapture } from '../scan/output';
 import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
 import { queryActivityWindow, foldEvents, ymdUtc } from './activity';
@@ -153,25 +154,40 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
   // Current metadata for the changed files. Vanished files (deleted
   // after the window) skip; folders never scan.
   //
-  // A file we can't fetch is LOST, not fatal: getFileMetadata has already
-  // spent the effort (the limiter retries rate limits, withTransientRetry
-  // retries 5xx + dropped sockets), so anything still failing here has had
-  // its chance. Dropping one file matches how processBatch treats a file
-  // that fails extraction — count it, log it, keep the run alive. Failing
-  // the run instead would stall the account indefinitely: the cursor lives
-  // on the account, so every later run would re-enter the same window,
-  // hit the same file, and die again, with nothing watching to notice.
+  // getFileMetadata has already spent the effort (the limiter retries rate
+  // limits, withTransientRetry retries 5xx + dropped sockets). What still
+  // fails splits by class:
+  //   - TRANSIENT (rate limit, 5xx, timeout, connection): the run fails
+  //     before any LLM spend and the cursor holds — the queue retry re-runs
+  //     the window minutes later, when the same fetch very likely works.
+  //     Advancing past it would lose the file's changes for good.
+  //   - PERMANENT (permission and other 4xx): the file is LOST, not fatal —
+  //     matching how processBatch treats a file that fails extraction.
+  //     Failing the run on it would stall the account indefinitely: the
+  //     cursor lives on the account, so every later run would re-enter the
+  //     same window, hit the same file, and die again.
   //
   // The count rides the final summary line, which survives the 40-line
   // log_summary tail clip — otherwise a run that silently dropped a dozen
   // files reads exactly like a clean one.
   const files: TraversedFile[] = [];
   let filesUnfetchable = 0;
+  let metadataTransient = 0;
   for (const id of changedIds) {
     let meta;
     try {
       meta = await timed('file_metadata', () => getFileMetadata(id));
     } catch (err) {
+      if (isTransientFailure(err)) {
+        // Stop at the first one: the window re-runs regardless, and each
+        // further stuck fetch would only add its full retry budget (minutes)
+        // to a run that is already going to fail.
+        metadataTransient++;
+        log(
+          `    ⚠ metadata fetch failed for ${id} after retries (transient): ${summarizeError(err)} — the window will be re-run`,
+        );
+        break;
+      }
       filesUnfetchable++;
       log(
         `    ⚠ metadata unreadable for ${id} after retries: ${summarizeError(err)} — file dropped from this window`,
@@ -207,6 +223,12 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
     });
   }
 
+  if (metadataTransient > 0) {
+    throw new Error(
+      `${metadataTransient} transient metadata failure(s) — cursor NOT advanced; retry re-runs this window`,
+    );
+  }
+
   let filesProcessed = 0;
   let scansProcessed = 0;
   if (files.length > 0) {
@@ -222,11 +244,17 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
       concurrency: DEFAULT_CONCURRENCY,
     });
     // Window-commit gate: don't advance the cursor unless every entity's
-    // proposals landed — the queue retry re-runs the identical window.
-    if (outcome.stage3Failures > 0) {
-      throw new Error(
-        `${outcome.stage3Failures} stage-3 failure(s) — cursor NOT advanced; retry re-runs this window`,
-      );
+    // proposals landed (stage 3, failed distills included) and no file's
+    // observations were lost to a transient error — the queue retry
+    // re-runs the identical window.
+    if (outcome.stage3Failures > 0 || outcome.transientFileErrors > 0) {
+      const causes = [
+        ...(outcome.stage3Failures > 0 ? [`${outcome.stage3Failures} stage-3 failure(s)`] : []),
+        ...(outcome.transientFileErrors > 0
+          ? [`${outcome.transientFileErrors} transient file error(s)`]
+          : []),
+      ];
+      throw new Error(`${causes.join(' + ')} — cursor NOT advanced; retry re-runs this window`);
     }
     filesProcessed = files.length;
     scansProcessed = 1;

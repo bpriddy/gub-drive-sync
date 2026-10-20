@@ -46,6 +46,7 @@ import { config } from '../config';
 import { log, fmtBytes, fmtMs } from './output';
 import { timed } from './timing';
 import { runWithConcurrency } from './util';
+import { isTransientFailure } from './failure-class';
 import {
   isForeignCampaignTag,
   routeCampaignObs,
@@ -210,6 +211,15 @@ export async function processBatch(
   let filesExtracted = 0;
   let filesSkipped = 0;
   let filesErrored = 0;
+  /** Of filesErrored, the transient ones (rate limit, 5xx, timeout, dropped
+   *  connection) whose observations a re-run can recover — see
+   *  BatchOutcome.transientFileErrors. */
+  let transientFileErrors = 0;
+  /** Count one lost file (or lost stage-2 observation set) by failure class. */
+  const countLostToError = (err: unknown): void => {
+    filesErrored++;
+    if (isTransientFailure(err)) transientFileErrors++;
+  };
   /** Files visible in listings but 403 on content export → worklist rows. */
   let filesRestricted = 0;
   /** Previously restricted files that became readable this scan (rows resolved). */
@@ -457,6 +467,7 @@ export async function processBatch(
       log(`    ⛔ ${file.name}  RESTRICTED (403 — visible in listings, content not readable)`);
       filesRestricted++;
       if (infraWrites) {
+        let firstSighting = false;
         try {
           const existing = await prisma.driveRestrictedFile.findUnique({
             where: { accountId_fileId: { accountId: ctx.accountId, fileId: file.id } },
@@ -467,6 +478,7 @@ export async function processBatch(
               data: { lastProbedAt: new Date() },
             });
           } else {
+            firstSighting = true;
             await prisma.driveRestrictedFile.create({
               data: {
                 accountId: ctx.accountId,
@@ -494,7 +506,11 @@ export async function processBatch(
             );
           }
         } catch (err) {
-          filesErrored++;
+          // A failed first sighting never reached its bucket — a lost
+          // observation. A failed lastProbedAt bump on a known row loses
+          // nothing, so it never holds the cursor.
+          if (firstSighting) countLostToError(err);
+          else filesErrored++;
           log(`      ✗ restricted-worklist write failed: ${summarizeError(err)}`);
         }
       }
@@ -502,7 +518,7 @@ export async function processBatch(
     }
     if (o.kind === 'error') {
       log(`    ✗ ${file.name}  ERROR: ${summarizeError(o.error)}`);
-      filesErrored++;
+      countLostToError(o.error);
       return;
     }
     foldersWithText.add(file.parents?.[0] ?? parentPathOf(file));
@@ -716,7 +732,7 @@ export async function processBatch(
       filesExtracted++;
     } catch (err) {
       log(`    ✗ ${file.name}  ERROR: ${summarizeError(err)}`);
-      filesErrored++;
+      countLostToError(err);
     }
   }
 
@@ -790,6 +806,10 @@ export async function processBatch(
       }
     } catch (err) {
       log(`    ✗ asset-folder interpret failed for ${bf.folderPath}: ${summarizeError(err)}`);
+      // Not a file error (the files themselves skipped on mime), but the
+      // folder's asset observations are lost the same way — count only the
+      // transient class toward the re-run gate.
+      if (isTransientFailure(err)) transientFileErrors++;
     }
   }
 
@@ -804,6 +824,11 @@ export async function processBatch(
   log(
     `  → Extracted OK: ${filesExtracted}  Skipped: ${filesSkipped}  Errored: ${filesErrored}  Restricted: ${filesRestricted}  Zero obs: ${filesZeroObs}`,
   );
+  if (transientFileErrors > 0) {
+    log(
+      `  ⚠ ${transientFileErrors} transient error(s) (rate limit / 5xx / timeout / connection) — a re-run of this batch can recover their observations`,
+    );
+  }
   if (filesRestricted > 0) {
     log(
       `  ⛔ ${filesRestricted} restricted file(s) on the worklist — re-probed each scan; fix sharing or mark Ignore in gub-admin`,
@@ -1178,6 +1203,11 @@ export async function processBatch(
       let distillResult: EntitySynthesisResult['distillResult'] = null;
       const validatedChanges: ValidatedChange[] = [];
       let distilledNotes: Array<{ text: string; source_file_ids: string[] }> = [];
+      // A failed distill is a stage-3 failure: on the propose path the
+      // observations reach review ONLY through distillation, so carrying on
+      // would advance the cursor past them. Nothing for this target is
+      // proposed or applied; the driver's gate re-runs the window/day.
+      let distillFailed = false;
       if (target.entityType === 'piece') {
         // Pieces are markdown-only: no writable fields → nothing to distill.
         // Observations flow straight into synthesis below.
@@ -1308,8 +1338,28 @@ export async function processBatch(
             wlog(`        · ${vc.field} = ${val}  (${(vc.confidence * 100).toFixed(0)}%)`);
           }
         } catch (err) {
+          distillFailed = true;
+          stage3Failures++;
           wlog(`      distill failed: ${summarizeError(err)}`);
         }
+
+      if (distillFailed) {
+        wlog(
+          '      ✗ NOT proposed or applied — distill failed; counted as a stage-3 failure so the batch re-runs',
+        );
+        for (const line of lineBuffer) log(line);
+        return {
+          entityType: target.entityType,
+          entityName: target.entityName,
+          entityStatus: target.entityStatus,
+          observationsCount: target.observations.length,
+          filesCount: target.fileIds.size,
+          distillResult,
+          synthesizedMarkdown: '(distill failed — not proposed or synthesized)',
+          synthesizedSensitiveMarkdown: null,
+          synthesisMs: 0,
+        };
+      }
 
       // ── Synthesize (dual-output: general + sensitive) ───────────────
       // ── PROPOSE path (forward): review applies, we don't ─────────────
@@ -1573,6 +1623,7 @@ export async function processBatch(
     filesExtracted,
     filesSkipped,
     filesErrored,
+    transientFileErrors,
     filesZeroObs,
     accountObsTotal: accountBucket.length,
     campaignObsTotal,

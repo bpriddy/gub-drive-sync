@@ -28,8 +28,12 @@
 import { google, type drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
 import { logger } from '../logger';
-import { withTransientRetry } from './retry';
+import { isRateLimitError, withTransientRetry } from './retry';
 import { buildBotOAuthClient } from '../workspace';
+
+// Re-exported: the classifier lives in the config-free ./retry so the scan
+// core can classify a failure without the client's auth imports.
+export { isRateLimitError };
 
 const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 
@@ -53,27 +57,6 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 // Cost: ~125ms added per call (8 calls/sec). For Chevy's ~159 startup
 // calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
 // burst. Acceptable, and we never get a 403 in steady state.
-
-export function isRateLimitError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as {
-    code?: number;
-    status?: number;
-    errors?: Array<{ reason?: string }>;
-    response?: { status?: number; data?: { error?: { errors?: Array<{ reason?: string }> } } };
-  };
-  const status = e.code ?? e.status ?? e.response?.status;
-  if (status !== 403 && status !== 429) return false;
-  const reasons: string[] = [
-    ...(e.errors ?? []).map((x) => x.reason ?? ''),
-    ...(e.response?.data?.error?.errors ?? []).map((x) => x.reason ?? ''),
-  ];
-  // Reasons that mean "rate-limited, try again." Other 403s (auth, perms)
-  // are NOT retryable and should propagate immediately.
-  return reasons.some(
-    (r) => r === 'userRateLimitExceeded' || r === 'rateLimitExceeded' || r === 'quotaExceeded',
-  );
-}
 
 class DriveRateLimiter {
   private chainTail: Promise<void> = Promise.resolve();

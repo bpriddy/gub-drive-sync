@@ -153,6 +153,18 @@ export interface BatchOutcome {
   filesExtracted: number;
   filesSkipped: number;
   filesErrored: number;
+  /**
+   * Of filesErrored (plus stage-2 asset-folder calls), the failures of a
+   * transient class — rate limit, 408/5xx, timeout, dropped connection —
+   * after the call's own retries were spent. Their observations are lost
+   * from THIS batch but a re-run would very likely recover them, so the
+   * forward driver holds the cursor on them. Permanent failures (corrupt
+   * file, permission, malformed model output) stay counted-and-dropped:
+   * every re-run would repeat them. Idea-tier extraction failures are not
+   * counted: ideas are a separate ratchet with their own error count
+   * (ideaStats.ideaErrors), not part of the window's observations.
+   */
+  transientFileErrors: number;
   filesZeroObs: number;
   accountObsTotal: number;
   campaignObsTotal: number;
@@ -168,8 +180,10 @@ export interface BatchOutcome {
    * Stage-3 synthesis/apply/propose failures. Non-zero means at least
    * one entity's day did NOT land (in the DB or the review queue) —
    * run.ts throws before the cursor persists so the queue retry re-runs
-   * the day instead of silently losing it. Distill failures are
-   * deliberately excluded (degraded, not lost).
+   * the day instead of silently losing it. A failed distill counts too:
+   * on the propose path it is the only route from observations to review,
+   * so it is a loss, not a degradation; the target is then neither
+   * proposed nor applied, so the re-run lands it exactly once.
    */
   stage3Failures: number;
   /** Ideas tier: deck-gated extraction stats (null when account folder unknown). */

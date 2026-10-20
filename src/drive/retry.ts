@@ -85,3 +85,28 @@ export async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
   // Unreachable: the loop either returns or throws on the last attempt.
   throw new Error('withTransientRetry: exhausted without result');
 }
+
+/**
+ * Drive rate-limit signal: 403/429 carrying a rate-limit reason. Other 403s
+ * (auth, permissions) are NOT retryable and should propagate immediately.
+ */
+export function isRateLimitError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    code?: number;
+    status?: number;
+    errors?: Array<{ reason?: string }>;
+    response?: { status?: number; data?: { error?: { errors?: Array<{ reason?: string }> } } };
+  };
+  const status = e.code ?? e.status ?? e.response?.status;
+  if (status !== 403 && status !== 429) return false;
+  const reasons: string[] = [
+    ...(e.errors ?? []).map((x) => x.reason ?? ''),
+    ...(e.response?.data?.error?.errors ?? []).map((x) => x.reason ?? ''),
+  ];
+  // Reasons that mean "rate-limited, try again." Other 403s (auth, perms)
+  // are NOT retryable and should propagate immediately.
+  return reasons.some(
+    (r) => r === 'userRateLimitExceeded' || r === 'rateLimitExceeded' || r === 'quotaExceeded',
+  );
+}
