@@ -15,6 +15,7 @@
 // call in the process while it waited. Wrapping means each attempt re-enters
 // the queue and gets paced like any other call.
 
+import { jitteredDelayMs } from '../backoff';
 import { logger } from '../logger';
 
 /**
@@ -90,7 +91,8 @@ export async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
       return await fn();
     } catch (err) {
       if (!isTransientTransportError(err) || attempt === MAX_ATTEMPTS) throw err;
-      const backoffMs = 1000 * Math.pow(2, attempt - 1);
+      // Nominal 1 s → 2 s, jittered so parallel workers don't retry in step.
+      const backoffMs = jitteredDelayMs(1000 * Math.pow(2, attempt - 1));
       logger.warn(
         { attempt, MAX_ATTEMPTS, backoffMs, err: err instanceof Error ? err.message : String(err) },
         '[drive.retry] transient transport fault — retrying',
@@ -102,27 +104,54 @@ export async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
   throw new Error('withTransientRetry: exhausted without result');
 }
 
+/** 403 reasons that mean "rate-limited, try again". */
+const RATE_LIMIT_REASONS = new Set(['userRateLimitExceeded', 'rateLimitExceeded', 'quotaExceeded']);
+
+type ReasonList = Array<{ reason?: string } | null | undefined>;
+
 /**
- * Drive rate-limit signal: 403/429 carrying a rate-limit reason. Other 403s
- * (auth, permissions) are NOT retryable and should propagate immediately.
+ * Drive/Workspace rate-limit signal — back off and try again:
+ *   - 429, whatever its body says (newer APIs answer RESOURCE_EXHAUSTED
+ *     with no `errors[].reason` at all);
+ *   - 403 carrying a rate-limit reason.
+ * Other 403s (auth, permissions) are NOT retryable and should propagate
+ * immediately.
+ *
+ * Reasons are read wherever googleapis left them: `errors` on the error,
+ * the parsed body, or — for `responseType: 'stream'` calls (media
+ * downloads) — the raw JSON text gaxios read off the stream, where neither
+ * `code` nor `errors` is set. Missing that last shape made a rate-limited
+ * download look like a permission error (see isDrivePermissionError).
  */
 export function isRateLimitError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   const e = err as {
-    code?: number;
+    code?: number | string;
     status?: number;
-    errors?: Array<{ reason?: string }>;
-    response?: { status?: number; data?: { error?: { errors?: Array<{ reason?: string }> } } };
+    errors?: ReasonList;
+    response?: { status?: number; data?: unknown };
   };
-  const status = e.code ?? e.status ?? e.response?.status;
-  if (status !== 403 && status !== 429) return false;
-  const reasons: string[] = [
-    ...(e.errors ?? []).map((x) => x.reason ?? ''),
-    ...(e.response?.data?.error?.errors ?? []).map((x) => x.reason ?? ''),
-  ];
-  // Reasons that mean "rate-limited, try again." Other 403s (auth, perms)
-  // are NOT retryable and should propagate immediately.
-  return reasons.some(
-    (r) => r === 'userRateLimitExceeded' || r === 'rateLimitExceeded' || r === 'quotaExceeded',
-  );
+  const code =
+    typeof e.code === 'number'
+      ? e.code
+      : typeof e.code === 'string' && /^\d+$/.test(e.code)
+        ? Number(e.code)
+        : undefined;
+  const status = code ?? e.status ?? e.response?.status;
+  if (status === 429) return true;
+  if (status !== 403) return false;
+  return reasonsOf(e).some((r) => RATE_LIMIT_REASONS.has(r));
+}
+
+function reasonsOf(e: { errors?: ReasonList; response?: { data?: unknown } }): string[] {
+  let body = e.response?.data;
+  if (typeof body === 'string') {
+    try {
+      body = JSON.parse(body);
+    } catch {
+      body = undefined;
+    }
+  }
+  const bodyErrors = (body as { error?: { errors?: ReasonList } } | undefined)?.error?.errors;
+  return [...(e.errors ?? []), ...(bodyErrors ?? [])].map((x) => x?.reason ?? '');
 }

@@ -36,6 +36,7 @@ import { google, type docs_v1, type slides_v1, type sheets_v4 } from 'googleapis
 import { config } from '../config';
 import { logger } from '../logger';
 import { downloadFileBuffer } from './client';
+import { pacedCall } from './pacing';
 import { buildBotOAuthClient } from '../workspace';
 import type { ExtractionOutcome, ExtractionSkip, TraversedFile } from './types';
 
@@ -323,7 +324,7 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
 
 export async function extractGoogleDoc(documentId: string): Promise<string> {
   const client = await docsClient();
-  const res = await client.documents.get({ documentId });
+  const res = await pacedCall('docs', () => client.documents.get({ documentId }));
   const doc = res.data;
   const parts: string[] = [];
 
@@ -382,7 +383,7 @@ function walkDocTable(t: docs_v1.Schema$Table): string {
 
 export async function extractGoogleSlides(presentationId: string): Promise<string> {
   const client = await slidesClient();
-  const res = await client.presentations.get({ presentationId });
+  const res = await pacedCall('slides', () => client.presentations.get({ presentationId }));
   const pres = res.data;
   const parts: string[] = [];
 
@@ -460,10 +461,12 @@ export async function extractGoogleSheets(spreadsheetId: string): Promise<string
   const client = await sheetsClient();
 
   // Step 1: enumerate sheets.
-  const meta = await client.spreadsheets.get({
-    spreadsheetId,
-    fields: 'properties.title,sheets.properties(title,sheetId)',
-  });
+  const meta = await pacedCall('sheets', () =>
+    client.spreadsheets.get({
+      spreadsheetId,
+      fields: 'properties.title,sheets.properties(title,sheetId)',
+    }),
+  );
 
   const workbookTitle = meta.data.properties?.title;
   const sheetTitles = (meta.data.sheets ?? [])
@@ -473,11 +476,13 @@ export async function extractGoogleSheets(spreadsheetId: string): Promise<string
   if (sheetTitles.length === 0) return '';
 
   // Step 2: batch values fetch. One range per sheet, naming the whole sheet.
-  const values = await client.spreadsheets.values.batchGet({
-    spreadsheetId,
-    ranges: sheetTitles,
-    valueRenderOption: 'FORMATTED_VALUE',
-  });
+  const values = await pacedCall('sheets', () =>
+    client.spreadsheets.values.batchGet({
+      spreadsheetId,
+      ranges: sheetTitles,
+      valueRenderOption: 'FORMATTED_VALUE',
+    }),
+  );
 
   const parts: string[] = [];
   if (workbookTitle) parts.push(`# ${workbookTitle}\n\n`);

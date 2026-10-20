@@ -14,6 +14,7 @@ import { prisma } from '../prisma';
 import { config } from '../config';
 import { logger } from '../logger';
 import { buildBotOAuthClient } from '../workspace';
+import { pacedCall } from '../drive/pacing';
 
 const DIRECTORY_SCOPE = 'https://www.googleapis.com/auth/directory.readonly';
 
@@ -55,14 +56,16 @@ export async function resolveActors(resources: ReadonlySet<string>): Promise<Map
   let resolved = 0;
   for (const resource of misses) {
     try {
-      const res = await people.people.get({
-        resourceName: resource,
-        personFields: 'emailAddresses,names',
-        // READ_SOURCE_TYPE_PROFILE covers ACCOUNT + DOMAIN_PROFILE + PROFILE
-        // response sources; DOMAIN_PROFILE is not itself a valid *read*
-        // source enum (validated live 2026-08-14 — it 400s every call).
-        sources: ['READ_SOURCE_TYPE_PROFILE', 'READ_SOURCE_TYPE_DOMAIN_CONTACT'],
-      });
+      const res = await pacedCall('people', () =>
+        people.people.get({
+          resourceName: resource,
+          personFields: 'emailAddresses,names',
+          // READ_SOURCE_TYPE_PROFILE covers ACCOUNT + DOMAIN_PROFILE + PROFILE
+          // response sources; DOMAIN_PROFILE is not itself a valid *read*
+          // source enum (validated live 2026-08-14 — it 400s every call).
+          sources: ['READ_SOURCE_TYPE_PROFILE', 'READ_SOURCE_TYPE_DOMAIN_CONTACT'],
+        }),
+      );
       const email =
         res.data.emailAddresses?.find((e) => e.metadata?.primary)?.value ??
         res.data.emailAddresses?.[0]?.value ??

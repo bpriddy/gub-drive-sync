@@ -29,6 +29,7 @@ import { google, type drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
 import { config } from '../config';
 import { logger } from '../logger';
+import { jitteredDelayMs } from '../backoff';
 import { isRateLimitError, RequestTimeoutError, withTransientRetry } from './retry';
 import { buildBotOAuthClient } from '../workspace';
 
@@ -59,7 +60,7 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 // calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
 // burst. Acceptable, and we never get a 403 in steady state.
 
-class DriveRateLimiter {
+export class DriveRateLimiter {
   private chainTail: Promise<void> = Promise.resolve();
   private lastCallEndAt = 0;
   private readonly minIntervalMs: number;
@@ -90,8 +91,9 @@ class DriveRateLimiter {
     // Defense in depth: even with pacing, transient quota throttles can
     // slip through (bot user has tighter-than-documented quota,
     // cumulative effects, concurrent processes sharing the bot user).
-    // Retry rate-limit errors with exponential backoff: 2s → 4s → 8s →
-    // 16s → 30s. Non-rate-limit errors propagate immediately.
+    // Retry rate-limit errors with exponential backoff: nominal 2s → 4s →
+    // 8s → 16s (cap 30s), jittered ×[0.5, 1.5). Non-rate-limit errors
+    // propagate immediately.
     const MAX_ATTEMPTS = 5;
     let lastErr: unknown;
     try {
@@ -101,7 +103,7 @@ class DriveRateLimiter {
         } catch (err) {
           lastErr = err;
           if (!isRateLimitError(err) || attempt === MAX_ATTEMPTS) throw err;
-          const backoffMs = Math.min(2000 * Math.pow(2, attempt - 1), 30_000);
+          const backoffMs = jitteredDelayMs(Math.min(2000 * Math.pow(2, attempt - 1), 30_000));
           logger.warn(
             { attempt, MAX_ATTEMPTS, backoffMs },
             '[drive.client] rate-limited despite pacing — backing off and retrying',
