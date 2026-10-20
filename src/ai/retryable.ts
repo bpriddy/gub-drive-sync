@@ -16,8 +16,23 @@ export function isRetryableHttpStatus(status: number): boolean {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
 
+/**
+ * One attempt ran past its call type's deadline (the SDK aborted the fetch).
+ * Retried like a 408: a stalled request is the transient case timeouts
+ * exist for.
+ */
+export class LlmTimeoutError extends Error {
+  readonly timeoutMs: number;
+  constructor(timeoutMs: number, options?: { cause?: unknown }) {
+    super(`[gemini] request timed out after ${timeoutMs} ms`, options);
+    this.name = 'LlmTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export function isRetryableLlmError(err: unknown): boolean {
   if (!err) return false;
+  if (err instanceof LlmTimeoutError) return true;
   // API-level errors carry a typed HTTP status (SDK-recommended handling).
   if (err instanceof ApiError) return isRetryableHttpStatus(err.status);
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();

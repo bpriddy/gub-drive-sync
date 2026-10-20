@@ -113,6 +113,7 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
   const completion = await runPreset({
     key: 'drive.distillation.v1',
     responseSchema: distillationResponseSchema(input.entityType),
+    timeoutMs: config.GEMINI_TIMEOUT_DISTILL_MS,
     variables: {
       entity_type: input.entityType,
       writable_fields_json: JSON.stringify(

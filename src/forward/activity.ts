@@ -17,6 +17,7 @@
  */
 
 import { google, type driveactivity_v2 } from 'googleapis';
+import { config } from '../config';
 import { logger } from '../logger';
 import { buildBotOAuthClient } from '../workspace';
 
@@ -41,7 +42,11 @@ async function activityClient(): Promise<driveactivity_v2.Driveactivity> {
   if (cachedClient) return cachedClient;
   const auth = await buildBotOAuthClient('drive', [ACTIVITY_SCOPE]);
   logger.info('[forward.activity] initialized Drive Activity client (drive bot OAuth)');
-  cachedClient = google.driveactivity({ version: 'v2', auth });
+  cachedClient = google.driveactivity({
+    version: 'v2',
+    auth,
+    timeout: config.DRIVE_READ_TIMEOUT_MS,
+  });
   return cachedClient;
 }
 

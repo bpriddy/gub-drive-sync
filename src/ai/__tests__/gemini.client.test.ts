@@ -18,12 +18,15 @@ vi.mock('../../config', () => ({
     GEMINI_API_KEY: undefined,
     GCP_PROJECT_ID: undefined,
     GEMINI_LOCATION: 'global',
+    // Real defaults are minutes; the stall tests need the default path to
+    // fire within a test's lifetime.
+    GEMINI_TIMEOUT_DEFAULT_MS: 40,
   },
 }));
 vi.mock('../../logger', () => ({ logger: loggerMock }));
 
 import { GeminiLlmDriver } from '../gemini.client';
-import { isRetryableLlmError } from '../retryable';
+import { isRetryableLlmError, LlmTimeoutError } from '../retryable';
 
 function okResponse(text = '{"ok":true}', finishReason = 'STOP'): Response {
   return new Response(
@@ -161,5 +164,61 @@ describe('isRetryableLlmError', () => {
     ).toBe(false);
     expect(isRetryableLlmError(new SyntaxError('Unexpected end of JSON input'))).toBe(false);
     expect(isRetryableLlmError(null)).toBe(false);
+  });
+});
+
+/** A fetch that never answers until its signal aborts — then rejects like real fetch. */
+function stalledFetch(_url: string, init?: RequestInit): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    const signal = init?.signal;
+    if (!signal) return; // no deadline: hang (the test would time out)
+    signal.addEventListener('abort', () =>
+      reject(new DOMException('This operation was aborted', 'AbortError')),
+    );
+  });
+}
+
+function headerOf(init: RequestInit | undefined, name: string): string | null {
+  return new Headers(init?.headers).get(name);
+}
+
+describe('GeminiLlmDriver per-attempt deadline', () => {
+  it('aborts a stalled attempt at its timeout, then retries and succeeds', async () => {
+    fetchMock.mockImplementationOnce(stalledFetch).mockResolvedValueOnce(okResponse('{"b":2}'));
+    const res = await driver().complete({ ...REQ, timeoutMs: 30 });
+    expect(res.text).toBe('{"b":2}');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The deadline also reaches the server (seconds, rounded up).
+    expect(headerOf(fetchMock.mock.calls[0]![1], 'X-Server-Timeout')).toBe('1');
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ attempt: 1, retryable: true, willRetry: true }),
+      '[gemini] generateContent attempt failed',
+    );
+  });
+
+  it('surfaces a named timeout once every attempt stalls', async () => {
+    fetchMock.mockImplementation(stalledFetch);
+    const err = await driver()
+      .complete({ ...REQ, timeoutMs: 20 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LlmTimeoutError);
+    expect((err as LlmTimeoutError).message).toBe('[gemini] request timed out after 20 ms');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('falls back to GEMINI_TIMEOUT_DEFAULT_MS when the call type sets none', async () => {
+    fetchMock.mockImplementation(stalledFetch);
+    const err = await driver()
+      .complete(REQ)
+      .catch((e: unknown) => e);
+    expect((err as LlmTimeoutError).timeoutMs).toBe(40);
+  });
+
+  it('sets no deadline at all when the timeout is 0 (the rollback)', async () => {
+    fetchMock.mockResolvedValue(okResponse());
+    await driver().complete({ ...REQ, timeoutMs: 0 });
+    const init = fetchMock.mock.calls[0]![1];
+    expect(init?.signal ?? null).toBeNull();
+    expect(headerOf(init, 'X-Server-Timeout')).toBeNull();
   });
 });

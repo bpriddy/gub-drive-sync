@@ -28,6 +28,7 @@
  */
 
 import { z } from 'zod';
+import { config } from '../config';
 import { logger } from '../logger';
 import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
 import { listAllFoldersInDrive, listSubfolders, probeFolder, type DriveFolderRec } from './client';
@@ -333,6 +334,7 @@ export async function classifyFolders(args: {
     tag: STRUCTURE_RESOLUTION_VERSION,
     responseSchema: structureResolutionResponseSchema(),
     maxOutputTokens: MAX_OUTPUT_TOKENS,
+    timeoutMs: config.GEMINI_TIMEOUT_CLASSIFY_MS,
   });
 
   let parsed: z.infer<typeof StructureResponseSchema>;

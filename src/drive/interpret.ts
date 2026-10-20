@@ -105,6 +105,7 @@ export async function interpretFile(input: InterpretFileInput): Promise<Interpre
   const result = await runPreset({
     key: 'drive.file_extraction.v1',
     responseSchema: perFileResponseSchema(),
+    timeoutMs: config.GEMINI_TIMEOUT_INTERPRET_MS,
     variables: {
       account_name: input.accountName ?? '(unknown)',
       campaign_name: input.campaignName ?? '(n/a)',

@@ -73,21 +73,21 @@ let cachedSheets: sheets_v4.Sheets | null = null;
 async function docsClient(): Promise<docs_v1.Docs> {
   if (cachedDocs) return cachedDocs;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedDocs = google.docs({ version: 'v1', auth });
+  cachedDocs = google.docs({ version: 'v1', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedDocs;
 }
 
 async function slidesClient(): Promise<slides_v1.Slides> {
   if (cachedSlides) return cachedSlides;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedSlides = google.slides({ version: 'v1', auth });
+  cachedSlides = google.slides({ version: 'v1', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedSlides;
 }
 
 async function sheetsClient(): Promise<sheets_v4.Sheets> {
   if (cachedSheets) return cachedSheets;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedSheets = google.sheets({ version: 'v4', auth });
+  cachedSheets = google.sheets({ version: 'v4', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedSheets;
 }
 

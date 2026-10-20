@@ -35,7 +35,11 @@ export function isTransientTransportError(err: unknown): boolean {
     status?: number;
     response?: { status?: number };
     message?: string;
+    error?: { type?: string };
   };
+  // A request that ran past its gaxios `timeout` (node-fetch FetchError,
+  // wrapped by gaxios with no response): a stall, not a refusal.
+  if (e.error?.type === 'request-timeout' || e.error?.type === 'body-timeout') return true;
   const numericCode = typeof e.code === 'string' ? Number(e.code) : e.code;
   const status =
     (Number.isFinite(numericCode) ? (numericCode as number) : undefined) ??
@@ -57,6 +61,18 @@ export function isTransientTransportError(err: unknown): boolean {
   return (
     typeof e.message === 'string' && /socket hang up|network socket disconnected/i.test(e.message)
   );
+}
+
+/**
+ * A request this Job aborted at its own deadline. `code: 'ETIMEDOUT'` puts
+ * it in the transient class (isTransientTransportError) on purpose.
+ */
+export class RequestTimeoutError extends Error {
+  readonly code = 'ETIMEDOUT';
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'RequestTimeoutError';
+  }
 }
 
 /**

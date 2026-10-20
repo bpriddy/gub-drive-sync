@@ -27,8 +27,9 @@
 
 import { google, type drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
+import { config } from '../config';
 import { logger } from '../logger';
-import { isRateLimitError, withTransientRetry } from './retry';
+import { isRateLimitError, RequestTimeoutError, withTransientRetry } from './retry';
 import { buildBotOAuthClient } from '../workspace';
 
 // Re-exported: the classifier lives in the config-free ./retry so the scan
@@ -149,7 +150,9 @@ export async function driveClient(): Promise<drive_v3.Drive> {
   const auth = await buildBotOAuthClient('drive', [DRIVE_READONLY_SCOPE]);
   logger.info('[drive.client] initialized Drive client (bot-user OAuth)');
 
-  cachedClient = google.drive({ version: 'v3', auth });
+  // Service-level gaxios timeout: every metadata/list call aborts after
+  // DRIVE_READ_TIMEOUT_MS (gaxios then retries a timed-out GET twice).
+  cachedClient = google.drive({ version: 'v3', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedClient;
 }
 
@@ -410,10 +413,35 @@ export async function getFileMetadata(fileId: string): Promise<drive_v3.Schema$F
  */
 export async function downloadFileBuffer(fileId: string): Promise<Buffer> {
   const client = await driveClient();
-  const res = await driveLimiter.run(() =>
-    client.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' }),
-  );
-  return streamToBuffer(res.data as Readable);
+  // One deadline for the whole download. gaxios' `timeout` stops at the
+  // response headers; the abort signal also covers a body that stalls
+  // mid-stream. The per-request `timeout` overrides the service-level read
+  // timeout, which is far too short for a large binary. The deadline is
+  // armed when the request starts, inside the limiter, so time spent
+  // queued behind other Drive calls never counts against it.
+  const timeoutMs = config.DRIVE_MEDIA_TIMEOUT_MS;
+  const abort = new AbortController();
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    const res = await driveLimiter.run(() => {
+      if (timer) clearTimeout(timer); // a rate-limit retry re-arms
+      if (timeoutMs > 0) timer = setTimeout(() => abort.abort(), timeoutMs);
+      return client.files.get(
+        { fileId, alt: 'media', supportsAllDrives: true },
+        { responseType: 'stream', timeout: timeoutMs, signal: abort.signal },
+      );
+    });
+    return await streamToBuffer(res.data as Readable);
+  } catch (err) {
+    if (abort.signal.aborted) {
+      throw new RequestTimeoutError(`media download timed out after ${timeoutMs} ms`, {
+        cause: err,
+      });
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function streamToBuffer(stream: Readable): Promise<Buffer> {

@@ -2,6 +2,7 @@
 // by every driver (day-walk backfill today; the Activity forward driver next).
 import { z } from 'zod';
 import { prisma } from '../prisma';
+import { config } from '../config';
 import {
   ACCOUNT_WRITABLE_FIELDS,
   CAMPAIGN_WRITABLE_FIELDS,
@@ -88,6 +89,7 @@ export async function runDistillation(
   const completion = await runPreset({
     key: 'drive.distillation.v1',
     responseSchema: distillationResponseSchema(entityType),
+    timeoutMs: config.GEMINI_TIMEOUT_DISTILL_MS,
     variables: {
       entity_type: entityType,
       writable_fields_json: JSON.stringify(

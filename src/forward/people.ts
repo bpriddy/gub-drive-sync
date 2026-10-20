@@ -11,6 +11,7 @@
 
 import { google } from 'googleapis';
 import { prisma } from '../prisma';
+import { config } from '../config';
 import { logger } from '../logger';
 import { buildBotOAuthClient } from '../workspace';
 
@@ -49,7 +50,7 @@ export async function resolveActors(resources: ReadonlySet<string>): Promise<Map
   if (misses.length === 0) return out;
 
   const auth = await buildBotOAuthClient('directory', [DIRECTORY_SCOPE]);
-  const people = google.people({ version: 'v1', auth });
+  const people = google.people({ version: 'v1', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
 
   let resolved = 0;
   for (const resource of misses) {

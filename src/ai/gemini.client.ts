@@ -26,7 +26,8 @@ import { ApiError, GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google
 import { config } from '../config';
 import { logger } from '../logger';
 import { jitteredDelayMs } from '../backoff';
-import { isRetryableLlmError } from './retryable';
+import { isRetryableLlmError, LlmTimeoutError } from './retryable';
+import { raiseFetchTimeouts, requiredFetchTimeoutMs } from './fetch-timeouts';
 import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } from './ai.types';
 
 /**
@@ -89,6 +90,9 @@ export class GeminiLlmDriver implements LlmDriver {
   }
 
   async complete(req: LlmCompletionRequest): Promise<LlmCompletionResult> {
+    // Per-attempt deadline. httpOptions.timeout makes the SDK abort the
+    // fetch and send X-Server-Timeout so the server gives up too.
+    const timeoutMs = req.timeoutMs ?? config.GEMINI_TIMEOUT_DEFAULT_MS;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
@@ -96,6 +100,7 @@ export class GeminiLlmDriver implements LlmDriver {
           model: req.model,
           contents: req.prompt,
           config: {
+            ...(timeoutMs > 0 ? { httpOptions: { timeout: timeoutMs } } : {}),
             temperature: req.temperature,
             ...(req.responseSchema
               ? { responseMimeType: 'application/json', responseSchema: req.responseSchema }
@@ -134,7 +139,13 @@ export class GeminiLlmDriver implements LlmDriver {
           raw: res,
           ...(usage ? { usage } : {}),
         };
-      } catch (err) {
+      } catch (caught) {
+        // The SDK's deadline surfaces as fetch's bare AbortError ("This
+        // operation was aborted"); name it so logs and the retry say why.
+        const err =
+          timeoutMs > 0 && caught instanceof Error && caught.name === 'AbortError'
+            ? new LlmTimeoutError(timeoutMs, { cause: caught })
+            : caught;
         lastErr = err;
         const retryable = isRetryableLlmError(err);
         const willRetry = retryable && attempt < MAX_ATTEMPTS;
@@ -212,8 +223,28 @@ function emptyInstance(schema: Schema): unknown {
   }
 }
 
+/**
+ * Lift Node's fetch limits above the longest Gemini deadline (see
+ * ./fetch-timeouts). Real drivers only; the mock never fetches.
+ */
+function allowConfiguredDeadlines(): void {
+  const needed = requiredFetchTimeoutMs([
+    config.GEMINI_TIMEOUT_INTERPRET_MS,
+    config.GEMINI_TIMEOUT_DISTILL_MS,
+    config.GEMINI_TIMEOUT_CLASSIFY_MS,
+    config.GEMINI_TIMEOUT_DEFAULT_MS,
+  ]);
+  if (needed === null) return;
+  raiseFetchTimeouts(needed);
+  logger.info(
+    { headersTimeoutMs: needed, bodyTimeoutMs: needed },
+    '[llm] fetch dispatcher timeouts raised',
+  );
+}
+
 function createDriver(): LlmDriver {
   if (config.GEMINI_USE_ENTERPRISE && config.GCP_PROJECT_ID) {
+    allowConfiguredDeadlines();
     logger.info(
       { project: config.GCP_PROJECT_ID, location: config.GEMINI_LOCATION },
       '[llm] Gemini Enterprise Agent Platform (ADC auth)',
@@ -224,6 +255,7 @@ function createDriver(): LlmDriver {
     });
   }
   if (config.GEMINI_API_KEY) {
+    allowConfiguredDeadlines();
     return new GeminiLlmDriver({ apiKey: config.GEMINI_API_KEY });
   }
   logger.warn(

@@ -8,6 +8,10 @@
  */
 import { z } from 'zod';
 
+/** A per-request timeout in ms; `0` disables it (the pre-timeout behaviour). */
+const timeoutMs = (fallback: string) =>
+  z.string().default(fallback).transform(Number).pipe(z.number().int().min(0));
+
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
@@ -64,6 +68,21 @@ const EnvSchema = z.object({
    * synth → ~5min parallel.
    */
   SYNTH_CONCURRENCY: z.string().default('8').transform(Number),
+
+  // ── Request timeouts (ms, per attempt; 0 = none) ────────────────────────
+  // A stalled call used to hang until undici's 300 s fetch default (Gemini)
+  // or forever (googleapis). Each Gemini attempt aborts at its call type's
+  // deadline and is retried like a 408. Distill calls of ~185 s are
+  // legitimate; folder classify can run past 300 s.
+  GEMINI_TIMEOUT_INTERPRET_MS: timeoutMs('120000'),
+  GEMINI_TIMEOUT_DISTILL_MS: timeoutMs('240000'),
+  GEMINI_TIMEOUT_CLASSIFY_MS: timeoutMs('420000'),
+  /** Every other Gemini call (synthesis, ideas, asset folders, merges…). */
+  GEMINI_TIMEOUT_DEFAULT_MS: timeoutMs('300000'),
+  /** Drive / Docs / Slides / Sheets / Activity / People reads. */
+  DRIVE_READ_TIMEOUT_MS: timeoutMs('60000'),
+  /** Binary downloads (files.get alt=media), headers + body. */
+  DRIVE_MEDIA_TIMEOUT_MS: timeoutMs('300000'),
 
   // ── Notify URLs ──────────────────────────────────────────────────────────
   GUB_ADMIN_BASE_URL: z.string().url().default('http://localhost:5173'),
