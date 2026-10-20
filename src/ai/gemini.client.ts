@@ -25,57 +25,52 @@
 import { ApiError, GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google/genai';
 import { config } from '../config';
 import { logger } from '../logger';
+import { jitteredDelayMs } from '../backoff';
+import { isRetryableLlmError } from './retryable';
 import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } from './ai.types';
 
 /**
  * Retry posture for Gemini calls.
  *
- * Transient failures (network blips, 5xx, 429 rate limits) shouldn't kill
- * a multi-hour scan over one bad moment. We retry up to MAX_ATTEMPTS=3
- * with exponential backoff. Non-retryable errors (4xx other than 429,
- * auth issues, malformed prompts) throw immediately — retrying those
- * just wastes time.
- *
- * Detection: API-level errors are typed (ApiError.status — the SDK's
- * recommended handling); network-level transport errors never reach
- * ApiError, so those are string-matched.
+ * Transient failures (network blips, 408, 429 rate limits, 5xx) shouldn't
+ * kill a multi-hour scan over one bad moment. We retry up to MAX_ATTEMPTS=3
+ * with jittered exponential backoff. Non-retryable errors (other 4xx, auth
+ * issues, malformed prompts) throw immediately — retrying those just wastes
+ * time. Classification lives in ./retryable (isRetryableLlmError).
  */
 const MAX_ATTEMPTS = 3;
-const BASE_BACKOFF_MS = 1000; // 1s → 3s → 9s (3^attempt)
+const BASE_BACKOFF_MS = 1000; // nominal 1s → 3s (3^attempt), jittered ×[0.5, 1.5)
 
-function isRetryable(err: unknown): boolean {
-  if (!err) return false;
-  // API-level errors carry a typed HTTP status (SDK-recommended handling):
-  // retry rate limits + server-side failures, never other 4xx.
-  if (err instanceof ApiError) {
-    return err.status === 429 || (err.status >= 500 && err.status <= 599);
-  }
-  // Network-level failures never reach ApiError (they surface as fetch/socket
-  // errors from the transport) — string-match those.
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  if (msg.includes('fetch failed')) return true;
-  if (msg.includes('econnreset')) return true;
-  if (msg.includes('etimedout')) return true;
-  if (msg.includes('econnrefused')) return true;
-  if (msg.includes('socket hang up')) return true;
-  if (msg.includes('deadline exceeded')) return true;
-  return false;
-}
+/** Longest error text carried on the WARN line — enough for status + reason. */
+const WARN_ERR_MAX_CHARS = 300;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class GeminiLlmDriver implements LlmDriver {
+export interface GeminiDriverOptions {
+  /** Backoff sleep — injectable so the unit suite doesn't wait in real time. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export class GeminiLlmDriver implements LlmDriver {
   readonly name: string;
   private client: GoogleGenAI;
+  private readonly sleep: (ms: number) => Promise<void>;
 
-  constructor(init: { project: string; location: string } | { apiKey: string }) {
-    // retryOptions.attempts=1: OUR loop below owns retries (logging +
-    // backoff); pinning the SDK's built-in retry off prevents the two
-    // from stacking (SDK default is 5 attempts when retryOptions is set,
-    // and unspecified behavior otherwise — explicit is deterministic).
-    const httpOptions = { retryOptions: { attempts: 1 } };
+  constructor(
+    init: { project: string; location: string } | { apiKey: string },
+    opts: GeminiDriverOptions = {},
+  ) {
+    this.sleep = opts.sleep ?? sleep;
+    // NO retryOptions: OUR loop below owns retries (logging + backoff).
+    // With retryOptions set — even {attempts: 1} — @google/genai 2.11 routes
+    // fetch through p-retry and throws a plain Error("Retryable HTTP Error:
+    // <statusText>") for 408/429/5xx and "Non-retryable exception …" for
+    // the rest: no ApiError, no status, no response body. Without it the
+    // SDK makes exactly one fetch per call (no built-in retry) and throws a
+    // typed ApiError carrying the status and the server's error message.
+    const httpOptions = {};
     if ('project' in init) {
       // Gemini Enterprise Agent Platform: auth via ADC (the Cloud Run job's
       // service account in deploy; gcloud ADC locally) — no API key. The
@@ -141,18 +136,37 @@ class GeminiLlmDriver implements LlmDriver {
         };
       } catch (err) {
         lastErr = err;
-        const retryable = isRetryable(err);
+        const retryable = isRetryableLlmError(err);
         const willRetry = retryable && attempt < MAX_ATTEMPTS;
-        // Demoted to debug: callers (distill, interpret, etc.) handle the
-        // user-facing error display via progress.* + drive_scan_logs.
-        // Successful retries log at info above so we know it self-healed.
+        // Full error object stays at debug: callers (distill, interpret,
+        // etc.) handle the user-facing error display via progress.* +
+        // drive_scan_logs. Successful retries log at info above so we know
+        // it self-healed.
         logger.debug(
           { err, model: req.model, tag: req.tag, attempt, retryable, willRetry },
           '[gemini] generateContent failed',
         );
-        if (!willRetry) break;
-        // Exponential backoff: 1s, 3s, 9s.
-        await sleep(BASE_BACKOFF_MS * Math.pow(3, attempt - 1));
+        const backoffMs = willRetry
+          ? jitteredDelayMs(BASE_BACKOFF_MS * Math.pow(3, attempt - 1))
+          : null;
+        // Every failed attempt is visible at the default level — a 429
+        // storm that self-heals and one that loses a bucket must both show.
+        logger.warn(
+          {
+            model: req.model,
+            tag: req.tag,
+            attempt,
+            maxAttempts: MAX_ATTEMPTS,
+            status: err instanceof ApiError ? err.status : null,
+            retryable,
+            willRetry,
+            backoffMs,
+            error: (err instanceof Error ? err.message : String(err)).slice(0, WARN_ERR_MAX_CHARS),
+          },
+          '[gemini] generateContent attempt failed',
+        );
+        if (backoffMs === null) break;
+        await this.sleep(backoffMs);
       }
     }
     throw lastErr;
