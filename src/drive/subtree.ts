@@ -24,7 +24,13 @@
 
 import type { drive_v3 } from 'googleapis';
 import { FlatListingUnavailableError, listAllFoldersInDrive, listDriveFilesFlat } from './client';
-import { buildTreeFromFlat, MAX_DEPTH, subtreeParentPaths } from './folder-tree';
+import {
+  buildTreeFromFlat,
+  makeReach,
+  MAX_DEPTH,
+  subtreeParentPaths,
+  type ParentMapStats,
+} from './folder-tree';
 import type { TraversedFile } from './types';
 
 export interface SubtreeFiles {
@@ -34,6 +40,8 @@ export interface SubtreeFiles {
   folderCount: number;
   /** Folders at the depth cap: like traverseFolder, their files are not listed. */
   depthCapHits: number;
+  /** The file sweep's parent-map counters (depth_cap = depthCapHits). */
+  stats: ParentMapStats;
 }
 
 export async function listSubtreeFiles(
@@ -49,16 +57,32 @@ export async function listSubtreeFiles(
   }
   const folders = buildTreeFromFlat(rootId, rootLabel, flatFolders);
   const parentPathOf = subtreeParentPaths(rootId, rootLabel, folders);
-  const raw = await listDriveFilesFlat(
-    driveId,
-    (f) => !!f.id && !!f.name && !!f.mimeType && parentPathOf(f.parents?.[0]) !== null,
-  );
-  const files = raw.map((f) => toTraversedFile(f, `${parentPathOf(f.parents?.[0])} / ${f.name}`));
-  return {
-    files,
-    folderCount: folders.length,
-    depthCapHits: folders.filter((f) => f.depth > MAX_DEPTH).length,
+  const reach = makeReach(rootId, driveId, flatFolders);
+  const depthCapHits = folders.filter((f) => f.depth > MAX_DEPTH).length;
+  const stats: ParentMapStats = {
+    in_scope: 0,
+    out_of_scope: 0,
+    orphans: 0,
+    multi_parent: 0,
+    depth_cap: depthCapHits,
   };
+
+  const raw = await listDriveFilesFlat(driveId, (f) => {
+    if (!f.id || !f.name || !f.mimeType) return false;
+    if ((f.parents?.length ?? 0) > 1) stats.multi_parent++;
+    const parentId = f.parents?.[0];
+    if (parentPathOf(parentId) !== null) {
+      stats.in_scope++;
+      return true;
+    }
+    const r = reach(parentId);
+    if (r === 'out') stats.out_of_scope++;
+    else if (r === 'orphan') stats.orphans++;
+    // 'in' here means beneath the depth cap: not listed, as in traverseFolder.
+    return false;
+  });
+  const files = raw.map((f) => toTraversedFile(f, `${parentPathOf(f.parents?.[0])} / ${f.name}`));
+  return { files, folderCount: folders.length, depthCapHits, stats };
 }
 
 /** The same shape traverseFolder yields, plus the flat listing's content markers. */

@@ -34,7 +34,10 @@ export async function gatherFilesAuto(
     // a folder share without drive membership) falls back to the walk.
     log('  Using FLAT list of the drive, cut to this folder…');
     try {
-      const { files, depthCapHits } = await listSubtreeFiles(folderId, label, probe.driveId);
+      const { files, depthCapHits, stats } = await listSubtreeFiles(folderId, label, probe.driveId);
+      log(
+        `  Parent map (files): in_scope=${stats.in_scope} out_of_scope=${stats.out_of_scope} orphans=${stats.orphans} multi_parent=${stats.multi_parent} depth_cap=${stats.depth_cap}`,
+      );
       if (depthCapHits > 0)
         log(`  ⚠ ${depthCapHits} subfolder(s) past depth cap — files beneath NOT listed`);
       return sortByCreatedTime(files, newestFirst);

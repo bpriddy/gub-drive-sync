@@ -323,6 +323,8 @@ export interface DriveFolderRec {
   name: string;
   /** Immediate parent id (shared-drive folders have at most one parent). */
   parentId: string | null;
+  /** How many parents Drive listed; parentId is the first. Above 1 is a legacy multi-parent item. */
+  parentCount: number;
 }
 
 export async function listAllFoldersInDrive(
@@ -349,7 +351,12 @@ export async function listAllFoldersInDrive(
     );
     for (const f of res.data.files ?? []) {
       if (!f.id || !f.name) continue;
-      out.push({ id: f.id, name: f.name, parentId: f.parents?.[0] ?? null });
+      out.push({
+        id: f.id,
+        name: f.name,
+        parentId: f.parents?.[0] ?? null,
+        parentCount: f.parents?.length ?? 0,
+      });
     }
     if (opts.onPage) opts.onPage(out.length);
     pageToken = res.data.nextPageToken ?? undefined;

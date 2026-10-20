@@ -39,12 +39,8 @@ import {
   probeFolder,
   type DriveFolderRec,
 } from './client';
-import { buildTreeFromFlat } from './folder-tree';
+import { buildTreeFromFlat, folderMapStats, MAX_DEPTH } from './folder-tree';
 import { structureResolutionResponseSchema } from './structured-output';
-
-// Folders are shallow in practice; this is a defense-in-depth rail against
-// an infinite-recursion bug, matching traversal.ts's cap.
-const MAX_DEPTH = 100;
 
 const STRUCTURE_MODEL = DEFAULT_GEMINI_MODEL;
 const STRUCTURE_TEMPERATURE = 0.2;
@@ -170,7 +166,19 @@ export async function gatherFolders(
         '[drive.structure] flat listing unavailable — walking recursively',
       );
     }
-    if (flat) return buildTreeFromFlat(rootFolderId, rootLabel, flat);
+    if (flat) {
+      const folders = buildTreeFromFlat(rootFolderId, rootLabel, flat);
+      logger.info(
+        {
+          kind: 'folders',
+          root_kind: probe.isSharedDriveRoot ? 'drive_root' : 'in_drive',
+          folders_listed: flat.length,
+          ...folderMapStats(rootFolderId, probe.driveId, flat, folders),
+        },
+        '[drive.structure] parent map',
+      );
+      return folders;
+    }
   }
   return walkFoldersRecursive(rootFolderId, rootLabel, opts.onProgress);
 }

@@ -15,6 +15,7 @@
 
 import { prisma } from '../prisma';
 import { getFileMetadata } from '../drive/client';
+import { isOutsideFolderMap } from '../drive/folder-tree';
 import { notifyReviewers } from '../drive/notify';
 import type { TraversedFile } from '../drive/types';
 import { summarizeError } from '../progress';
@@ -167,6 +168,11 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
   // files reads exactly like a clean one.
   const files: TraversedFile[] = [];
   let filesUnfetchable = 0;
+  // Changed files whose parent is neither the root nor a folder in this
+  // run's freshly gathered map: moved out of the tree, or under a parent the
+  // bot cannot see. Counted and logged only — they are still scanned and
+  // attributed to the account exactly as before (no tombstone yet).
+  let outsideFolderMap = 0;
   for (const id of changedIds) {
     let meta;
     try {
@@ -184,6 +190,7 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
     }
     if (meta.mimeType === 'application/vnd.google-apps.folder') continue;
     const parentId = meta.parents?.[0] ?? null;
+    if (isOutsideFolderMap(parentId, ctx.folderId, structure.folderPathById)) outsideFolderMap++;
     const parentPath = (parentId && structure.folderPathById.get(parentId)) || ctx.name;
     files.push({
       id: meta.id,
@@ -205,6 +212,11 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
           }
         : {}),
     });
+  }
+  if (outsideFolderMap > 0) {
+    log(
+      `  Parent map: out_of_scope=${outsideFolderMap} changed file(s) outside the folder map (moved out of the tree, or parent not visible)`,
+    );
   }
 
   let filesProcessed = 0;

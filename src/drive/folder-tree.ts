@@ -22,8 +22,130 @@
 import type { DriveFolderRec } from './client';
 import type { FolderNode } from './structure';
 
-// Drive's own nesting limit; the same cap as structure.ts and traversal.ts.
+// Drive's own nesting limit. The one cap for every listing: traversal.ts and
+// structure.ts import it, so the walks and the flat listing cut alike.
 export const MAX_DEPTH = 100;
+
+/**
+ * Counters for one flat listing cut to one root, counted in ONE unit: folders
+ * (`[drive.structure] parent map`, kind=folders) or files (the discovery
+ * `Parent map (files):` line). The keys are log keys: add, never rename.
+ */
+export interface ParentMapStats {
+  /**
+   * Items kept. Folders: the subtree's folders. Files: files whose parent is
+   * the root or a subtree folder above the depth cap.
+   */
+  in_scope: number;
+  /**
+   * Items whose parent chain reaches the drive root without passing the
+   * root. For a root inside a drive this is the rest of the drive, a size
+   * figure rather than a move signal; for the drive root it is always 0.
+   */
+  out_of_scope: number;
+  /** Items whose parent chain breaks: a parent missing from the listing, no parent, or a loop. */
+  orphans: number;
+  /**
+   * Items of the whole listing (in scope or not) with more than one parent;
+   * parents[0] is used, as everywhere.
+   */
+  multi_parent: number;
+  /** Subtree folders at the depth cap: their contents are not listed. */
+  depth_cap: number;
+}
+
+export type Reach = 'in' | 'out' | 'orphan';
+
+/**
+ * Where a folder's parent chain leads: to the root ('in'), to the drive root
+ * without passing the root ('out'), or nowhere ('orphan': a parent missing
+ * from the listing, no parent at all, or a loop). Iterative and memoized, so
+ * classifying every item of a large drive stays linear.
+ */
+export function makeReach(
+  rootId: string,
+  driveId: string,
+  flat: DriveFolderRec[],
+): (folderId: string | null | undefined) => Reach {
+  const parentById = new Map(flat.map((f) => [f.id, f.parentId]));
+  const memo = new Map<string, Reach>();
+  return (start) => {
+    const chain: string[] = [];
+    const onChain = new Set<string>();
+    let id: string | null | undefined = start;
+    let result: Reach;
+    for (;;) {
+      if (id === rootId) {
+        result = 'in';
+        break;
+      }
+      // The drive root is checked after the root, so it reads 'in' when the
+      // root IS the drive.
+      if (id === driveId) {
+        result = 'out';
+        break;
+      }
+      if (!id || onChain.has(id) || !parentById.has(id)) {
+        result = 'orphan';
+        break;
+      }
+      const known = memo.get(id);
+      if (known) {
+        result = known;
+        break;
+      }
+      chain.push(id);
+      onChain.add(id);
+      id = parentById.get(id);
+    }
+    for (const c of chain) memo.set(c, result);
+    return result;
+  };
+}
+
+/**
+ * A changed file seen by the forward run whose parent is neither the root
+ * nor a folder in the run's gathered map: moved out of the tree, or under a
+ * parent the bot cannot see.
+ */
+export function isOutsideFolderMap(
+  parentId: string | null,
+  rootId: string,
+  folderPathById: ReadonlyMap<string, string>,
+): boolean {
+  if (parentId === rootId) return false;
+  return !(parentId && folderPathById.has(parentId));
+}
+
+/**
+ * Counters for a folder listing: `folders` is buildTreeFromFlat's output for
+ * the same root and listing. The root folder itself is not counted.
+ */
+export function folderMapStats(
+  rootId: string,
+  driveId: string,
+  flat: DriveFolderRec[],
+  folders: FolderNode[],
+): ParentMapStats {
+  const reach = makeReach(rootId, driveId, flat);
+  let outOfScope = 0;
+  let orphans = 0;
+  let multiParent = 0;
+  for (const f of flat) {
+    if (f.parentCount > 1) multiParent++;
+    if (f.id === rootId) continue;
+    const r = reach(f.parentId);
+    if (r === 'out') outOfScope++;
+    else if (r === 'orphan') orphans++;
+  }
+  return {
+    in_scope: folders.length,
+    out_of_scope: outOfScope,
+    orphans,
+    multi_parent: multiParent,
+    depth_cap: folders.filter((f) => f.depth > MAX_DEPTH).length,
+  };
+}
 
 /**
  * Reconstruct a depth-first folder tree from a flat folder list (each with

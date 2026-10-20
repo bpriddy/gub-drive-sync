@@ -8,17 +8,19 @@
  */
 
 import { listFolderChildren } from './client';
+import { MAX_DEPTH } from './folder-tree';
 import type { TraversedFile } from './types';
 import { logger } from '../logger';
 
 const GOOGLE_FOLDER_MIME = 'application/vnd.google-apps.folder';
-// Matches Drive's own shared-drive depth limit (100). We're not the
-// bottleneck — if a tree somehow exceeds this, Drive itself would have
+// MAX_DEPTH matches Drive's own shared-drive depth limit (100). We're not
+// the bottleneck — if a tree somehow exceeds this, Drive itself would have
 // rejected the structure before we ever saw it. The check stays purely
 // as defense-in-depth against an infinite-recursion bug in our code.
 // History: was 8 (too low — tripped on real Year/Quarter/Project trees),
-// briefly 20, now 100 to match Drive on 2026-05-22.
-const MAX_DEPTH = 100;
+// briefly 20, now 100 to match Drive on 2026-05-22. It lives in
+// folder-tree.ts so this walk, the folder walk and the flat listing cut at
+// the same depth.
 
 /**
  * Called when `listFolderChildren` fails on a SUBFOLDER (depth > 0).
