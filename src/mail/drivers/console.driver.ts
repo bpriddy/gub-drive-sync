@@ -1,7 +1,9 @@
 /**
  * console.driver.ts — dry-run mail driver.
  *
- * Writes the rendered message to the logger instead of dispatching.
+ * Writes the message's envelope to the logger instead of dispatching:
+ * recipients, subject, tags and the body's length. The body itself stays
+ * out of the logs.
  * Default driver in dev, and the automatic fallback when Mailgun is
  * selected but MAILGUN_API_KEY / MAILGUN_DOMAIN / MAIL_FROM_ADDRESS is
  * unset (so dev never mis-configures into silence).
@@ -21,7 +23,7 @@ export class ConsoleMailDriver implements MailDriver {
           to: to.map((t) => t.email),
           subject: message.subject,
           tags: message.tags,
-          textPreview: message.text.slice(0, 400),
+          textLength: message.text.length,
           hasHtml: Boolean(message.html),
         },
       },
