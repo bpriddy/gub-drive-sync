@@ -403,13 +403,13 @@ export async function probeFolder(folderId: string): Promise<SharedDriveProbe> {
 
 /**
  * Flat-list every non-folder file in a shared drive, paginated and
- * (optionally) ordered. ONLY valid for shared-drive-root ids — for
- * folders inside drives, you must walk recursively (`traverseFolder`).
+ * (optionally) ordered. ONLY valid for shared-drive ids. A folder inside a
+ * drive uses listSubtreeFiles (drive/subtree.ts) instead, which lists the
+ * drive flat and cuts the folder's subtree out with breadcrumb paths.
  *
- * Used by backfill to skip the recursive walk for shared-drive entities.
- * Returns TraversedFile shape with `path = name` (no breadcrumb; the flat
- * query gives parent ids, not paths, and reconstructing paths costs
- * more API calls than it's usually worth at this layer).
+ * Used by backfill to skip the recursive walk for shared-drive-root entities.
+ * Returns TraversedFile shape with `path = name` (no breadcrumb). The
+ * per-file interpret prompt reads that path, so it stays as it is.
  */
 export interface FlatListOptions {
   /** Stop after this many files. Use for capped iteration. */
@@ -464,6 +464,58 @@ export async function listSharedDriveFiles(
           : {}),
       });
       if (maxFiles !== null && out.length >= maxFiles) return out;
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+/**
+ * Fields for the flat file listing: FILE_FIELDS plus Drive's content markers
+ * (`version`, and `md5Checksum` for binary files) for a later check of
+ * which files really changed.
+ */
+export const FLAT_FILE_FIELDS = `${FILE_FIELDS},version,md5Checksum`;
+
+/**
+ * Flat-list every non-folder file in a shared drive, keeping only the files
+ * `keep` accepts. ONLY valid for shared-drive ids. The filter runs page by
+ * page, so a small root inside a big drive holds its own files, not the
+ * drive's. Each page retries transient faults, as listAllFoldersInDrive does.
+ *
+ * Ordered by createdTime, which an edit does not change, so a file edited
+ * while the sweep pages cannot shift to another page and be listed twice or
+ * skipped; an id seen twice is kept once all the same. The caller still
+ * sorts (direction, ties).
+ */
+export async function listDriveFilesFlat(
+  driveId: string,
+  keep: (file: drive_v3.Schema$File) => boolean,
+): Promise<drive_v3.Schema$File[]> {
+  const client = await driveClient();
+  const out: drive_v3.Schema$File[] = [];
+  const seen = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const res = await withTransientRetry(() =>
+      driveLimiter.run(() =>
+        client.files.list({
+          corpora: 'drive',
+          driveId,
+          q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
+          orderBy: 'createdTime',
+          fields: `nextPageToken, files(${FLAT_FILE_FIELDS})`,
+          pageSize: LIST_PAGE_SIZE,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          ...(pageToken ? { pageToken } : {}),
+        }),
+      ),
+    );
+    for (const f of res.data.files ?? []) {
+      if (f.id && seen.has(f.id)) continue;
+      if (f.id) seen.add(f.id);
+      if (keep(f)) out.push(f);
     }
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);

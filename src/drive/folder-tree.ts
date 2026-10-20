@@ -23,7 +23,7 @@ import type { DriveFolderRec } from './client';
 import type { FolderNode } from './structure';
 
 // Drive's own nesting limit; the same cap as structure.ts and traversal.ts.
-const MAX_DEPTH = 100;
+export const MAX_DEPTH = 100;
 
 /**
  * Reconstruct a depth-first folder tree from a flat folder list (each with
@@ -62,4 +62,23 @@ export function buildTreeFromFlat(
 
   descend(rootId, rootLabel, 0);
   return out;
+}
+
+/**
+ * Where a flat-listed file belongs, by its immediate parent: the parent's
+ * breadcrumb when traverseFolder would yield the file — its parent is the
+ * root or a subtree folder above the depth cap — else null (outside the
+ * subtree, parent not visible, or beneath the cap). `folders` is
+ * buildTreeFromFlat's output for the same root.
+ */
+export function subtreeParentPaths(
+  rootId: string,
+  rootLabel: string,
+  folders: FolderNode[],
+): (parentId: string | null | undefined) => string | null {
+  const pathById = new Map<string, string>([[rootId, rootLabel]]);
+  // traverseFolder lists a folder's contents only down to depth MAX_DEPTH;
+  // folders one level deeper are yielded, but their files are not.
+  for (const f of folders) if (f.depth <= MAX_DEPTH) pathById.set(f.id, f.path);
+  return (parentId) => (parentId ? (pathById.get(parentId) ?? null) : null);
 }
