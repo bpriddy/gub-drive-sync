@@ -17,21 +17,23 @@
  * Orphan proposals (reviewer_staff_id IS NULL, typical for new top-level
  * account proposals where we haven't mapped an owner yet) are logged to
  * drive_scan_logs under category 'diagnostic' and left for admin review
- * out-of-band. We never drop them silently.
+ * out-of-band, and one WARN line per run counts them per account. We never
+ * drop them silently.
  *
  * Idempotency: once an email dispatches successfully we stamp notified_at
  * on every proposal included in that email. A second call with the same
  * syncRunId is a no-op; a later run will only pick up newer proposals.
  *
- * Works in dev with MAIL_DRIVER=console — the rendered email (including the
- * magic-link URL) prints to stdout, so the review UI can be built and
- * exercised end-to-end without Mailgun credentials.
+ * "Dispatched" means the driver says so (MailSendResult.dispatched). The
+ * dry-run driver (MAIL_DRIVER=console) sends nothing and logs only the
+ * envelope, so its proposals keep notified_at NULL: they still count as
+ * not notified, and a real driver picks them up later.
  */
 
 import { config } from '../config';
 import { prisma } from '../prisma';
 import { logger } from '../logger';
-import { mail } from '../mail';
+import { mail, type MailSendResult } from '../mail';
 import { writeScanLog } from './logs';
 
 export interface NotifyInput {
@@ -44,6 +46,8 @@ export interface NotifyResult {
   proposalsNotified: number;
   orphansLogged: number;
   emailDriver: string;
+  /** Reviewers whose email the driver did not dispatch (dry run). */
+  ownersNotDispatched: number;
 }
 
 interface PendingRow {
@@ -104,6 +108,26 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
     });
   }
 
+  if (orphans.length > 0) {
+    // One line per run, counted per account (null: the account itself is
+    // still a proposal), so an owner gap shows up in Cloud Logging and not
+    // only in drive_scan_logs.
+    const perAccount = new Map<string | null, number>();
+    for (const orphan of orphans) {
+      perAccount.set(orphan.accountId, (perAccount.get(orphan.accountId) ?? 0) + 1);
+    }
+    logger.warn(
+      {
+        syncRunId: input.syncRunId ?? null,
+        orphans: orphans.length,
+        accounts: [...perAccount]
+          .map(([accountId, count]) => ({ accountId, count }))
+          .sort((a, b) => b.count - a.count),
+      },
+      '[drive.notify] pending proposals without a reviewer, by account',
+    );
+  }
+
   const withReviewer: PendingRow[] = rows.filter(
     (r): r is PendingRow & { reviewerStaffId: string } => !!r.reviewerStaffId,
   );
@@ -126,11 +150,13 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
       proposalsNotified: 0,
       orphansLogged: orphans.length,
       emailDriver: mail.driverName,
+      ownersNotDispatched: 0,
     };
   }
 
   let ownersEmailed = 0;
   let proposalsNotified = 0;
+  let ownersNotDispatched = 0;
 
   for (const [reviewerStaffId, bucket] of byReviewer.entries()) {
     // Resolve the current email from staff (avoid stale cached reviewerEmail).
@@ -163,7 +189,9 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
 
     // Summarize what's in the bundle for the email body.
     const newEntityGroups = new Set(
-      bucket.filter((r) => r.kind === 'new_entity' && r.proposalGroupId).map((r) => r.proposalGroupId!),
+      bucket
+        .filter((r) => r.kind === 'new_entity' && r.proposalGroupId)
+        .map((r) => r.proposalGroupId!),
     ).size;
     const fieldChanges = bucket.filter((r) => r.kind === 'field_change').length;
 
@@ -175,8 +203,9 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
       ttlDays: config.DRIVE_PROPOSAL_TTL_DAYS,
     });
 
+    let sent: MailSendResult;
     try {
-      await mail.send({
+      sent = await mail.send({
         to: { email: staff.email, name: staff.fullName },
         subject,
         text,
@@ -189,6 +218,16 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
       logger.error(
         { err, reviewerStaffId, bucketSize: bucket.length },
         '[drive.notify] mail dispatch failed — leaving proposals unnotified',
+      );
+      continue;
+    }
+
+    if (!sent.dispatched) {
+      // Nothing was sent (dry-run driver): leave notified_at NULL.
+      ownersNotDispatched++;
+      logger.info(
+        { reviewerStaffId, proposals: bucket.length, driver: sent.driver },
+        '[drive.notify] review email not dispatched (dry run) — proposals left unnotified',
       );
       continue;
     }
@@ -220,6 +259,7 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
     proposalsNotified,
     orphansLogged: orphans.length,
     emailDriver: mail.driverName,
+    ownersNotDispatched,
   };
 }
 
