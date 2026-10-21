@@ -25,21 +25,26 @@ The exceptions are operator modes, not writers of the sync:
   to the canonical one.
 - `clear-account` deletes an account's rows.
 
-The database also nulls `account_id`, `campaign_id` and `sync_run_id` when the
-row they reference is deleted (`ON DELETE SET NULL`).
+The database also nulls `account_id`, `campaign_id`, `sync_run_id` and
+`drive_sync_run_id` when the row they reference is deleted
+(`ON DELETE SET NULL`), so a row outlives its account, campaign or run.
 
 ## Writers
 
-| Writer | When it writes | `sync_run_id` |
-|---|---|---|
-| v1 full sync (`scanFolder`, `src/drive/sync.ts`) | an account scan, then one scan per campaign folder; a row for every file seen, including `delta_unchanged` ones | the `sync_runs` row of that sync |
-| v2 scan core (`processBatch`, `src/scan/process-batch.ts`) | every forward run and every bootstrap chunk, one row per file of the batch, in `apply` and `propose` mode; **never in `dryrun`** | NULL |
-| index catch-up (`refresh-snapshots`, `src/drive/snapshot-refresh.ts`) | once, by an operator with `--confirm`: one row per file whose latest row no longer matches a Drive listing; a listing only, nothing is extracted | NULL |
+| Writer | When it writes | `sync_run_id` | `drive_sync_run_id` |
+|---|---|---|---|
+| v1 full sync (`scanFolder`, `src/drive/sync.ts`) | an account scan, then one scan per campaign folder; a row for every file seen, including `delta_unchanged` ones | the `sync_runs` row of that sync | NULL |
+| v2 scan core (`processBatch`, `src/scan/process-batch.ts`) | every forward run and every bootstrap chunk, one row per file of the batch, in `apply` and `propose` mode; **never in `dryrun`** | NULL | the `drive_sync_runs` row of that run (NULL for a CLI backfill, which has no run row) |
+| index catch-up (`refresh-snapshots`, `src/drive/snapshot-refresh.ts`) | once, by an operator with `--confirm`: one row per file whose latest row no longer matches a Drive listing; a listing only, nothing is extracted | NULL | NULL |
 
 The v2 writer sits in the scan core's serial apply chain, after the file's
 outcome is applied, so the rows come out in file order whatever the worker
 pool does. The row is telemetry, not dossier content: it is written whether
 or not the file produced observations, and review never gates it.
+
+The same run id is stamped as `drive_sync_run_id` on the review proposals
+(`drive_change_proposals`) a forward run writes; v1 proposals keep their
+`sync_run_id`.
 
 ## Columns that matter
 
@@ -50,7 +55,8 @@ or not the file produced observations, and review never gates it.
 | `path` | ` / `-separated breadcrumb. **v1** roots it at the name of the entity the scan was for: an account scan at the account, a campaign scan at the campaign. So a file inside a campaign folder can have an account-rooted row and a campaign-rooted row from the same v1 run. **v2** roots every path at the account (queue-driven runs are always account-scoped). |
 | `account_id` | The account the run belongs to. |
 | `campaign_id` | **v2**: the file's *folder attribution* — the campaign whose folder the file sits in, NULL for account-level files — not whatever campaign an LLM tag routed its observations to. **v1**: set by campaign scans, NULL on account scans. |
-| `sync_run_id` | **v1 only**: the `sync_runs` row of the full sync. It references `sync_runs`, a different table from the `drive_sync_runs` queue the v2 drivers run under, so **v2 writers and the catch-up leave it NULL**. Stamping a queue id here fails the foreign key (Postgres 23503) — the first scan-core writer did exactly that and wrote nothing. NULL is necessary, not sufficient, for "written by v2": a v1 row also has it NULL if its run row was later deleted, and the catch-up's rows are NULL too (they have `was_extracted = false`). |
+| `sync_run_id` | **v1 only**: the `sync_runs` row of the full sync. It references `sync_runs`, a different table from the `drive_sync_runs` queue the v2 drivers run under, so **v2 writers and the catch-up leave it NULL**. Stamping a queue id here fails the foreign key (Postgres 23503) — the first scan-core writer did exactly that and wrote nothing. A v1 row also has it NULL if its run row was later deleted. |
+| `drive_sync_run_id` | **v2**: the `drive_sync_runs` queue row (a forward or bootstrap run) that wrote the row. NULL on v1 rows, on rows written outside a queue run (a CLI backfill, the index catch-up), on rows an earlier release of the writer wrote before it stamped the run, and on rows whose run was deleted. It has its own foreign key, so an id that is no `drive_sync_runs` row is refused (23503) just like a queue id in `sync_run_id`. |
 | `was_extracted`, `content_hash`, `skip_reason` | See below. |
 | `scanned_at` | When the row was written (database clock). Readers order by it. |
 
@@ -103,8 +109,23 @@ Its form depends on `SKIP_UNCHANGED_CONTENT`:
   An extracted row whose idea extraction or merge failed carries no hash, so
   the gate retries that file on its next event.
 
-A consumer that needs "interpreted" must read **v2 rows only** (they leave
-`sync_run_id` NULL — see the caveat above) or accept v1's weaker meaning.
+A consumer that needs "interpreted" must read **v2 rows only** or accept v1's
+weaker meaning. `drive_sync_run_id IS NOT NULL` identifies a queue-written v2
+row for certain (v1 never sets it). A row with both run ids NULL is unknown: a
+v2 row written outside a queue run or before the column existed, or a v1 row
+whose run was deleted. The catch-up's rows have both NULL too, and say what
+they are in `skip_reason = 'index_refresh'`.
+
+**Deploy order.** The column arrives with gub-schemas 1.8.0 and GUB's
+migration `20261021100000_drive_sync_run_id`. Apply that migration **before**
+deploying any image of this job built against gub-schemas 1.8.0 or later. The
+generated client names every column of a model in its queries (an INSERT
+returns them all), so against a database without the column every create on
+`drive_file_snapshots` and `drive_change_proposals`, and every read of them
+without a `select`, fails with Prisma P2022 — v1 paths included. The scan core
+then fails every forward run (fail-closed: the cursor holds and nothing wrong
+is written) until the migration lands. The migration is additive and
+nullable, so it is safe under the images that run before it.
 
 ## `skip_reason`
 
@@ -298,3 +319,35 @@ In this repo:
 
 A trashed file (flag on) is skipped unread, so an edit made just before it
 was trashed is not interpreted.
+
+## Checking the index
+
+Read-only queries for the database owner; none of them writes.
+
+Freshness, per account: when did the index last get a row? An account with a
+Drive folder and no rows at all is the original defect — a scheduler that ran
+and an index that never moved.
+
+```sql
+SELECT a.id, a.name, max(s.scanned_at) AS last_row, count(s.id) AS row_count
+FROM accounts a
+LEFT JOIN drive_file_snapshots s ON s.account_id = a.id
+WHERE a.drive_folder_id IS NOT NULL
+GROUP BY a.id, a.name
+ORDER BY last_row NULLS FIRST;
+```
+
+Rows written per run (recent runs, newest first). A completed run with
+`files_processed > 0` and no snapshot rows is a writer that did not write (or a
+run from before the writer stamped `drive_sync_run_id`); a completed run whose
+count is above `files_processed` is a retried window, which writes its rows
+again.
+
+```sql
+SELECT r.id, r.mode, r.status, r.completed_at, r.files_processed,
+       (SELECT count(*) FROM drive_file_snapshots s WHERE s.drive_sync_run_id = r.id) AS snapshot_rows,
+       (SELECT count(*) FROM drive_change_proposals p WHERE p.drive_sync_run_id = r.id) AS proposals
+FROM drive_sync_runs r
+WHERE r.requested_at > now() - interval '7 days'
+ORDER BY r.requested_at DESC;
+```

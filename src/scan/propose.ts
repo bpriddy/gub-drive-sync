@@ -44,6 +44,13 @@ export interface ProposeTargetInput {
   entityName: string;
   validatedChanges: ValidatedChange[];
   notes: ProposeNoteItem[];
+  /**
+   * The drive_sync_runs queue row proposing these, stamped as
+   * drive_sync_run_id on every row written. Not sync_run_id: that references
+   * the v1 sync_runs table, so a queue id there fails the foreign key. Null
+   * when the caller has no run row.
+   */
+  driveSyncRunId: string | null;
 }
 
 export interface ProposeTargetResult {
@@ -85,6 +92,7 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
       items,
       reviewer,
       expiresAt,
+      driveSyncRunId: input.driveSyncRunId,
     });
     return { fieldProposals: 0, noteItems: items.length, duplicatesSkipped: 0 };
   }
@@ -126,6 +134,7 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
     }
     await prisma.driveChangeProposal.create({
       data: {
+        driveSyncRunId: input.driveSyncRunId,
         kind: 'field_change',
         entityType: input.entityType,
         accountId,
@@ -159,6 +168,7 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
       items: notes,
       reviewer,
       expiresAt,
+      driveSyncRunId: input.driveSyncRunId,
     });
     noteItems = notes.length;
   }
@@ -217,10 +227,12 @@ async function writeNoteBatch(args: {
   items: ProposeNoteItem[];
   reviewer: { reviewerEmail: string | null; reviewerStaffId: string | null };
   expiresAt: Date;
+  driveSyncRunId: string | null;
 }): Promise<void> {
   const unionSources = Array.from(new Set(args.items.flatMap((n) => n.source_file_ids)));
   await prisma.driveChangeProposal.create({
     data: {
+      driveSyncRunId: args.driveSyncRunId,
       kind: 'additional_update',
       // Sentinel — `property` is NOT NULL but doesn't name a column for
       // this kind (mirrors distillAndEmit's contract with the review UI).

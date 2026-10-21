@@ -138,6 +138,13 @@ export interface ProcessBatchOptions {
    * interpreted. Only the forward run passes it.
    */
   unchangedGate?: { notAfter: Date } | null;
+  /**
+   * The drive_sync_runs queue row driving this batch. Stamped as
+   * drive_sync_run_id on every drive_file_snapshots and drive_change_proposals
+   * row the batch writes, so a row traces back to the run that wrote it. Null
+   * when the caller has no run row (a CLI backfill).
+   */
+  driveSyncRunId: string | null;
 }
 
 export async function processBatch(
@@ -154,6 +161,7 @@ export async function processBatch(
     application,
     editedAt,
     concurrency,
+    driveSyncRunId,
   } = opts;
   // Dossier auto-apply is 'apply' only; infrastructure + automatic-ratchet
   // writes (restricted worklist, ideas, piece markdown) happen in 'propose'
@@ -882,7 +890,8 @@ export async function processBatch(
   // worklist and is written in 'propose' mode too. Campaign is the file's
   // FOLDER attribution (where it lives in Drive), the same expression the
   // restricted worklist uses — not the campaign an LLM tag routed its
-  // observations to.
+  // observations to. The run is recorded in drive_sync_run_id; sync_run_id
+  // stays NULL because it references the v1 sync_runs table.
   //
   // A failed row never rejects applyChain (that would discard the batch's
   // extraction spend) and is never swallowed either: it is counted and
@@ -895,7 +904,7 @@ export async function processBatch(
       campaignId: o.attribution.matchedCampaignId ?? (ctx.type === 'campaign' ? ctx.id : null),
     };
     try {
-      await writeSnapshot(snapshotForScanOutcome(o, scope));
+      await writeSnapshot(snapshotForScanOutcome(o, scope, driveSyncRunId));
     } catch (err) {
       snapshotWriteFailures++;
       // The code only: summarizeError can embed query arguments (names, paths).
@@ -1575,6 +1584,7 @@ export async function processBatch(
               entityName: target.entityName,
               validatedChanges,
               notes: distilledNotes,
+              driveSyncRunId,
             }),
           );
         } catch (err) {
