@@ -1,6 +1,7 @@
 // Part of the backfill engine (see index.ts). Extracted verbatim from the
 // former scripts/backfill.ts monolith — behavior-preserving reorganization.
 import { writeFileSync } from 'node:fs';
+import { config } from '../config';
 import { prisma } from '../prisma';
 import type { Attributor } from '../drive/structure';
 import type { TraversedFile } from '../drive/types';
@@ -350,6 +351,15 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     if (!args.dryrun && outcome.stage3Failures > 0) {
       throw new Error(
         `${outcome.stage3Failures} entity stage-3 failure(s) on ${nextDay.date} — day NOT committed; the queue retry re-runs it`,
+      );
+    }
+    // Same for the Drive name index: a snapshot row that failed to write
+    // leaves its file stale there, and a committed day is never revisited.
+    // The retry writes the day's rows again (append-only: one more row per
+    // file for every failed attempt).
+    if (!args.dryrun && outcome.snapshotWriteFailures > config.SNAPSHOT_WRITE_FAILURE_LIMIT) {
+      throw new Error(
+        `${outcome.snapshotWriteFailures} snapshot write failure(s) on ${nextDay.date} (SNAPSHOT_WRITE_FAILURE_LIMIT=${config.SNAPSHOT_WRITE_FAILURE_LIMIT}) — day NOT committed; the queue retry re-runs it`,
       );
     }
 
