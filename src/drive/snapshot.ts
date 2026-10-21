@@ -22,15 +22,23 @@
  * "interpreted" must read v2 rows only (they leave sync_run_id NULL — necessary,
  * not sufficient, see the doc) or accept v1's weaker meaning.
  *
+ * A third, listing-only writer is the index catch-up (snapshot-refresh.ts): it
+ * records what a Drive listing shows, never an extraction, so its rows are
+ * was_extracted = false with skip_reason INDEX_REFRESH_SKIP_REASON.
+ *
  * Delta rule (v1 only): if the most recent snapshot for this file_id has a
  * modified_time at or after Drive's current modifiedTime, we skip extraction.
  * A snapshot row is still written every scan (append-only) so history stays
- * intact.
+ * intact. The catch-up's listing-only rows do not count: a listing says nothing
+ * about which version was last extracted.
  */
 
 import { prisma } from '../prisma';
 import { logger } from '../logger';
 import type { TraversalScope, TraversedFile } from './types';
+
+/** skip_reason of the listing-only rows drive/snapshot-refresh.ts writes. */
+export const INDEX_REFRESH_SKIP_REASON = 'index_refresh';
 
 export interface DeltaCheck {
   shouldExtract: boolean;
@@ -47,8 +55,14 @@ export async function checkDelta(file: TraversedFile): Promise<DeltaCheck> {
   if (!file.modifiedTime) {
     return { shouldExtract: true, reason: 'no_modified_time' };
   }
+  // Rows from refresh-snapshots record a listing, not an extraction, so they
+  // must not satisfy the delta rule. Spelled as an OR because Prisma's `not`
+  // on a nullable column drops the NULL rows — every extracted row.
   const latest = await prisma.driveFileSnapshot.findFirst({
-    where: { fileId: file.id },
+    where: {
+      fileId: file.id,
+      OR: [{ skipReason: null }, { skipReason: { not: INDEX_REFRESH_SKIP_REASON } }],
+    },
     orderBy: { scannedAt: 'desc' },
     select: { scannedAt: true, modifiedTime: true },
   });

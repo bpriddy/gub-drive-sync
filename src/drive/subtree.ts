@@ -31,11 +31,18 @@ import {
   subtreeParentPaths,
   type ParentMapStats,
 } from './folder-tree';
+import type { FolderNode } from './structure';
 import type { TraversedFile } from './types';
 
 export interface SubtreeFiles {
   /** Non-folder files under the root, in listing order. */
   files: TraversedFile[];
+  /**
+   * The subtree's folders, the root excluded, depth-first: the tree the file
+   * paths were cut from. A caller that must tell which folder owns a file
+   * (the index catch-up's campaign attribution) walks `parentId` up it.
+   */
+  folders: FolderNode[];
   /** Folders in the subtree, the root excluded. */
   folderCount: number;
   /** Folders at the depth cap: like traverseFolder, their files are not listed. */
@@ -82,7 +89,7 @@ export async function listSubtreeFiles(
     return false;
   });
   const files = raw.map((f) => toTraversedFile(f, `${parentPathOf(f.parents?.[0])} / ${f.name}`));
-  return { files, folderCount: folders.length, depthCapHits, stats };
+  return { files, folders, folderCount: folders.length, depthCapHits, stats };
 }
 
 /** The same shape traverseFolder yields, plus the flat listing's content markers. */

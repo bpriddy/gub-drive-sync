@@ -6,11 +6,11 @@ vi.hoisted(() => {
   process.env.DATABASE_URL ??= 'postgres://test/test';
 });
 
-const { warn } = vi.hoisted(() => ({ warn: vi.fn() }));
-vi.mock('../../prisma', () => ({ prisma: {} }));
+const { warn, findFirst } = vi.hoisted(() => ({ warn: vi.fn(), findFirst: vi.fn() }));
+vi.mock('../../prisma', () => ({ prisma: { driveFileSnapshot: { findFirst } } }));
 vi.mock('../../logger', () => ({ logger: { warn } }));
 
-import { reportSnapshotWriteFailure, snapshotForScanOutcome } from '../snapshot';
+import { checkDelta, reportSnapshotWriteFailure, snapshotForScanOutcome } from '../snapshot';
 import type { TraversedFile } from '../types';
 
 const file: TraversedFile = {
@@ -140,5 +140,52 @@ describe('reportSnapshotWriteFailure', () => {
       meta: { constraint: ['file_id'] },
     });
     expect(reportSnapshotWriteFailure(where, notNull)).toBe('P2011');
+  });
+});
+
+describe('checkDelta', () => {
+  beforeEach(() => findFirst.mockReset());
+
+  it('ignores listing-only index_refresh rows, keeping rows whose skip_reason is NULL', async () => {
+    findFirst.mockResolvedValue(null);
+
+    await checkDelta(file);
+
+    // Prisma's `not` on a nullable column drops the NULL rows — every extracted
+    // row — so the filter is an OR that names them.
+    expect(findFirst.mock.calls[0]![0].where).toEqual({
+      fileId: 'f1',
+      OR: [{ skipReason: null }, { skipReason: { not: 'index_refresh' } }],
+    });
+    expect(findFirst.mock.calls[0]![0].orderBy).toEqual({ scannedAt: 'desc' });
+  });
+
+  it('still skips a file whose latest extraction is at or after Drive’s modified time', async () => {
+    findFirst.mockResolvedValue({
+      scannedAt: new Date('2026-09-02T00:00:00Z'),
+      modifiedTime: new Date('2026-09-01T00:00:00Z'),
+    });
+
+    await expect(checkDelta(file)).resolves.toMatchObject({
+      shouldExtract: false,
+      skipReason: 'delta_unchanged',
+    });
+  });
+
+  it('extracts a file first seen, or modified since its last extraction', async () => {
+    findFirst.mockResolvedValueOnce(null);
+    await expect(checkDelta(file)).resolves.toMatchObject({
+      shouldExtract: true,
+      reason: 'first_seen',
+    });
+
+    findFirst.mockResolvedValueOnce({
+      scannedAt: new Date('2026-08-02T00:00:00Z'),
+      modifiedTime: new Date('2026-08-01T00:00:00Z'),
+    });
+    await expect(checkDelta(file)).resolves.toMatchObject({
+      shouldExtract: true,
+      reason: 'modified_since_last',
+    });
   });
 });

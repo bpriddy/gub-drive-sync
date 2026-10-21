@@ -34,6 +34,7 @@ row they reference is deleted (`ON DELETE SET NULL`).
 |---|---|---|
 | v1 full sync (`scanFolder`, `src/drive/sync.ts`) | an account scan, then one scan per campaign folder; a row for every file seen, including `delta_unchanged` ones | the `sync_runs` row of that sync |
 | v2 scan core (`processBatch`, `src/scan/process-batch.ts`) | every forward run and every bootstrap chunk, one row per file of the batch, in `apply` and `propose` mode; **never in `dryrun`** | NULL |
+| index catch-up (`refresh-snapshots`, `src/drive/snapshot-refresh.ts`) | once, by an operator with `--confirm`: one row per file whose latest row no longer matches a Drive listing; a listing only, nothing is extracted | NULL |
 
 The v2 writer sits in the scan core's serial apply chain, after the file's
 outcome is applied, so the rows come out in file order whatever the worker
@@ -49,7 +50,7 @@ or not the file produced observations, and review never gates it.
 | `path` | ` / `-separated breadcrumb. **v1** roots it at the name of the entity the scan was for: an account scan at the account, a campaign scan at the campaign. So a file inside a campaign folder can have an account-rooted row and a campaign-rooted row from the same v1 run. **v2** roots every path at the account (queue-driven runs are always account-scoped). |
 | `account_id` | The account the run belongs to. |
 | `campaign_id` | **v2**: the file's *folder attribution* — the campaign whose folder the file sits in, NULL for account-level files — not whatever campaign an LLM tag routed its observations to. **v1**: set by campaign scans, NULL on account scans. |
-| `sync_run_id` | **v1 only**: the `sync_runs` row of the full sync. It references `sync_runs`, a different table from the `drive_sync_runs` queue the v2 drivers run under, so **v2 writers leave it NULL**. Stamping a queue id here fails the foreign key (Postgres 23503) — the first scan-core writer did exactly that and wrote nothing. NULL is necessary, not sufficient, for "written by v2": a v1 row also has it NULL if its run row was later deleted. |
+| `sync_run_id` | **v1 only**: the `sync_runs` row of the full sync. It references `sync_runs`, a different table from the `drive_sync_runs` queue the v2 drivers run under, so **v2 writers and the catch-up leave it NULL**. Stamping a queue id here fails the foreign key (Postgres 23503) — the first scan-core writer did exactly that and wrote nothing. NULL is necessary, not sufficient, for "written by v2": a v1 row also has it NULL if its run row was later deleted, and the catch-up's rows are NULL too (they have `was_extracted = false`). |
 | `was_extracted`, `content_hash`, `skip_reason` | See below. |
 | `scanned_at` | When the row was written (database clock). Readers order by it. |
 
@@ -89,6 +90,7 @@ NULL on an extracted row. Otherwise:
 | `restricted` | Drive answered 403: the file is visible in listings, its content is not readable by the sync bot. | v2 |
 | `delta_unchanged` | Unchanged since the last v1 scan; extraction was skipped. | v1 |
 | `skipped` | A v2 skip outcome that carried no reason (defensive; not expected). | v2 |
+| `index_refresh` | A listing-only row: the file was seen in a Drive listing and nothing was extracted. | the catch-up |
 
 ## A write that fails
 
@@ -115,6 +117,90 @@ until they change again.
 The WARN's message text is a contract: the platform's Terraform defines a
 log-based metric on it and an alert policy on that metric, so reword it only
 together with that definition.
+
+## Catching up the index
+
+A forward run indexes only the files it processes, so a file created, renamed
+or moved while nothing wrote the index stays unfindable, or findable under its
+old name, until it is edited again. `refresh-snapshots` closes that gap once,
+from a Drive listing: no extraction and no model call.
+
+```
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=refresh-snapshots,--account-id,<account uuid>            # dry-run
+gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
+  --args=refresh-snapshots,--account-id,<account uuid>,--confirm  # write
+```
+
+`--account-id` is optional (absent: every account with a Drive folder); an id
+that matches nothing, a flag it does not know and a missing value are errors.
+
+Run it when no forward or bootstrap run is pending or running for the account,
+so outside the daily forward run. A scan-core row written between the
+catch-up's lookup and its insert would otherwise end up behind the catch-up's
+row, an older reading of the same file, until the file changes again.
+
+1. **Dry-run first.** Without `--confirm` it lists, compares and writes
+   nothing. The output is counts only — never a file name, path or id: one
+   line per account (its id, the files listed, which listing was used, the rows
+   it would write by reason, the legacy counters below) and a total.
+2. **`--confirm`** writes those rows, one INSERT each: `was_extracted = false`,
+   `skip_reason = 'index_refresh'`, `sync_run_id` NULL, `path` rooted at the
+   account like a forward row's, and `campaign_id` the campaign (or piece)
+   folder nearest above the file. A row that fails is counted and reported with
+   the WARN described above (`source = refresh`); the other rows are still
+   written and the run fails after its summary. A re-run writes nothing: its
+   listing now matches the rows.
+3. **Refresh GUB's token-frequency view afterwards.** File search weights a
+   query's words by a materialized view over the latest row per file. It is
+   refreshed out of band, with the migration role, by GUB's
+   `scripts/refresh-file-search-df.ts`; until then new names rank, at worst,
+   a little noisier.
+
+**What is compared.** The file's latest row against the listing, first match
+wins; no match means no row.
+
+| Reason | The latest row differs from the listing in |
+|---|---|
+| `unindexed` | there is no row at all |
+| `renamed` | `name` |
+| `moved` | `path` |
+| `modified` | `modified_time` |
+| `mime_changed` | `mime_type` |
+
+**The listing.** A root inside a shared drive (the drive root included) is
+listed flat, about one `files.list` call per 1000 items of the drive and not one
+per folder; a root inside a drive that refuses the flat listing falls back to
+the walk (the drive root itself does not: a walk could not read it either), and
+a My Drive root always walks. Both root the path at the account's name, the label
+the forward run uses, so a catch-up row and a forward row of one file carry the
+same path. Files below an unreadable subfolder, or below the depth cap, are not
+listed; the output counts both.
+
+**Legacy rows and moves.** The v1 sync scanned an account from its root and then
+each campaign folder again, rooted at the campaign's *name* (see `path`
+above). A file in a campaign folder therefore has two rows per v1 run, the
+campaign-rooted one written last, so it is the file's latest row, and no
+listing's path starts like it. Compared as it is, every such file would count as
+moved. For a latest row that has a `sync_run_id` and a `campaign_id` the
+catch-up compares the listing's path with the account-rooted row *the same run*
+wrote for the file instead. The same path means the file has not moved; a
+campaign folder that moved since v1 still counts, because the listing then
+differs from the run's account-rooted row as well. Two counters report it:
+
+- `legacyNormalized`: files compared that way;
+- `legacyUnresolved`: files whose run left no account-rooted row. They are
+  compared as they are, so a `moved` among them can be a false one; the cost is
+  one extra index row each.
+
+A campaign deleted since v1 nulls `campaign_id` on its rows, which hides them
+from this rule: they are compared as they are, with the same cost.
+
+**What else reads the rows.** `_sources` and the cited-file lookup read
+`was_extracted = true` rows only, so they are unchanged. The v1 delta rule
+(`checkDelta`) ignores `index_refresh` rows: a listing says nothing about which
+version was last extracted, so a file with a newer listing-only row is still
+extracted when v1 scans it.
 
 ## Readers
 
