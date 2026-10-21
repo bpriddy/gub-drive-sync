@@ -1,5 +1,6 @@
 // Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
 // by every driver (day-walk backfill today; the Activity forward driver next).
+import { logger } from '../logger';
 import { log, rule, fmtMs } from './output';
 
 // ── Phase timing ─────────────────────────────────────────────────────────────
@@ -41,6 +42,7 @@ export async function timed<T>(phase: string, fn: () => Promise<T>): Promise<T> 
 /** Pretty-name table so phase keys render as human labels in the summary. */
 const PHASE_LABELS: Record<string, string> = {
   setup: 'Setup (loadEntity)',
+  files_cache_load: 'Files cache load (DB)',
   structure_walk: 'Drive walk (folders)',
   structure_classify: 'Classify folders (LLM)',
   file_discovery: 'Discover files (Drive)',
@@ -61,9 +63,7 @@ export function printPhaseSummary(wallClockMs: number): void {
   if (rows.length === 0) return;
   log('');
   log(rule('Phase timing (this scan)'));
-  const labelWidth = Math.max(
-    ...rows.map((r) => (PHASE_LABELS[r.phase] ?? r.phase).length),
-  );
+  const labelWidth = Math.max(...rows.map((r) => (PHASE_LABELS[r.phase] ?? r.phase).length));
   const timeWidth = Math.max(...rows.map((r) => fmtMs(r.ms).length));
   for (const r of rows) {
     const label = (PHASE_LABELS[r.phase] ?? r.phase).padEnd(labelWidth);
@@ -74,15 +74,37 @@ export function printPhaseSummary(wallClockMs: number): void {
     log(`  ${label}   ${t}   ${bar}  ${pct}`);
   }
   log('  ' + '─'.repeat(labelWidth + 3 + timeWidth + 3 + 20 + 2 + 4));
-  log(`  ${'Instrumented total'.padEnd(labelWidth)}   ${fmtMs(instrumentedMs).padStart(timeWidth)}`);
+  log(
+    `  ${'Instrumented total'.padEnd(labelWidth)}   ${fmtMs(instrumentedMs).padStart(timeWidth)}`,
+  );
   const untracked = wallClockMs - instrumentedMs;
   if (untracked > 0) {
-    log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}   (un-instrumented: ${fmtMs(untracked)})`);
+    log(
+      `  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}   (un-instrumented: ${fmtMs(untracked)})`,
+    );
   } else {
     log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}`);
   }
+  printPeakMemory();
 }
 
+/**
+ * Last line of the run summary: the process's peak RSS. It is a PROCESS
+ * high-water mark (the kernel keeps one number per process), not this run's —
+ * one execution can drain several queue rows — so read it as "the most this
+ * job execution has needed so far". Also written as a structured line, so the
+ * peak can be queried and charted without parsing the captured log.
+ */
+function printPeakMemory(): void {
+  const mib = (n: number): number => Math.round(n / 1024 / 1024);
+  const peakRssBytes = process.resourceUsage().maxRSS * 1024; // maxRSS is in KiB
+  const heapUsedBytes = process.memoryUsage().heapUsed;
+  log(
+    `  Peak memory: RSS ${mib(peakRssBytes)} MiB (process high-water mark), ` +
+      `heap used ${mib(heapUsedBytes)} MiB now`,
+  );
+  logger.info({ peakRssBytes, heapUsedBytes }, '[drive.memory] run peak');
+}
 
 /** Fresh timer for a new run (was `phaseTimer = new PhaseTimer()` inline). */
 export function resetPhaseTimer(): void {

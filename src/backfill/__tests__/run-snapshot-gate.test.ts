@@ -12,6 +12,7 @@ const m = vi.hoisted(() => ({
   loadEntity: vi.fn(),
   processBatch: vi.fn(),
   persistCursor: vi.fn(),
+  loadBootstrapFilesCache: vi.fn(),
 }));
 
 vi.mock('../../config', () => ({ config: m.config }));
@@ -32,6 +33,7 @@ vi.mock('../days', async (importActual) => ({
   ...(await importActual<typeof import('../days')>()),
   persistCursor: m.persistCursor,
   persistBootstrapFilesCache: vi.fn(),
+  loadBootstrapFilesCache: m.loadBootstrapFilesCache,
 }));
 vi.mock('../../scan/process-batch', () => ({ processBatch: m.processBatch }));
 vi.mock('../../scan/output', () => ({
@@ -51,7 +53,8 @@ vi.mock('../../scan/timing', () => ({
 import { runBackfill } from '../run';
 
 // One cached active day: chunk 2..N of a bootstrap chain reads the file list
-// from the account row, so no Drive discovery is involved.
+// from the account row (loadBootstrapFilesCache), so no Drive discovery is
+// involved.
 const DAY = '2026-09-01';
 const FILE = {
   id: 'f1',
@@ -83,7 +86,8 @@ const run = (over: { dryrun?: boolean } = {}) =>
   });
 
 beforeEach(() => {
-  for (const fn of [m.loadEntity, m.processBatch, m.persistCursor]) fn.mockReset();
+  for (const fn of [m.loadEntity, m.processBatch, m.persistCursor, m.loadBootstrapFilesCache])
+    fn.mockReset();
   m.config.SNAPSHOT_WRITE_FAILURE_LIMIT = 0;
   m.loadEntity.mockResolvedValue({
     type: 'account',
@@ -92,7 +96,10 @@ beforeEach(() => {
     folderId: 'root-1',
     accountId: 'acc-1',
     driveBootstrapCursor: null,
-    driveBootstrapFiles: { files: [FILE], activeDates: [{ date: DAY, files: [FILE] }] },
+  });
+  m.loadBootstrapFilesCache.mockResolvedValue({
+    files: [FILE],
+    activeDates: [{ date: DAY, files: [FILE] }],
   });
   m.processBatch.mockResolvedValue(outcome(0));
 });

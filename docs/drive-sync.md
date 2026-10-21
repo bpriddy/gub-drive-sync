@@ -148,7 +148,7 @@ migration (`20260610100000_drive_bootstrap_cache`).
 | `drive_last_synced_at` | TIMESTAMPTZ | Latest completed forward sync. NULL until first forward chunk. |
 | `drive_activity_page_token` | TEXT | Activity API pageToken for the next forward run. NULL before first forward chunk. |
 | `drive_structure_classification` | JSONB | Cached `{ fingerprint, entityMap, folders, ... }`. Built by bootstrap chunk #1; reused by chunks 2..N. SURVIVES bootstrap completion; forward sync re-uses with hash invalidation. |
-| `drive_bootstrap_files` | JSONB | Cached `{ files, activeDates }`. Built by bootstrap chunk #1; reused by chunks 2..N. NULLed on completion (~10MB payload, no value after). |
+| `drive_bootstrap_files` | JSONB | Cached `{ version: 2, files, activeDates }` (each file stored once; days list file ids). Built by bootstrap chunk #1; reused by chunks 2..N; parsed only by the bootstrap path; `loadEntity` never selects it (v1 paths that load whole account rows still read it). NULLed on completion (~10MB payload for a 25k-file drive, no value after). |
 | `status_markdown` | TEXT | Synthesized human-readable summary (general bullets) |
 | `status_sensitive_markdown` | TEXT | Synthesized summary, sensitive tier (per D29) |
 
@@ -225,15 +225,39 @@ results so chunks 2..N skip the prelude.
 
 ```jsonc
 {
-  "files": [ /* TraversedFile[] — full file metadata */ ],
-  "activeDates": [ /* DayBucket[] — pre-bucketed by modifiedTime */ ]
+  "version": 2,
+  "files": [ /* TraversedFile[] — full file metadata, each file ONCE */ ],
+  "activeDates": [ /* { "date": "YYYY-MM-DD", "fileIds": [ids into files] } per active day */ ]
 }
 ```
 
 - Built by bootstrap chunk #1, written via `persistBootstrapFilesCache`.
-- Reused by chunks 2..N as-is.
+- Reused by chunks 2..N as-is, read via `loadBootstrapFilesCache`. In the
+  scan core only the bootstrap path asks for it: `loadEntity` selects every
+  other `accounts` column, so structure-only and forward runs never pull the
+  blob. Account writes read back only the id. The v1 paths that load whole
+  account rows (`include` in `drive/orchestrator.ts` and `drive/discover.ts`)
+  and gub-admin's account pages still read the column, without parsing it.
 - NULLed on bootstrap completion (no value after; forward sync uses
   Activity API).
+- The first format had no `version` key and stored every file twice (in
+  `files` and again in `activeDates[].files`). It is still read — a chain
+  started before version 2 keeps its cache — and is never written. Version 2
+  halves the bytes per file, which roughly doubles how many files fit under
+  PostgreSQL's ~255 MB jsonb limit; a much larger drive needs the cache
+  split into per-chunk rows instead of one value.
+- A cache that cannot be used (unknown version, wrong shape, a day listing
+  an id that is not in `files`) is a miss: the run logs
+  `Files cache unusable (…)`, re-discovers the files and overwrites it.
+- Rollback: a build from before version 2 reads a version-2 cache as a hit
+  and then fails on the first day (its days carry `fileIds`, not `files`).
+  Before rolling back, drop the caches that were written in the new format;
+  the next chunk re-discovers:
+
+  ```sql
+  UPDATE accounts SET drive_bootstrap_files = NULL
+  WHERE drive_bootstrap_files ->> 'version' = '2';
+  ```
 
 ### Fingerprint
 
@@ -261,9 +285,15 @@ For every file in the day's bucket:
 
 1. **Extract** (`src/drive/extract.ts`): pull content from Drive.
    - Google-native (Docs/Slides/Sheets): per-type Workspace API. Returns
-     structured-but-flat text.
+     structured-but-flat text. No byte cap (nothing is downloaded); the
+     walked text is capped by `NATIVE_MAX_CHARS` and a longer one is
+     skipped with `too_many_chars` (the API response itself is not bounded).
    - Binary (PDF/DOCX/PPTX/text/*): `downloadFileBuffer` + per-type
      parser. Size cap (`DRIVE_MAX_FILE_SIZE_BYTES`, default 300MB).
+     Downloads and their parse run under a byte-weighted budget
+     (`src/drive/download.ts`): the metadata sizes in flight sum to at
+     most `DOWNLOAD_INFLIGHT_BYTES`, and a file at or above
+     `DOWNLOAD_HEAVY_BYTES` (or of unknown size) runs alone.
    - `predictExtractionSkip` is the metadata-only skip check
      `extractText` runs first — unsupported mimes and oversize files
      short-circuit without any I/O.
@@ -500,6 +530,9 @@ Environment variables consumed at runtime by gub-drive-sync. Defined in
 | `GEMINI_API_KEY` | — | Gemini API key. |
 | `GEMINI_MAX_INPUT_CHARS` | 40000 | Per-file LLM input truncation cap. |
 | `DRIVE_MAX_FILE_SIZE_BYTES` | 314572800 (300MB) | Binary download cap. Google-native bypasses. |
+| `DOWNLOAD_INFLIGHT_BYTES` | 629145600 (600MiB) | Most bytes of binary downloads (fetch + parse) in flight at once; sized from file metadata. |
+| `DOWNLOAD_HEAVY_BYTES` | 52428800 (50MiB) | A file at or above this size, or of unknown size, runs alone. Must not exceed `DOWNLOAD_INFLIGHT_BYTES` (boot fails otherwise). |
+| `NATIVE_MAX_CHARS` | 2000000 | Google-native Docs/Sheets/Slides have no byte size to check, so their walked text is capped instead: over it the file is skipped (`too_many_chars`), not truncated. |
 | `SYNTH_CONCURRENCY` | 8 | Per-entity worker pool size for distill+synth. |
 | `GCP_PROJECT_ID` / `GCP_REGION` / `DRIVE_SYNC_JOB_NAME` | — | Required for `scheduleContinuation` to fire fresh Job executions. |
 
