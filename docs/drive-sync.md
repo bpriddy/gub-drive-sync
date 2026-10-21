@@ -264,6 +264,10 @@ For every file in the day's bucket:
      structured-but-flat text.
    - Binary (PDF/DOCX/PPTX/text/*): `downloadFileBuffer` + per-type
      parser. Size cap (`DRIVE_MAX_FILE_SIZE_BYTES`, default 300MB).
+     Downloads and their parse run under a byte-weighted budget
+     (`src/drive/download.ts`): the metadata sizes in flight sum to at
+     most `DOWNLOAD_INFLIGHT_BYTES`, and a file at or above
+     `DOWNLOAD_HEAVY_BYTES` (or of unknown size) runs alone.
    - `predictExtractionSkip` is the metadata-only skip check
      `extractText` runs first — unsupported mimes and oversize files
      short-circuit without any I/O.
@@ -500,6 +504,8 @@ Environment variables consumed at runtime by gub-drive-sync. Defined in
 | `GEMINI_API_KEY` | — | Gemini API key. |
 | `GEMINI_MAX_INPUT_CHARS` | 40000 | Per-file LLM input truncation cap. |
 | `DRIVE_MAX_FILE_SIZE_BYTES` | 314572800 (300MB) | Binary download cap. Google-native bypasses. |
+| `DOWNLOAD_INFLIGHT_BYTES` | 629145600 (600MiB) | Most bytes of binary downloads (fetch + parse) in flight at once; sized from file metadata. |
+| `DOWNLOAD_HEAVY_BYTES` | 52428800 (50MiB) | A file at or above this size, or of unknown size, runs alone. Must not exceed `DOWNLOAD_INFLIGHT_BYTES` (boot fails otherwise). |
 | `SYNTH_CONCURRENCY` | 8 | Per-entity worker pool size for distill+synth. |
 | `GCP_PROJECT_ID` / `GCP_REGION` / `DRIVE_SYNC_JOB_NAME` | — | Required for `scheduleContinuation` to fire fresh Job executions. |
 

@@ -35,7 +35,7 @@ import mammoth from 'mammoth';
 import { google, type docs_v1, type slides_v1, type sheets_v4 } from 'googleapis';
 import { config } from '../config';
 import { logger } from '../logger';
-import { downloadFileBuffer } from './client';
+import { withDownloadedFile } from './download';
 import { buildBotOAuthClient } from '../workspace';
 import type { ExtractionOutcome, ExtractionSkip, TraversedFile } from './types';
 
@@ -252,52 +252,56 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
         return ok(await extractGoogleSheets(effectiveFile.id), 'gsheet');
 
       // ── Binary downloads: size cap already checked in predictExtractionSkip.
-      case MIME.PDF: {
-        const buf = await downloadFileBuffer(effectiveFile.id);
-        // Import lazily to keep the parser off the module init path.
-        //
-        // `unpdf` is a thin modern wrapper over `pdfjs-dist`'s legacy
-        // build — the build Mozilla maintains specifically for Node /
-        // serverless environments without DOM globals. We deliberately
-        // do NOT use pdf-parse: v1.x is unmaintained (last release
-        // 2019), and v2.x is a rewrite on top of the non-legacy
-        // pdfjs-dist build that expects browser globals (DOMMatrix,
-        // Path2D, ImageData) and throws in Node without `canvas`
-        // native-dep polyfills. unpdf is the actively-maintained
-        // primitive that exists precisely because of v2's breakage.
-        //
-        // We construct the PDFDocumentProxy explicitly (rather than
-        // passing raw bytes to extractText) so we can set pdfjs's
-        // `verbosity` level. Default is WARNINGS, which spams the log
-        // with harmless TrueType-font notes like "TT: undefined
-        // function: 32" — those don't affect text extraction but
-        // drown out real signal. verbosity: 0 = ERRORS only.
-        const { getDocumentProxy, extractText } = await import('unpdf');
-        const pdf = await getDocumentProxy(new Uint8Array(buf), { verbosity: 0 });
-        const { text } = await extractText(pdf, { mergePages: true });
-        return ok(text, 'pdf');
-      }
-      case MIME.DOCX: {
-        const buf = await downloadFileBuffer(effectiveFile.id);
-        const { value } = await mammoth.extractRawText({ buffer: buf });
-        return ok(value, 'docx');
-      }
-      case MIME.PPTX: {
-        const buf = await downloadFileBuffer(effectiveFile.id);
-        // Import lazily to keep officeparser off the module init path —
-        // it has a heavy zlib/xml unpack chain we'd rather defer.
-        // officeparser flattens to plain text; slide boundaries and
-        // speaker notes are mostly preserved as runs of lines. For
-        // richer visual understanding (charts/photos/layout), see the
-        // future "rich pipeline" plan in docs/status-markdown-plan.md.
-        const { parseOfficeAsync } = await import('officeparser');
-        const text = await parseOfficeAsync(buf);
-        return ok(text, 'pptx');
-      }
+      //    Each branch downloads and parses inside withDownloadedFile's byte
+      //    reservation, sized from effectiveFile.size (a missing size counts as
+      //    heavy). `return await`, so a failure still lands in the catch below.
+      case MIME.PDF:
+        return await withDownloadedFile(effectiveFile, async (buf) => {
+          // Import lazily to keep the parser off the module init path.
+          //
+          // `unpdf` is a thin modern wrapper over `pdfjs-dist`'s legacy
+          // build — the build Mozilla maintains specifically for Node /
+          // serverless environments without DOM globals. We deliberately
+          // do NOT use pdf-parse: v1.x is unmaintained (last release
+          // 2019), and v2.x is a rewrite on top of the non-legacy
+          // pdfjs-dist build that expects browser globals (DOMMatrix,
+          // Path2D, ImageData) and throws in Node without `canvas`
+          // native-dep polyfills. unpdf is the actively-maintained
+          // primitive that exists precisely because of v2's breakage.
+          //
+          // We construct the PDFDocumentProxy explicitly (rather than
+          // passing raw bytes to extractText) so we can set pdfjs's
+          // `verbosity` level. Default is WARNINGS, which spams the log
+          // with harmless TrueType-font notes like "TT: undefined
+          // function: 32" — those don't affect text extraction but
+          // drown out real signal. verbosity: 0 = ERRORS only.
+          const { getDocumentProxy, extractText } = await import('unpdf');
+          const pdf = await getDocumentProxy(new Uint8Array(buf), { verbosity: 0 });
+          const { text } = await extractText(pdf, { mergePages: true });
+          return ok(text, 'pdf');
+        });
+      case MIME.DOCX:
+        return await withDownloadedFile(effectiveFile, async (buf) => {
+          const { value } = await mammoth.extractRawText({ buffer: buf });
+          return ok(value, 'docx');
+        });
+      case MIME.PPTX:
+        return await withDownloadedFile(effectiveFile, async (buf) => {
+          // Import lazily to keep officeparser off the module init path —
+          // it has a heavy zlib/xml unpack chain we'd rather defer.
+          // officeparser flattens to plain text; slide boundaries and
+          // speaker notes are mostly preserved as runs of lines. For
+          // richer visual understanding (charts/photos/layout), see the
+          // future "rich pipeline" plan in docs/status-markdown-plan.md.
+          const { parseOfficeAsync } = await import('officeparser');
+          const text = await parseOfficeAsync(buf);
+          return ok(text, 'pptx');
+        });
       default: {
         if (effectiveFile.mimeType.startsWith('text/')) {
-          const buf = await downloadFileBuffer(effectiveFile.id);
-          return ok(buf.toString('utf-8'), 'plaintext');
+          return await withDownloadedFile(effectiveFile, async (buf) =>
+            ok(buf.toString('utf-8'), 'plaintext'),
+          );
         }
         // predictExtractionSkip would have caught this above; defensive
         // fall-through in case extractText gets called with a file the

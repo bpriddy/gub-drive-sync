@@ -32,6 +32,25 @@ const EnvSchema = z.object({
   // Cloud Run Job's --memory should be >=1Gi (currently 1Gi; bump to
   // 2Gi if you start seeing OOM on the largest PDFs).
   DRIVE_MAX_FILE_SIZE_BYTES: z.string().default('314572800').transform(Number),
+  // In-flight budget for BINARY downloads. A download is buffered whole and its
+  // parser then builds structures next to the buffer, so N workers x up to
+  // DRIVE_MAX_FILE_SIZE_BYTES can exceed the job's memory. The metadata sizes
+  // of the downloads in flight (fetch + parse) sum to at most
+  // DOWNLOAD_INFLIGHT_BYTES; a file at or above DOWNLOAD_HEAVY_BYTES, or of
+  // unknown size, runs alone. 600 MiB / 50 MiB: a transfer briefly holds ~2x its
+  // size (the chunks plus the concatenated Buffer), which still fits the 2Gi
+  // job. No flag: the default is the bound, and it only limits concurrency.
+  // HEAVY must not exceed INFLIGHT (checked in loadConfig).
+  DOWNLOAD_INFLIGHT_BYTES: z
+    .string()
+    .default('629145600')
+    .transform(Number)
+    .pipe(z.number().int().safe().min(1)),
+  DOWNLOAD_HEAVY_BYTES: z
+    .string()
+    .default('52428800')
+    .transform(Number)
+    .pipe(z.number().int().safe().min(1)),
   DRIVE_PROPOSAL_TTL_DAYS: z.string().default('14').transform(Number),
 
   // ── AI / Gemini ──────────────────────────────────────────────────────────
@@ -100,6 +119,15 @@ export function loadConfig(): Config {
   if (!parsed.success) {
     const errors = parsed.error.errors.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
     throw new Error(`Environment configuration invalid:\n${errors}`);
+  }
+  // Cross-field: a file below the heavy threshold has to fit in the in-flight
+  // budget, or it could never be admitted. Fail at boot rather than hang on
+  // the first download.
+  const { DOWNLOAD_HEAVY_BYTES: heavy, DOWNLOAD_INFLIGHT_BYTES: inflight } = parsed.data;
+  if (heavy > inflight) {
+    throw new Error(
+      `Environment configuration invalid:\n  DOWNLOAD_HEAVY_BYTES: must not exceed DOWNLOAD_INFLIGHT_BYTES (${heavy} > ${inflight})`,
+    );
   }
   return parsed.data;
 }
