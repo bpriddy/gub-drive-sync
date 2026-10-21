@@ -56,9 +56,9 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 // minimum interval between consecutive calls. Sequential by design —
 // concurrent callers queue up behind whoever's currently waiting.
 //
-// Cost: ~125ms added per call (8 calls/sec). For Chevy's ~159 startup
-// calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
-// burst. Acceptable, and we never get a 403 in steady state.
+// Cost: ~125ms added per call (8 calls/sec). For the largest account's
+// ~159 startup calls = ~20s of upfront throttled wall-clock vs ~5-10s of
+// unconstrained burst. Acceptable, and we never get a 403 in steady state.
 
 export class DriveRateLimiter {
   private chainTail: Promise<void> = Promise.resolve();
@@ -125,8 +125,8 @@ export class DriveRateLimiter {
  * 4 calls/sec gives 250ms spacing. Conservative vs Drive's documented
  * 10/sec per-user limit, but real-world enforcement is often tighter
  * (bot user quotas, sliding-window edges, concurrent process effects).
- * The cost is ~40s of upfront throttled wall-clock for Chevy's ~159
- * startup calls — acceptable.
+ * The cost is ~40s of upfront throttled wall-clock for the largest
+ * account's ~159 startup calls — acceptable.
  *
  * If 4/sec STILL hits the limit, the retry-with-backoff inside .run()
  * absorbs it: we wait up to 30s and try again, up to 5 attempts. The
