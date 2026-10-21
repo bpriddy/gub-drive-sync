@@ -36,12 +36,6 @@ export function isRetryableLlmError(err: unknown): boolean {
   // API-level errors carry a typed HTTP status (SDK-recommended handling).
   if (err instanceof ApiError) return isRetryableHttpStatus(err.status);
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  // With httpOptions.retryOptions set, the SDK's retry wrapper (p-retry
-  // around fetch) never builds an ApiError: a retryable status is thrown as
-  // a plain Error carrying only the statusText, which can be empty. The
-  // driver no longer sets retryOptions, but the SDK's behaviour is one
-  // config line away, so the shape is matched here too.
-  if (msg.startsWith('retryable http error')) return true;
   // Network-level failures never reach ApiError (they surface as fetch or
   // socket errors from the transport) — string-match those.
   if (msg.includes('fetch failed')) return true;

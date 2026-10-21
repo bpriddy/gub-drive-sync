@@ -149,10 +149,6 @@ describe('isRetryableLlmError', () => {
     expect(isRetryableLlmError(new ApiError({ message: 'x', status: 408 }))).toBe(true);
     expect(isRetryableLlmError(new ApiError({ message: 'x', status: 500 }))).toBe(true);
     expect(isRetryableLlmError(new ApiError({ message: 'x', status: 504 }))).toBe(true);
-    // The SDK's own retry wrapper (httpOptions.retryOptions) throws this
-    // plain Error for 408/429/5xx; statusText may be empty on HTTP/2.
-    expect(isRetryableLlmError(new Error('Retryable HTTP Error: Service Unavailable'))).toBe(true);
-    expect(isRetryableLlmError(new Error('Retryable HTTP Error: '))).toBe(true);
     expect(isRetryableLlmError(new TypeError('fetch failed'))).toBe(true);
   });
 

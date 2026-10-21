@@ -6,7 +6,6 @@ describe('isTransientFailure', () => {
   it('accepts what a re-run of the window can recover', () => {
     expect(isTransientFailure(new ApiError({ message: 'x', status: 429 }))).toBe(true);
     expect(isTransientFailure(new ApiError({ message: 'x', status: 503 }))).toBe(true);
-    expect(isTransientFailure(new Error('Retryable HTTP Error: Service Unavailable'))).toBe(true);
     expect(isTransientFailure({ code: 500 })).toBe(true); // Drive 5xx
     expect(isTransientFailure({ code: 'ECONNRESET' })).toBe(true);
     expect(isTransientFailure({ code: 403, errors: [{ reason: 'userRateLimitExceeded' }] })).toBe(
