@@ -42,6 +42,7 @@ export async function timed<T>(phase: string, fn: () => Promise<T>): Promise<T> 
 /** Pretty-name table so phase keys render as human labels in the summary. */
 const PHASE_LABELS: Record<string, string> = {
   setup: 'Setup (loadEntity)',
+  files_cache_load: 'Files cache load (DB)',
   structure_walk: 'Drive walk (folders)',
   structure_classify: 'Classify folders (LLM)',
   file_discovery: 'Discover files (Drive)',

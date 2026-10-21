@@ -13,8 +13,8 @@ import {
   groupFilesByDate,
   persistCursor,
   persistBootstrapFilesCache,
+  loadBootstrapFilesCache,
   type DayBucket,
-  type BootstrapFilesCache,
 } from './days';
 import type { CampaignNameDirectory } from '../scan/batch-types';
 import { processBatch } from '../scan/process-batch';
@@ -165,11 +165,16 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   // buckets computed by chunk #1. Each chunk just advances the cursor
   // through the cached activeDates — no fresh files.list pagination
   // needed. Cache is NULLed on bootstrap completion (see persistCursor).
+  //
+  // The cache is read HERE, not with the account row: it is the one column
+  // that grows with the drive (hundreds of MB on a large one), and only this
+  // path uses it — structure-only returned above and the forward driver
+  // re-gathers every run.
   log(rule('Discover files'));
   let allFiles: TraversedFile[];
   let activeDates: DayBucket[];
-  const cachedFiles = ctx.driveBootstrapFiles as BootstrapFilesCache | null;
-  if (cachedFiles && cachedFiles.files && cachedFiles.activeDates) {
+  const cachedFiles = await timed('files_cache_load', () => loadBootstrapFilesCache(ctx.accountId));
+  if (cachedFiles) {
     log(
       `  ✓ Files cache HIT  (${cachedFiles.files.length} files, ${cachedFiles.activeDates.length} active days)`,
     );

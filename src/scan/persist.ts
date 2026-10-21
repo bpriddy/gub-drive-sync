@@ -294,6 +294,8 @@ async function persistAccountTarget(
     await tx.account.update({
       where: { id: accountId },
       data: columnUpdates,
+      // RETURNING only the id, not drive_bootstrap_files.
+      select: { id: true },
     });
     for (const vc of validatedChanges) {
       const previousCols = projectChangeValue(vc.spec.changeKind, vc.previousValue, 'previous');

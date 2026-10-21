@@ -12,6 +12,10 @@ import type { IdeaScanStats } from '../drive/idea-scan';
  * dossiers, and the driver-owned cursor/cache fields. Constructed by the
  * DRIVER (src/backfill/entity.ts loadEntity today; the forward driver
  * later) and consumed read-only by the scan core.
+ *
+ * Deliberately NOT here: the bootstrap files cache
+ * (accounts.drive_bootstrap_files). It grows with the drive, so only the
+ * bootstrap path loads it, lazily, via loadBootstrapFilesCache (days.ts).
  */
 export interface EntityCtx {
   type: 'account' | 'campaign';
@@ -46,12 +50,6 @@ export interface EntityCtx {
    * checks fingerprint; on match, skips the ~1m 45s LLM classify step.
    */
   driveStructureClassification: unknown;
-  /**
-   * Cached file list + active_dates from bootstrap chunk #1. NULL after
-   * bootstrap completes (or before first chunk). When present, chunks
-   * 2..N skip the ~3 min file discovery + grouping step.
-   */
-  driveBootstrapFiles: unknown;
   reviewerEmail: string | null;
   reviewerStaffId: string | null;
 }

@@ -2,7 +2,7 @@
  * printPhaseSummary ends with the process's peak memory, as a human line in the
  * run summary (the part captured into the run's log) and as a structured line
  * for querying. Both drivers call printPhaseSummary last, so that is where the
- * peak lands.
+ * peak lands. The summary also labels the bootstrap files cache read.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -31,6 +31,18 @@ beforeEach(() => {
 afterEach(() => {
   setLogCapture(null);
   vi.restoreAllMocks();
+});
+
+describe('printPhaseSummary phase labels', () => {
+  it('names the bootstrap files cache read, now timed apart from loadEntity', async () => {
+    resetPhaseTimer();
+    await timed('files_cache_load', async () => {});
+
+    printPhaseSummary(1500);
+
+    expect(lines.some((l) => l.startsWith('  Files cache load (DB)'))).toBe(true);
+    expect(lines.some((l) => l.includes('files_cache_load'))).toBe(false);
+  });
 });
 
 describe('printPhaseSummary peak memory', () => {
