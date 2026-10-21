@@ -1,9 +1,31 @@
 /**
- * drive.snapshot.ts — Per-file history + delta skip.
+ * drive.snapshot.ts — The Drive file index: per-file history + delta skip.
  *
- * Delta rule: if the most recent snapshot for this file_id has a modified_time
- * at or after Drive's current modifiedTime, we skip extraction. A snapshot row
- * is still written every scan (append-only) so history stays intact.
+ * drive_file_snapshots is APPEND-ONLY history, one row per processed file per
+ * run. Writers only INSERT; nothing updates or deletes a row (the operator
+ * modes merge-campaign-dupes and clear-account are the existing exceptions).
+ * It is also the Drive file-name index GUB reads: file-name search takes the
+ * latest row per file, the `_sources` / `_cited` lists the latest row with
+ * was_extracted = true. docs/drive-file-index.md has the full picture.
+ *
+ * Two writers, and `was_extracted` does NOT mean the same in both:
+ *   v1 (scanFolder, src/drive/sync.ts): true = the text was extracted. The
+ *     interpret step runs afterwards in a callback that logs its own failure,
+ *     so a rate-limited interpret still left the row true — and the delta
+ *     rule below then never re-interpreted that file.
+ *   v2 (the scan core, src/scan/process-batch.ts): true = the text was
+ *     extracted AND the per-file interpret call returned. A failure of either
+ *     is false with skip_reason 'extract_error'. Later stages (routing, ideas,
+ *     distill, synthesis) never change the row; their failures are the runs'
+ *     own gates.
+ * content_hash is set exactly on the extracted rows. A consumer that needs
+ * "interpreted" must read v2 rows only (they leave sync_run_id NULL — necessary,
+ * not sufficient, see the doc) or accept v1's weaker meaning.
+ *
+ * Delta rule (v1 only): if the most recent snapshot for this file_id has a
+ * modified_time at or after Drive's current modifiedTime, we skip extraction.
+ * A snapshot row is still written every scan (append-only) so history stays
+ * intact.
  */
 
 import { prisma } from '../prisma';
@@ -52,11 +74,23 @@ export async function checkDelta(file: TraversedFile): Promise<DeltaCheck> {
 }
 
 export interface WriteSnapshotInput {
+  /**
+   * The `sync_runs` row of a v1 full sync. The column references that v1
+   * table, so v2 writers leave it null: stamping a `drive_sync_runs` queue id
+   * here fails the foreign key (23503).
+   */
   syncRunId: string | null;
   scope: TraversalScope;
   file: TraversedFile;
+  /**
+   * v1: the text was extracted — interpretation may still have failed.
+   * v2: the text was extracted AND the per-file interpret call returned.
+   * See the file header.
+   */
   wasExtracted: boolean;
+  /** Why the file was not extracted; the vocabulary is in docs/drive-file-index.md. */
   skipReason?: string | null;
+  /** Set exactly on extracted rows. */
   contentHash?: string | null;
 }
 

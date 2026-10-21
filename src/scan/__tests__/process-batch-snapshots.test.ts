@@ -169,6 +169,20 @@ describe('processBatch writes the Drive name index', () => {
     expect(outcome.snapshotWriteFailures).toBe(0);
   });
 
+  it('counts a file as extracted only once its interpret call returned (v2 was_extracted)', async () => {
+    interpretFile.mockRejectedValueOnce(new Error('rate limited'));
+
+    await processBatch([file('ok', 'folder-q3')], opts());
+
+    // The text WAS extracted, but the file never got interpreted: unlike v1,
+    // the row must not claim it was.
+    expect(rows()[0]).toMatchObject({
+      wasExtracted: false,
+      skipReason: 'extract_error',
+      contentHash: null,
+    });
+  });
+
   it('leaves sync_run_id NULL: it references the v1 sync_runs table, not the queue', async () => {
     await processBatch(BATCH, opts());
     expect(rows().map((r) => r.syncRunId)).toEqual([null, null, null, null]);
