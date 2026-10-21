@@ -21,6 +21,10 @@
  *                                                    PROPOSE for review)
  *   seed-edit-stats          → seedEditStats (one-shot ~1y historical
  *     [--account-id X]         drive_edit_stats seed; stats only)
+ *   refresh-snapshots        → refreshFileSnapshots (operator gcloud; one-
+ *     [--account-id X]         shot catch-up of the drive_file_snapshots
+ *     [--confirm]              name index — Drive listing only, no LLM.
+ *                              No --confirm = dry-run counts.)
  *   merge-campaign-dupes     → runCampaignMerge  (operator gcloud; one-shot
  *     --account-name X [--confirm]                 detect + merge duplicate
  *     [--min-confidence 0..1]                      campaigns. No --confirm =
@@ -53,6 +57,7 @@ import {
 import { processBackfillQueue } from './drive/backfill-queue';
 import { DRIVE_SYNC_SYSTEM_STAFF_ID } from './drive/heal';
 import { seedEditStats } from './forward/seed';
+import { parseRefreshSnapshotsArgs, refreshFileSnapshots } from './drive/snapshot-refresh';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
 import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
@@ -72,7 +77,8 @@ type Mode =
   | 'clear-account'
   | 'extract-ideas'
   | 'derive-pieces'
-  | 'seed-edit-stats';
+  | 'seed-edit-stats'
+  | 'refresh-snapshots';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -88,6 +94,7 @@ const ALL_MODES: readonly Mode[] = [
   'extract-ideas',
   'derive-pieces',
   'seed-edit-stats',
+  'refresh-snapshots',
 ];
 
 interface ParsedArgs {
@@ -95,7 +102,10 @@ interface ParsedArgs {
   syncRunId?: string;
   accountId?: string;
   accountName?: string;
-  /** merge-campaign-dupes: actually apply (delete rows). Absent = dry-run. */
+  /**
+   * merge-campaign-dupes: actually apply (delete rows). refresh-snapshots:
+   * write the index rows. Absent = dry-run.
+   */
   confirm?: boolean;
   /** merge-campaign-dupes: raise the merge confidence floor above 0.8. */
   minConfidence?: number;
@@ -276,6 +286,15 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
+  if (mode === 'refresh-snapshots') {
+    // [--account-id X]  (absent = every account with a drive_folder_id)
+    // --confirm         (write rows; absent = dry-run counts)
+    // Strict parsing, tested in drive/__tests__/snapshot-refresh.test.ts.
+    const parsed = parseRefreshSnapshotsArgs(positional.slice(1));
+    if (parsed.accountId) out.accountId = parsed.accountId;
+    if (parsed.confirm) out.confirm = true;
+  }
+
   return out;
 }
 
@@ -355,6 +374,16 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
     case 'seed-edit-stats': {
       const result = await seedEditStats({
         ...(args.accountId ? { accountId: args.accountId } : {}),
+      });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'refresh-snapshots': {
+      // Orthogonal to sync state — no reapStaleSyncs(). Writes only
+      // drive_file_snapshots rows, and only with --confirm.
+      const result = await refreshFileSnapshots({
+        ...(args.accountId ? { accountId: args.accountId } : {}),
+        confirm: args.confirm === true,
       });
       return result as unknown as Record<string, unknown>;
     }

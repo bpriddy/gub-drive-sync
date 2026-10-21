@@ -37,6 +37,18 @@ const EnvSchema = z.object({
   // 2Gi if you start seeing OOM on the largest PDFs).
   DRIVE_MAX_FILE_SIZE_BYTES: z.string().default('314572800').transform(Number),
   DRIVE_PROPOSAL_TTL_DAYS: z.string().default('14').transform(Number),
+  /**
+   * drive_file_snapshots rows (the Drive name index) allowed to fail per
+   * batch before the run itself fails. 0 = any failed row fails the run, so
+   * the queue retries it and a DB/schema problem cannot quietly empty the
+   * index again. Raising it is a stop-gap while that problem is fixed: the
+   * files over the limit stay stale in the index until they change again.
+   */
+  SNAPSHOT_WRITE_FAILURE_LIMIT: z
+    .string()
+    .default('0')
+    .transform(Number)
+    .pipe(z.number().int().min(0)),
 
   // ── AI / Gemini ──────────────────────────────────────────────────────────
   GEMINI_API_KEY: z.string().optional(),

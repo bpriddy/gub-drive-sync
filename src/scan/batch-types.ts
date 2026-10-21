@@ -188,4 +188,12 @@ export interface BatchOutcome {
   stage3Failures: number;
   /** Ideas tier: deck-gated extraction stats (null when account folder unknown). */
   ideaStats: IdeaScanStats | null;
+  /**
+   * drive_file_snapshots rows (the Drive name index) that failed to write.
+   * Each is already reported with a `[drive.snapshot] write failed` WARN.
+   * The drivers fail the run when this exceeds SNAPSHOT_WRITE_FAILURE_LIMIT
+   * before the cursor or day is committed — append-only history, so every
+   * retry re-writes the whole window: one more row per file per failed attempt.
+   */
+  snapshotWriteFailures: number;
 }

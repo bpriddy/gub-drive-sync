@@ -29,8 +29,10 @@ backfill-pending ─► processOne ─► runBackfill (src/backfill/run.ts)   (b
        │    └─ otherwise          → gatherFilesRecursive → traverseFolder → listFolderChildren per folder
        └─ campaign scans: gatherFilesRecursive(piece folder) per piece   (always recursive)
 
-refresh-snapshots (proposed catch-up, unmerged branch, #66)
-  └─ per account: traverseFolder(account root) → listFolderChildren per folder  (~6,780 calls modelled)
+refresh-snapshots (the index catch-up, #66)
+  └─ per account: probeFolder(root)
+       ├─ inside a shared drive → listSubtreeFiles(root): flat folder + file sweeps  (~35 calls)
+       └─ My Drive, or a refused in-drive listing → traverseFolder → listFolderChildren per folder
 
 v1 / other:
   run-full-sync, poll → scanEntity → scanFolder (src/drive/sync.ts) → traverseFolder

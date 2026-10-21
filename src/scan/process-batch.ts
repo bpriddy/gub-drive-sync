@@ -2,6 +2,11 @@
 // by every driver (day-walk backfill today; the Activity forward driver next).
 import { prisma } from '../prisma';
 import { extractText } from '../drive/extract';
+import {
+  reportSnapshotWriteFailure,
+  snapshotForScanOutcome,
+  writeSnapshot,
+} from '../drive/snapshot';
 import { interpretAssetFolder } from '../drive/asset-folder';
 import {
   interpretFile,
@@ -229,6 +234,8 @@ export async function processBatch(
   let campaignObsDiscarded = 0;
   /** Stage-3 synthesis/apply/propose failures — see BatchOutcome.stage3Failures. */
   let stage3Failures = 0;
+  /** drive_file_snapshots rows that failed to write — see BatchOutcome.snapshotWriteFailures. */
+  let snapshotWriteFailures = 0;
   /** Obs about a DIFFERENT campaign found inside a campaign zone — misfiled content, dropped. */
   let foreignObsDropped = 0;
   /** Account-zone obs naming an UNKNOWN campaign → converted to account observations (no phantoms). */
@@ -317,6 +324,7 @@ export async function processBatch(
     error?: unknown;
     extractor?: string;
     textLength?: number;
+    contentHash?: string;
     res?: InterpretFileOutput;
     /** Deck-gated candidates from the worker; null = not a deck (or no idea
      *  context); 'failed' = extraction errored (already counted). */
@@ -404,6 +412,7 @@ export async function processBatch(
         kind: 'ok',
         extractor: extraction.extractor,
         textLength: extraction.text.length,
+        contentHash: extraction.contentHash,
         res,
         ideaCandidates,
       };
@@ -736,6 +745,39 @@ export async function processBatch(
     }
   }
 
+  // One drive_file_snapshots row per scanned file — the Drive name index GUB
+  // reads (its file-name search, the `_sources` lists). The v1 scanFolder
+  // path wrote these; the scan core did not, so once the scheduler moved to
+  // forward-all the index stopped at the last v1 run. The row is telemetry,
+  // not dossier content, so it rides infraWrites like the restricted
+  // worklist and is written in 'propose' mode too. Campaign is the file's
+  // FOLDER attribution (where it lives in Drive), the same expression the
+  // restricted worklist uses — not the campaign an LLM tag routed its
+  // observations to.
+  //
+  // A failed row never rejects applyChain (that would discard the batch's
+  // extraction spend) and is never swallowed either: it is counted and
+  // reported, and the drivers fail the run when the count exceeds
+  // SNAPSHOT_WRITE_FAILURE_LIMIT.
+  async function recordSnapshot(o: WorkerOutcome): Promise<void> {
+    if (!infraWrites) return;
+    const scope = {
+      accountId: ctx.accountId,
+      campaignId: o.attribution.matchedCampaignId ?? (ctx.type === 'campaign' ? ctx.id : null),
+    };
+    try {
+      await writeSnapshot(snapshotForScanOutcome(o, scope));
+    } catch (err) {
+      snapshotWriteFailures++;
+      // The code only: summarizeError can embed query arguments (names, paths).
+      const why = reportSnapshotWriteFailure(
+        { fileId: o.file.id, accountId: scope.accountId, source: 'scan' },
+        err,
+      );
+      log(`      ✗ snapshot write failed for ${o.file.name}: ${why}`);
+    }
+  }
+
   // Pool driver: N workers pull files by index; results are applied
   // strictly in file-index order through a serialized promise chain, so
   // every shared-state mutation happens in the same order as a serial run.
@@ -755,6 +797,7 @@ export async function processBatch(
         outcomes[nextApply] = undefined; // claimed — release for GC
         nextApply++;
         await applyOutcome(o);
+        await recordSnapshot(o);
       }
     });
     return applyChain;
@@ -836,6 +879,11 @@ export async function processBatch(
   }
   if (filesRestored > 0) {
     log(`  🔓 ${filesRestored} previously restricted file(s) restored this scan`);
+  }
+  if (snapshotWriteFailures > 0) {
+    log(
+      `  ⚠ ${snapshotWriteFailures} drive_file_snapshots write(s) failed — see the [drive.snapshot] WARN lines; over SNAPSHOT_WRITE_FAILURE_LIMIT the run fails and re-runs`,
+    );
   }
   log('');
 
@@ -1633,5 +1681,6 @@ export async function processBatch(
     synthesized,
     stage3Failures,
     ideaStats: ideaCtx?.stats ?? null,
+    snapshotWriteFailures,
   };
 }

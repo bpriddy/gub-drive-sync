@@ -21,6 +21,7 @@ vi.mock('../../config', () => ({
 
 const { gatherFolders } = await import('../structure');
 const { gatherFilesAuto, gatherFilesRecursive } = await import('../../backfill/discovery');
+const { listSubtreeFiles } = await import('../subtree');
 const {
   FlatListingUnavailableError,
   isListingUnavailableError,
@@ -410,6 +411,25 @@ describe('gatherFilesAuto', () => {
     await gatherFilesAuto(ROOT, LABEL, false);
     expect(logLines).toContain('  Using RECURSIVE walk…');
     expect(listCalls().some((c) => c.params['corpora'] === 'drive')).toBe(false);
+  });
+});
+
+describe('listSubtreeFiles', () => {
+  it('returns the subtree’s folders, the root excluded, as gatherFolders builds them', async () => {
+    asSharedDrive(clientTree());
+    const { files, folders, folderCount } = await listSubtreeFiles(ROOT, LABEL, DRIVE);
+
+    // The tree the file paths were cut from: the index catch-up walks parentId
+    // up it to find the campaign folder that owns a file.
+    expect(folders).toEqual(await gatherFolders(ROOT, LABEL));
+    expect(folders.map((n) => [n.id, n.parentId])).toEqual([
+      ['y26', null],
+      ['launch', 'y26'],
+      ['assets', 'y26'],
+      ['admin', null],
+    ]);
+    expect(folderCount).toBe(folders.length);
+    expect(files).toHaveLength(5);
   });
 });
 
