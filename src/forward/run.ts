@@ -13,6 +13,7 @@
  * never a continuation chain.
  */
 
+import { config } from '../config';
 import { prisma } from '../prisma';
 import { getFileMetadata } from '../drive/client';
 import { isOutsideFolderMap } from '../drive/folder-tree';
@@ -238,6 +239,16 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
     if (outcome.stage3Failures > 0) {
       throw new Error(
         `${outcome.stage3Failures} stage-3 failure(s) — cursor NOT advanced; retry re-runs this window`,
+      );
+    }
+    // A snapshot row that failed to write leaves its file stale in the Drive
+    // name index. The retry re-runs the identical window and writes its rows
+    // again — history is append-only, so every failed attempt leaves one more
+    // row per file (up to the queue's attempts, and again on later runs while
+    // the cursor is held); readers take the latest.
+    if (outcome.snapshotWriteFailures > config.SNAPSHOT_WRITE_FAILURE_LIMIT) {
+      throw new Error(
+        `${outcome.snapshotWriteFailures} snapshot write failure(s) (SNAPSHOT_WRITE_FAILURE_LIMIT=${config.SNAPSHOT_WRITE_FAILURE_LIMIT}) — cursor NOT advanced; retry re-runs this window`,
       );
     }
     filesProcessed = files.length;

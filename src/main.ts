@@ -188,7 +188,9 @@ function parseArgs(argv: string[]): ParsedArgs {
       if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
-      throw new Error('mode=merge-campaign-dupes requires --account-id <uuid> or --account-name <fragment>');
+      throw new Error(
+        'mode=merge-campaign-dupes requires --account-id <uuid> or --account-name <fragment>',
+      );
     }
   }
 
@@ -198,13 +200,20 @@ function parseArgs(argv: string[]): ParsedArgs {
     for (let i = 1; i < positional.length; i++) {
       const arg = positional[i]!;
       if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
-      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
-      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
-      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
-      else if (arg === '--confirm') out.confirm = true;
+      else if (arg === '--account-id') {
+        out.accountId = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--account-name='))
+        out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') {
+        out.accountName = positional[i + 1];
+        i++;
+      } else if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
-      throw new Error('mode=clear-account requires --account-id <uuid> or --account-name <fragment>');
+      throw new Error(
+        'mode=clear-account requires --account-id <uuid> or --account-name <fragment>',
+      );
     }
   }
 
@@ -214,20 +223,32 @@ function parseArgs(argv: string[]): ParsedArgs {
     for (let i = 1; i < positional.length; i++) {
       const arg = positional[i]!;
       if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
-      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
-      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
-      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
-      else if (arg.startsWith('--campaign-name=')) out.campaignName = arg.slice('--campaign-name='.length);
-      else if (arg === '--campaign-name') { out.campaignName = positional[i + 1]; i++; }
-      else if (arg.startsWith('--folder-id=')) out.folderId = arg.slice('--folder-id='.length);
-      else if (arg === '--folder-id') { out.folderId = positional[i + 1]; i++; }
-      else if (arg === '--confirm') out.confirm = true;
+      else if (arg === '--account-id') {
+        out.accountId = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--account-name='))
+        out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') {
+        out.accountName = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--campaign-name='))
+        out.campaignName = arg.slice('--campaign-name='.length);
+      else if (arg === '--campaign-name') {
+        out.campaignName = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--folder-id=')) out.folderId = arg.slice('--folder-id='.length);
+      else if (arg === '--folder-id') {
+        out.folderId = positional[i + 1];
+        i++;
+      } else if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
       throw new Error('mode=extract-ideas requires --account-name <fragment> (or --account-id)');
     }
     if (!out.campaignName && !out.folderId) {
-      throw new Error('mode=extract-ideas requires --campaign-name <name> or --folder-id <drive folder id>');
+      throw new Error(
+        'mode=extract-ideas requires --campaign-name <name> or --folder-id <drive folder id>',
+      );
     }
   }
 
@@ -237,10 +258,15 @@ function parseArgs(argv: string[]): ParsedArgs {
     for (let i = 1; i < positional.length; i++) {
       const arg = positional[i]!;
       if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
-      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
-      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
-      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
-      else if (arg === '--confirm') out.confirm = true;
+      else if (arg === '--account-id') {
+        out.accountId = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--account-name='))
+        out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') {
+        out.accountName = positional[i + 1];
+        i++;
+      } else if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
       throw new Error('mode=derive-pieces requires --account-name <fragment> (or --account-id)');
@@ -429,14 +455,24 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
       // dossier (content-born), reconciled against folder-born pieces.
       // No --confirm = dry-run report; --confirm creates folder-less rows.
       const account = args.accountId
-        ? await prisma.account.findUnique({ where: { id: args.accountId }, select: { id: true, name: true } })
+        ? await prisma.account.findUnique({
+            where: { id: args.accountId },
+            select: { id: true, name: true },
+          })
         : await prisma.account.findFirst({
             where: { name: { contains: args.accountName!, mode: 'insensitive' } },
             select: { id: true, name: true },
           });
       if (!account) throw new Error('account not found');
-      const results = await derivePiecesForAccount({ accountId: account.id, apply: args.confirm ?? false });
-      return { accountName: account.name, apply: args.confirm ?? false, campaigns: results } as unknown as Record<string, unknown>;
+      const results = await derivePiecesForAccount({
+        accountId: account.id,
+        apply: args.confirm ?? false,
+      });
+      return {
+        accountName: account.name,
+        apply: args.confirm ?? false,
+        campaigns: results,
+      } as unknown as Record<string, unknown>;
     }
 
     case 'extract-ideas': {
