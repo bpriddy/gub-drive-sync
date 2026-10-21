@@ -1,5 +1,6 @@
 // Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
 // by every driver (day-walk backfill today; the Activity forward driver next).
+import { logger } from '../logger';
 import { log, rule, fmtMs } from './output';
 
 // ── Phase timing ─────────────────────────────────────────────────────────────
@@ -83,6 +84,25 @@ export function printPhaseSummary(wallClockMs: number): void {
   } else {
     log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}`);
   }
+  printPeakMemory();
+}
+
+/**
+ * Last line of the run summary: the process's peak RSS. It is a PROCESS
+ * high-water mark (the kernel keeps one number per process), not this run's —
+ * one execution can drain several queue rows — so read it as "the most this
+ * job execution has needed so far". Also written as a structured line, so the
+ * peak can be queried and charted without parsing the captured log.
+ */
+function printPeakMemory(): void {
+  const mib = (n: number): number => Math.round(n / 1024 / 1024);
+  const peakRssBytes = process.resourceUsage().maxRSS * 1024; // maxRSS is in KiB
+  const heapUsedBytes = process.memoryUsage().heapUsed;
+  log(
+    `  Peak memory: RSS ${mib(peakRssBytes)} MiB (process high-water mark), ` +
+      `heap used ${mib(heapUsedBytes)} MiB now`,
+  );
+  logger.info({ peakRssBytes, heapUsedBytes }, '[drive.memory] run peak');
 }
 
 /** Fresh timer for a new run (was `phaseTimer = new PhaseTimer()` inline). */

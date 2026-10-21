@@ -6,18 +6,23 @@
  *   - still held while the caller's parser runs (the parser keeps the buffer
  *     alive and builds structures next to it);
  *   - released on every exit, including a throwing parser or a failed fetch.
+ * Large downloads (at or above the heavy threshold) also log one memory line.
  * Downloads are faked at the ./client boundary; budgets are injected.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { downloadMock, cfg } = vi.hoisted(() => ({
+const { downloadMock, infoLog, cfg } = vi.hoisted(() => ({
   downloadMock: vi.fn(),
+  infoLog: vi.fn(),
   cfg: { DOWNLOAD_INFLIGHT_BYTES: 1000, DOWNLOAD_HEAVY_BYTES: 100 },
 }));
 
 vi.mock('../client', () => ({ downloadFileBuffer: downloadMock }));
 vi.mock('../../config', () => ({ config: cfg }));
+vi.mock('../../logger', () => ({
+  logger: { debug: vi.fn(), info: infoLog, warn: vi.fn(), error: vi.fn() },
+}));
 
 import { ByteBudget } from '../download-budget';
 import { downloadBudget, withDownloadedFile } from '../download';
@@ -37,6 +42,7 @@ const newBudget = (): ByteBudget => new ByteBudget({ capacityBytes: 1000, heavyB
 beforeEach(() => {
   downloadMock.mockReset();
   downloadMock.mockResolvedValue(Buffer.from('bytes'));
+  infoLog.mockReset();
 });
 
 describe('withDownloadedFile', () => {
@@ -145,6 +151,99 @@ describe('withDownloadedFile', () => {
     expect(use).not.toHaveBeenCalled();
     expect(budget.inFlightBytes).toBe(0);
     expect(budget.active).toBe(0);
+  });
+});
+
+const LARGE_FILE_LINE = '[drive.memory] large file in memory';
+
+describe('memory telemetry for large downloads', () => {
+  it('logs one line, with process memory, for a download at the heavy threshold', async () => {
+    downloadMock.mockResolvedValue(Buffer.alloc(100));
+
+    await withDownloadedFile({ id: 'big-1', size: 100 }, async () => 'parsed', newBudget());
+
+    expect(infoLog).toHaveBeenCalledTimes(1);
+    const [fields, message] = infoLog.mock.calls[0]!;
+    expect(message).toBe(LARGE_FILE_LINE);
+    expect(fields).toEqual({
+      fileId: 'big-1',
+      bytes: 100,
+      metadataBytes: 100,
+      rssBytes: expect.any(Number),
+      heapUsedBytes: expect.any(Number),
+      heapTotalBytes: expect.any(Number),
+      externalBytes: expect.any(Number),
+      arrayBuffersBytes: expect.any(Number),
+    });
+    for (const key of ['rssBytes', 'heapUsedBytes', 'heapTotalBytes', 'externalBytes']) {
+      expect(fields[key]).toBeGreaterThan(0);
+    }
+    // The 100-byte Buffer is not pooled, so Node counts it under arrayBuffers.
+    expect(fields.arrayBuffersBytes).toBeGreaterThanOrEqual(100);
+  });
+
+  it('logs nothing for a download below the threshold', async () => {
+    downloadMock.mockResolvedValue(Buffer.alloc(99));
+
+    await withDownloadedFile({ id: 'small-1', size: 99 }, async () => 'parsed', newBudget());
+
+    expect(infoLog).not.toHaveBeenCalled();
+  });
+
+  it('goes by the bytes actually received, not by the metadata size', async () => {
+    // Stale listing: metadata says 10 bytes (reserved as a light file), 150 arrive.
+    downloadMock.mockResolvedValueOnce(Buffer.alloc(150));
+    await withDownloadedFile({ id: 'grew', size: 10 }, async () => 0, newBudget());
+    expect(infoLog).toHaveBeenCalledTimes(1);
+    expect(infoLog.mock.calls[0]![0]).toMatchObject({
+      fileId: 'grew',
+      bytes: 150,
+      metadataBytes: 10,
+    });
+
+    // Unknown size (reserved as heavy) but a small download: no line.
+    infoLog.mockReset();
+    downloadMock.mockResolvedValueOnce(Buffer.alloc(20));
+    await withDownloadedFile({ id: 'tiny', size: null }, async () => 0, newBudget());
+    expect(infoLog).not.toHaveBeenCalled();
+  });
+
+  it('writes the line after the transfer and before the parse', async () => {
+    downloadMock.mockResolvedValue(Buffer.alloc(100));
+    let loggedBeforeParse = false;
+
+    await withDownloadedFile(
+      { id: 'big-1', size: 100 },
+      async () => {
+        loggedBeforeParse = infoLog.mock.calls.length === 1;
+      },
+      newBudget(),
+    );
+
+    expect(loggedBeforeParse).toBe(true);
+  });
+
+  it('never touches the buffer after the parser has detached it (as pdf.js does)', async () => {
+    const buf = Buffer.alloc(100);
+    downloadMock.mockResolvedValue(buf);
+    const budget = newBudget();
+
+    await expect(
+      withDownloadedFile(
+        { id: 'big-1', size: 100 },
+        async (b) => {
+          const ab = b.buffer as ArrayBuffer; // Buffer.alloc(): never a SharedArrayBuffer
+          structuredClone(ab, { transfer: [ab] }); // detaches it
+          return 'ok';
+        },
+        budget,
+      ),
+    ).resolves.toBe('ok');
+
+    expect(buf.byteLength).toBe(0);
+    expect(infoLog).toHaveBeenCalledTimes(1);
+    expect(infoLog.mock.calls[0]![0]).toMatchObject({ bytes: 100 }); // read before the detach
+    expect(budget.inFlightBytes).toBe(0);
   });
 });
 

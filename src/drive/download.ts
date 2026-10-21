@@ -15,6 +15,7 @@
  */
 
 import { config } from '../config';
+import { logger } from '../logger';
 import { downloadFileBuffer } from './client';
 import { ByteBudget } from './download-budget';
 
@@ -33,10 +34,33 @@ export function downloadBudget(): ByteBudget {
 }
 
 /**
+ * One line per large download (at or above the heavy threshold), written right
+ * after the transfer, with the process memory at that moment: an OOM can then be
+ * tied to a file and to what the budget let through. `metadataBytes` is the
+ * size the reservation was taken against; far below `bytes` means the listing
+ * was stale and the file was reserved as a light one. Ids and sizes only.
+ */
+function logLargeFile(fileId: string, bytes: number, metadataBytes: number | null): void {
+  const mem = process.memoryUsage();
+  logger.info(
+    {
+      fileId,
+      bytes,
+      metadataBytes,
+      rssBytes: mem.rss,
+      heapUsedBytes: mem.heapUsed,
+      heapTotalBytes: mem.heapTotal,
+      externalBytes: mem.external,
+      arrayBuffersBytes: mem.arrayBuffers,
+    },
+    '[drive.memory] large file in memory',
+  );
+}
+
+/**
  * Download `file` under the byte budget and hand the bytes to `use`. `file.size`
- * is the size from listing / files.get metadata; null (unknown, e.g. a shortcut
- * target) is treated as heavy. `budget` exists for tests; production callers
- * use the process-wide one.
+ * is the size from listing / files.get metadata; null (unknown) is treated as
+ * heavy. `budget` exists for tests; production callers use the process-wide one.
  */
 export async function withDownloadedFile<T>(
   file: { id: string; size: number | null },
@@ -46,6 +70,10 @@ export async function withDownloadedFile<T>(
   const release = await budget.acquire(file.size);
   try {
     const buf = await downloadFileBuffer(file.id);
+    // Measured on the bytes actually received, and before `use`: the PDF parser
+    // detaches the buffer it is handed, so `buf` must not be read after that.
+    const bytes = buf.byteLength;
+    if (bytes >= budget.heavyBytes) logLargeFile(file.id, bytes, file.size);
     return await use(buf);
   } finally {
     release();
