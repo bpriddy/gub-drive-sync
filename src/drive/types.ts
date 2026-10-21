@@ -61,6 +61,10 @@ export interface ExtractionSkip {
      *  size, and downloading a multi-hundred-MB binary just to discover
      *  it exceeds the cap is the OOM vector we're guarding. */
     | 'shortcut_unverified_size'
+    /** A Google-native Doc/Sheet/Slides whose walked text is longer than
+     *  NATIVE_MAX_CHARS. Native reads have no byte size to check before the
+     *  fetch, so this is decided after the walk, from the text itself. */
+    | 'too_many_chars'
     | 'empty'
     | 'delta_unchanged';
   detail?: string;

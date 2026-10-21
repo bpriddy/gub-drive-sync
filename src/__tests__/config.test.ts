@@ -1,6 +1,7 @@
 /**
- * Env validation for the download budget settings (DOWNLOAD_INFLIGHT_BYTES /
- * DOWNLOAD_HEAVY_BYTES). `config.ts` runs loadConfig() at import, so the one
+ * Env validation for the memory-bound settings: the download budget
+ * (DOWNLOAD_INFLIGHT_BYTES / DOWNLOAD_HEAVY_BYTES) and the native character cap
+ * (NATIVE_MAX_CHARS). `config.ts` runs loadConfig() at import, so the one
  * required variable is set before the module loads; each test then calls
  * loadConfig() itself against a controlled environment.
  */
@@ -14,7 +15,7 @@ vi.hoisted(() => {
 import { loadConfig } from '../config';
 
 const MIB = 1024 * 1024;
-const KEYS = ['DOWNLOAD_INFLIGHT_BYTES', 'DOWNLOAD_HEAVY_BYTES'] as const;
+const KEYS = ['DOWNLOAD_INFLIGHT_BYTES', 'DOWNLOAD_HEAVY_BYTES', 'NATIVE_MAX_CHARS'] as const;
 const saved: Record<string, string | undefined> = {};
 
 beforeEach(() => {
@@ -73,5 +74,23 @@ describe('download budget settings', () => {
     delete process.env['DOWNLOAD_INFLIGHT_BYTES'];
     process.env['DOWNLOAD_HEAVY_BYTES'] = bad;
     expect(() => loadConfig()).toThrow(/DOWNLOAD_HEAVY_BYTES/);
+  });
+});
+
+describe('NATIVE_MAX_CHARS', () => {
+  it('defaults to 2,000,000 characters', () => {
+    expect(loadConfig().NATIVE_MAX_CHARS).toBe(2_000_000);
+  });
+
+  it('parses an override, and treats an empty string as unset', () => {
+    process.env['NATIVE_MAX_CHARS'] = '500000';
+    expect(loadConfig().NATIVE_MAX_CHARS).toBe(500_000);
+    process.env['NATIVE_MAX_CHARS'] = '';
+    expect(loadConfig().NATIVE_MAX_CHARS).toBe(2_000_000);
+  });
+
+  it.each(['0', '-1', '1.5', 'abc', '1e300'])('rejects %j', (bad) => {
+    process.env['NATIVE_MAX_CHARS'] = bad;
+    expect(() => loadConfig()).toThrow(/NATIVE_MAX_CHARS/);
   });
 });

@@ -51,6 +51,17 @@ const EnvSchema = z.object({
     .default('52428800')
     .transform(Number)
     .pipe(z.number().int().safe().min(1)),
+  // Google-native files (Docs/Sheets/Slides) have no byte size to check before
+  // the read, so their cap is on the extracted TEXT: a file whose walked text is
+  // longer than this is skipped (skip_reason 'too_many_chars'), not truncated.
+  // 2M characters is far above real documents (an 825k-character sheet has been
+  // seen). It bounds what goes on to hashing, the LLM stage and the DB; the API
+  // response itself is already in memory by the time the walker returns.
+  NATIVE_MAX_CHARS: z
+    .string()
+    .default('2000000')
+    .transform(Number)
+    .pipe(z.number().int().safe().min(1)),
   DRIVE_PROPOSAL_TTL_DAYS: z.string().default('14').transform(Number),
 
   // ── AI / Gemini ──────────────────────────────────────────────────────────

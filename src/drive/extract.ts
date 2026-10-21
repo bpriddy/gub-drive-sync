@@ -3,7 +3,8 @@
  *
  * Given a TraversedFile, return an ExtractionOutcome:
  *   - { kind: 'ok', text, contentHash, extractor } for supported files
- *   - { kind: 'skip', reason } for folders, unsupported mime, oversized, or empty
+ *   - { kind: 'skip', reason } for folders, unsupported mime, oversized, empty,
+ *     or a Google-native file whose text is over NATIVE_MAX_CHARS
  *
  * Skip reasons route to drive_scan_logs with the matching category.
  *
@@ -105,6 +106,34 @@ function ok(text: string, extractor: string): ExtractionOutcome {
   return { kind: 'ok', text: trimmed, contentHash: hash(trimmed), extractor };
 }
 
+/**
+ * Character guard for the Google-native walkers. They have no byte size to
+ * check before the read — the API returns the whole structure — so the cap is
+ * on the walked text: over NATIVE_MAX_CHARS the file is skipped (not
+ * truncated) and logged. This bounds what goes on to hashing, the LLM stage
+ * and the DB, NOT the API response, which is already in memory when the walker
+ * returns.
+ */
+function nativeOutcome(
+  text: string,
+  extractor: 'gdoc' | 'gslides' | 'gsheet',
+  fileId: string,
+): ExtractionOutcome {
+  const limit = config.NATIVE_MAX_CHARS;
+  if (text.length > limit) {
+    logger.warn(
+      { fileId, extractor, chars: text.length, limit },
+      '[drive.extract] native text over NATIVE_MAX_CHARS — skipped',
+    );
+    return {
+      kind: 'skip',
+      reason: 'too_many_chars',
+      detail: `extractor=${extractor} chars=${text.length} limit=${limit}`,
+    };
+  }
+  return ok(text, extractor);
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -113,7 +142,9 @@ function ok(text: string, extractor: string): ExtractionOutcome {
  * dedicated APIs that return structured content — no full-file byte
  * transfer happens, so the cost is content-window-truncation (handled
  * downstream in interpret.ts) rather than transfer/memory. A 300 MB
- * Google Slides deck is API-traversed, not downloaded.
+ * Google Slides deck is API-traversed, not downloaded. What those walkers
+ * return is capped separately, by characters (NATIVE_MAX_CHARS, see
+ * nativeOutcome).
  */
 function tooLargeForBinaryDownload(file: TraversedFile): ExtractionSkip | null {
   if (file.size && file.size > config.DRIVE_MAX_FILE_SIZE_BYTES) {
@@ -176,7 +207,8 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
   }
 
   switch (effective.mimeType) {
-    // Google-native: API-traversed, no size cap.
+    // Google-native: API-traversed, no size cap here (the character guard
+    // needs the walked text, so it can't be predicted from metadata).
     case MIME.GOOGLE_DOC:
     case MIME.GOOGLE_SLIDES:
     case MIME.GOOGLE_SHEET:
@@ -242,14 +274,23 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
 
   try {
     switch (effectiveFile.mimeType) {
-      // ── Google-native: API-traversed, NO size cap. Content-window
+      // ── Google-native: API-traversed, NO byte size cap; the walked text is
+      //    capped by NATIVE_MAX_CHARS (nativeOutcome). Content-window
       //    truncation handled downstream by GEMINI_MAX_INPUT_CHARS.
       case MIME.GOOGLE_DOC:
-        return ok(await extractGoogleDoc(effectiveFile.id), 'gdoc');
+        return nativeOutcome(await extractGoogleDoc(effectiveFile.id), 'gdoc', effectiveFile.id);
       case MIME.GOOGLE_SLIDES:
-        return ok(await extractGoogleSlides(effectiveFile.id), 'gslides');
+        return nativeOutcome(
+          await extractGoogleSlides(effectiveFile.id),
+          'gslides',
+          effectiveFile.id,
+        );
       case MIME.GOOGLE_SHEET:
-        return ok(await extractGoogleSheets(effectiveFile.id), 'gsheet');
+        return nativeOutcome(
+          await extractGoogleSheets(effectiveFile.id),
+          'gsheet',
+          effectiveFile.id,
+        );
 
       // ── Binary downloads: size cap already checked in predictExtractionSkip.
       //    Each branch downloads and parses inside withDownloadedFile's byte

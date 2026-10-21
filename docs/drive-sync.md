@@ -261,7 +261,9 @@ For every file in the day's bucket:
 
 1. **Extract** (`src/drive/extract.ts`): pull content from Drive.
    - Google-native (Docs/Slides/Sheets): per-type Workspace API. Returns
-     structured-but-flat text.
+     structured-but-flat text. No byte cap (nothing is downloaded); the
+     walked text is capped by `NATIVE_MAX_CHARS` and a longer one is
+     skipped with `too_many_chars` (the API response itself is not bounded).
    - Binary (PDF/DOCX/PPTX/text/*): `downloadFileBuffer` + per-type
      parser. Size cap (`DRIVE_MAX_FILE_SIZE_BYTES`, default 300MB).
      Downloads and their parse run under a byte-weighted budget
@@ -506,6 +508,7 @@ Environment variables consumed at runtime by gub-drive-sync. Defined in
 | `DRIVE_MAX_FILE_SIZE_BYTES` | 314572800 (300MB) | Binary download cap. Google-native bypasses. |
 | `DOWNLOAD_INFLIGHT_BYTES` | 629145600 (600MiB) | Most bytes of binary downloads (fetch + parse) in flight at once; sized from file metadata. |
 | `DOWNLOAD_HEAVY_BYTES` | 52428800 (50MiB) | A file at or above this size, or of unknown size, runs alone. Must not exceed `DOWNLOAD_INFLIGHT_BYTES` (boot fails otherwise). |
+| `NATIVE_MAX_CHARS` | 2000000 | Google-native Docs/Sheets/Slides have no byte size to check, so their walked text is capped instead: over it the file is skipped (`too_many_chars`), not truncated. |
 | `SYNTH_CONCURRENCY` | 8 | Per-entity worker pool size for distill+synth. |
 | `GCP_PROJECT_ID` / `GCP_REGION` / `DRIVE_SYNC_JOB_NAME` | — | Required for `scheduleContinuation` to fire fresh Job executions. |
 
