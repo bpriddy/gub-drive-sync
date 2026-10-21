@@ -111,9 +111,9 @@ Bootstrap chunks 2..N reuse the cached structure and file list by design; #65 do
 |---|---|---|
 | Move inside the subtree | Next gather sees the new place. Folder moves change the fingerprint → re-classify. Forward path uses the fresh map. | Same. The map is fresh per run. |
 | Rename | New name. A folder rename rewrites descendant paths and the fingerprint → re-classify. | Same. |
-| Move out of the subtree | No signal. The item is absent from the next walk. Forward: if Activity reports it, its parent is not in the map, so it gets path `<account> / name`, is attributed to the account, and is scanned as if inside. | Listing: counted as `out_of_scope`. For an in-drive root that is everything else in the drive, a size figure, not a move signal. Forward (D4): changed files whose parent is not in the map are counted and logged; behaviour is otherwise unchanged and there is no tombstone. |
+| Move out of the subtree | No signal. The item is absent from the next walk. Forward: if Activity reports it, its parent is not in the map, so it gets path `<account> / name`, is attributed to the account, and is scanned as if inside. | Listing: counted as `out_of_scope`. For an in-drive root that is everything else in the drive, a size figure, not a move signal. Forward (H3-4): changed files whose parent is not in the map are counted and logged; behaviour is otherwise unchanged and there is no tombstone. |
 | Orphan (parent not visible) | Walk: unreachable, so never listed. Flat drive root: `buildTreeFromFlat` drops orphan folders silently; `listSharedDriveFiles` keeps orphan files (no subtree filter). | Counted as `orphans`. In-drive: excluded, the same as the walk. Drive-root files: still kept, now counted. |
-| Multi-parent (legacy) | Flat: `parents[0]` + visited set. Walks: **no visited set**, so a multi-parent folder's subtree is listed once per parent (duplicate nodes and files). My Drive only. | Flat: `parents[0]`, counted as `multi_parent` (expect 0). My Drive stays recursive and unchanged (D7). |
+| Multi-parent (legacy) | Flat: `parents[0]` + visited set. Walks: **no visited set**, so a multi-parent folder's subtree is listed once per parent (duplicate nodes and files). My Drive only. | Flat: `parents[0]`, counted as `multi_parent` (expect 0). My Drive stays recursive and unchanged (H3-7). |
 | Depth cap (100) | Walks stop below depth 101 (`onDepthCap`). `buildTreeFromFlat` caps folders the same way. `listSharedDriveFiles` ignores depth. | Same caps as the walk, files included (invariant 4); counted as `depth_cap`. Drive-root files unchanged. |
 | Shortcuts | Listed as files with `shortcutTarget`. Folder shortcuts are not descended (mime is not folder) and are not in the folder listings. Targets outside the tree are followed by the extractor. | Same. Shortcuts are non-folder items whose parent is in scope. |
 | Trashed | Excluded by `q`; descendants of a trashed folder are unreachable. | Excluded by `q`; descendants carry `trashed = true` (invariant 6). |
@@ -183,14 +183,14 @@ reads a live Drive, so it needs a go (`--all --probe-only`, §7).
 
 - **R1. `corpora=drive` visibility.** The bot may have access to a folder inside a shared drive
   without being a member of the drive. The docs say `corpora=drive` "queries all items in the
-  specified shared drive" but do not say what a non-member gets. Mitigation (D1): fall back to
+  specified shared drive" but do not say what a non-member gets. Mitigation (H3-1): fall back to
   the recursive walk, with a new log line, on a 404, on a 403 whose reasons name no limit or
   quota, or on a listing that does not contain the root. A partial listing that does contain the
   root is safe, because the walk sees only what the bot can read too.
 - **R2. Cost scales with the drive, not the subtree.** The flat cost is `ceil(drive items / 1000)`.
   A small root inside a huge drive can cost more than its walk (`subtree folders + 1`). For folders
   this needs a drive more than 1000× the subtree. For files it is likelier. The worst case is
-  bounded by the shared-drive cap of 500,000 items (~500 pages). D6.
+  bounded by the shared-drive cap of 500,000 items (~500 pages). H3-6.
 - **R3. All-or-nothing errors.** One failed page fails the gather, where the walk skipped one
   subfolder. That is arguably safer: a silently partial tree changes the fingerprint and triggers a
   paid re-classify on a wrong map. Mitigation: wrap each page of the new listings in
@@ -274,7 +274,7 @@ One commit per item, after a formatting-only commit (prettier on the four touche
 
 **Prepared, not run (needs a go):** `npm run probe-drive-listing -- --account-id <id> [--probe-only]`,
 and `--all --probe-only` for the root-shape census (§5).
-- It runs the production listing code and prints page counts, per-page latency (p50 / p95 / max)
+- It runs the production listing code and prints the folder sweep's page count, the wall time of each phase
   and the counters; never a name or an id.
 - It measures both production paths, the forward folder sweep and the file discovery (which lists
   the folders again): about 1 + 2 × ceil(folders / 1000) + ceil(files / 1000) calls per account,
@@ -293,23 +293,23 @@ Expected calls:
 
 ## 8. Decisions taken
 
-- **D1.** A refused drive listing falls back to the walk, for folders inside a drive only.
-- **D2.** `createdTime` and `lastModifyingUser` stay; `version,md5Checksum` are added and carried.
+- **H3-1.** A refused drive listing falls back to the walk, for folders inside a drive only.
+- **H3-2.** `createdTime` and `lastModifyingUser` stay; `version,md5Checksum` are added and carried.
   `trashed` is not requested: under `q: trashed = false` it is always false.
-- **D3.** The drive-root bootstrap keeps `path = name`. `listSubtreeFiles` gives #66 breadcrumbs for
+- **H3-3.** The drive-root bootstrap keeps `path = name`. `listSubtreeFiles` gives #66 breadcrumbs for
   any root, the drive root included.
-- **D4.** The forward counter is in, log only.
-- **D5.** Based on `origin/main`. The prettier commit is byte-identical to the forward-reliability
+- **H3-4.** The forward counter is in, log only.
+- **H3-5.** Based on `origin/main`. The prettier commit is byte-identical to the forward-reliability
   branch's for the shared files.
-- **D6.** Always flat for roots inside a drive; the counters and the probe show the cost.
-- **D7.** The recursive walks still have no visited set (My Drive only); out of scope.
+- **H3-6.** Always flat for roots inside a drive; the counters and the probe show the cost.
+- **H3-7.** The recursive walks still have no visited set (My Drive only); out of scope.
 
 ## 9. Where the code and the issue disagree
 
 - "the existing visited set already prevents loops": only `buildTreeFromFlat`, `buildAttributor` and
   `isInsideFolder` have one. `walkFoldersRecursive` and `traverseFolder` do not.
-- The issue's field list omits `createdTime` and `lastModifyingUser`, which the code needs (D2).
+- The issue's field list omits `createdTime` and `lastModifyingUser`, which the code needs (H3-2).
 - "A file moved out of the root's subtree increments an out of scope counter": a fresh listing cannot
   tell "moved out" from "never in". On the listing, `out_of_scope` measures the rest of the drive; a
-  move-out shows only in the forward path (D4).
+  move-out shows only in the forward path (H3-4).
 - `listSharedDriveFiles`' `maxFiles` option has no caller.
