@@ -76,10 +76,13 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 
 /** Reserved bytes seen by each fake parser at the moment it runs. */
 let atParse: number[];
+/** Reserved bytes seen by the fake pdf.js document when it is destroyed. */
+let atDestroy: number[];
 const reservedNow = (): number => downloadBudget().inFlightBytes;
 
 beforeEach(() => {
   atParse = [];
+  atDestroy = [];
   downloadMock.mockReset();
   downloadMock.mockResolvedValue(Buffer.from('file bytes'));
   debugLog.mockReset();
@@ -96,7 +99,11 @@ beforeEach(() => {
   getDocumentProxy.mockReset();
   getDocumentProxy.mockImplementation(async () => {
     atParse.push(reservedNow());
-    return {};
+    return {
+      destroy: async () => {
+        atDestroy.push(reservedNow());
+      },
+    };
   });
   pdfExtractText.mockReset();
   pdfExtractText.mockResolvedValue({ text: 'pdf text' });
@@ -131,6 +138,21 @@ describe('extractText binary branches go through the download budget', () => {
   it.each(branches)('%s: an unknown size counts as heavy', async (_n, mime) => {
     await extractText(file(mime, null));
     expect(atParse).toEqual([1000]);
+  });
+
+  it('PDF: destroys the document while the reservation is still held', async () => {
+    await extractText(file(MIME_PDF, 60));
+    expect(atDestroy).toEqual([60]);
+    expect(reservedNow()).toBe(0);
+  });
+
+  it('PDF: destroys the document when text extraction throws', async () => {
+    pdfExtractText.mockRejectedValue(new Error('bad xref'));
+
+    await expect(extractText(file(MIME_PDF, 60))).rejects.toThrow('bad xref');
+
+    expect(atDestroy).toEqual([60]);
+    expect(reservedNow()).toBe(0);
   });
 
   it('text/*: reserves the size around the download', async () => {

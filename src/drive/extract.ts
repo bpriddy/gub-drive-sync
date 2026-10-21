@@ -275,10 +275,30 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
           // with harmless TrueType-font notes like "TT: undefined
           // function: 32" — those don't affect text extraction but
           // drown out real signal. verbosity: 0 = ERRORS only.
+          //
+          // The bytes go in as a VIEW over the download, not as
+          // `new Uint8Array(buf)`, which copies the whole file next to the
+          // original. How the pdf.js bundled in unpdf 1.6.2 treats `data`
+          // (its getDataProp): it throws on a Node Buffer; it uses a
+          // Uint8Array as-is only when it covers its whole ArrayBuffer, and
+          // copies any other view. A large download owns its ArrayBuffer (Node
+          // pools only Buffers under Buffer.poolSize / 2 = 4 KiB), so the view
+          // is used without a copy; a small pooled Buffer is a slice of the
+          // shared pool, which pdf.js copies itself, so it never owns the pool.
+          // pdf.js also TRANSFERS the ArrayBuffer it is given to its worker
+          // side, which detaches `buf`: do not read `buf` after this call.
           const { getDocumentProxy, extractText } = await import('unpdf');
-          const pdf = await getDocumentProxy(new Uint8Array(buf), { verbosity: 0 });
-          const { text } = await extractText(pdf, { mergePages: true });
-          return ok(text, 'pdf');
+          const view = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+          const pdf = await getDocumentProxy(view, { verbosity: 0 });
+          // Destroy the document before the reservation is released: pdf.js
+          // keeps the transferred bytes alive until then, which would put the
+          // file's memory outside the budget until the next PDF replaces it.
+          try {
+            const { text } = await extractText(pdf, { mergePages: true });
+            return ok(text, 'pdf');
+          } finally {
+            await pdf.destroy();
+          }
         });
       case MIME.DOCX:
         return await withDownloadedFile(effectiveFile, async (buf) => {
