@@ -10,7 +10,6 @@ import { ymdFromDate } from './days';
 
 // ── Entity ───────────────────────────────────────────────────────────────────
 
-
 export async function loadEntity(args: Args): Promise<EntityCtx> {
   if (args.accountId) {
     const a = await prisma.account.findUniqueOrThrow({

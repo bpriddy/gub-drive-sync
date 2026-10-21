@@ -61,9 +61,7 @@ export function printPhaseSummary(wallClockMs: number): void {
   if (rows.length === 0) return;
   log('');
   log(rule('Phase timing (this scan)'));
-  const labelWidth = Math.max(
-    ...rows.map((r) => (PHASE_LABELS[r.phase] ?? r.phase).length),
-  );
+  const labelWidth = Math.max(...rows.map((r) => (PHASE_LABELS[r.phase] ?? r.phase).length));
   const timeWidth = Math.max(...rows.map((r) => fmtMs(r.ms).length));
   for (const r of rows) {
     const label = (PHASE_LABELS[r.phase] ?? r.phase).padEnd(labelWidth);
@@ -74,15 +72,18 @@ export function printPhaseSummary(wallClockMs: number): void {
     log(`  ${label}   ${t}   ${bar}  ${pct}`);
   }
   log('  ' + '─'.repeat(labelWidth + 3 + timeWidth + 3 + 20 + 2 + 4));
-  log(`  ${'Instrumented total'.padEnd(labelWidth)}   ${fmtMs(instrumentedMs).padStart(timeWidth)}`);
+  log(
+    `  ${'Instrumented total'.padEnd(labelWidth)}   ${fmtMs(instrumentedMs).padStart(timeWidth)}`,
+  );
   const untracked = wallClockMs - instrumentedMs;
   if (untracked > 0) {
-    log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}   (un-instrumented: ${fmtMs(untracked)})`);
+    log(
+      `  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}   (un-instrumented: ${fmtMs(untracked)})`,
+    );
   } else {
     log(`  ${'Wall-clock total'.padEnd(labelWidth)}   ${fmtMs(wallClockMs).padStart(timeWidth)}`);
   }
 }
-
 
 /** Fresh timer for a new run (was `phaseTimer = new PhaseTimer()` inline). */
 export function resetPhaseTimer(): void {

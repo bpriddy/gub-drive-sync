@@ -71,10 +71,7 @@ export function isRateLimitError(err: unknown): boolean {
   // Reasons that mean "rate-limited, try again." Other 403s (auth, perms)
   // are NOT retryable and should propagate immediately.
   return reasons.some(
-    (r) =>
-      r === 'userRateLimitExceeded' ||
-      r === 'rateLimitExceeded' ||
-      r === 'quotaExceeded',
+    (r) => r === 'userRateLimitExceeded' || r === 'rateLimitExceeded' || r === 'quotaExceeded',
   );
 }
 
@@ -406,9 +403,7 @@ export async function listSharedDriveFiles(
  * that has had sufficient effort spent on it and propagates — callers
  * decide whether to lose the file or fail the run.
  */
-export async function getFileMetadata(
-  fileId: string,
-): Promise<drive_v3.Schema$File | null> {
+export async function getFileMetadata(fileId: string): Promise<drive_v3.Schema$File | null> {
   const client = await driveClient();
   try {
     const res = await withTransientRetry(() =>
@@ -433,10 +428,7 @@ export async function getFileMetadata(
 export async function downloadFileBuffer(fileId: string): Promise<Buffer> {
   const client = await driveClient();
   const res = await driveLimiter.run(() =>
-    client.files.get(
-      { fileId, alt: 'media', supportsAllDrives: true },
-      { responseType: 'stream' },
-    ),
+    client.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' }),
   );
   return streamToBuffer(res.data as Readable);
 }
@@ -573,10 +565,7 @@ function isPageTokenExpired(err: unknown): boolean {
  * folder shape (3–5 levels deep). If trees get truly deep, add a parent-id
  * cache.
  */
-export async function isInsideFolder(
-  fileId: string,
-  rootFolderId: string,
-): Promise<boolean> {
+export async function isInsideFolder(fileId: string, rootFolderId: string): Promise<boolean> {
   if (fileId === rootFolderId) return true;
   const client = await driveClient();
   const visited = new Set<string>();

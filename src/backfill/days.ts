@@ -77,9 +77,7 @@ export function groupFilesByDate(files: TraversedFile[]): DayBucket[] {
     else byDate.set(date, [f]);
   }
   if (bogusBumped > 0) {
-    log(
-      `  ⚠ ${bogusBumped} file(s) had modifiedTime < createdTime — bumped to createdTime`,
-    );
+    log(`  ⚠ ${bogusBumped} file(s) had modifiedTime < createdTime — bumped to createdTime`);
   }
   return Array.from(byDate.entries())
     .map(([date, files]) => ({ date, files }))
@@ -154,15 +152,15 @@ export interface BootstrapFilesCache {
   activeDates: DayBucket[];
 }
 
-export function structureFingerprint(folders: Array<{ id: string; name: string; parentId: string | null }>): string {
+export function structureFingerprint(
+  folders: Array<{ id: string; name: string; parentId: string | null }>,
+): string {
   // Sort by id for determinism, then JSON-stringify a minimal canonical
   // form. Same folders → same hash regardless of API return order.
   const canonical = folders
     .map((f) => ({ id: f.id, name: f.name, parentId: f.parentId }))
     .sort((a, b) => a.id.localeCompare(b.id));
-  return createHash('sha256')
-    .update(JSON.stringify(canonical))
-    .digest('hex');
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
 export async function persistStructureCache(
