@@ -1,9 +1,6 @@
 // Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
 // by every driver (day-walk backfill today; the Activity forward driver next).
-import type {
-  AccountCurrentState,
-  CampaignCurrentState,
-} from '../drive/schema';
+import type { AccountCurrentState, CampaignCurrentState } from '../drive/schema';
 import type { CampaignObservation } from '../drive/interpret';
 import type { EntityMap } from '../drive/structure';
 import type { IdeaScanStats } from '../drive/idea-scan';

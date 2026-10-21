@@ -170,7 +170,9 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   let activeDates: DayBucket[];
   const cachedFiles = ctx.driveBootstrapFiles as BootstrapFilesCache | null;
   if (cachedFiles && cachedFiles.files && cachedFiles.activeDates) {
-    log(`  ✓ Files cache HIT  (${cachedFiles.files.length} files, ${cachedFiles.activeDates.length} active days)`);
+    log(
+      `  ✓ Files cache HIT  (${cachedFiles.files.length} files, ${cachedFiles.activeDates.length} active days)`,
+    );
     log(`    Skipping ~3 min file discovery + grouping.`);
     allFiles = cachedFiles.files;
     activeDates = cachedFiles.activeDates;
@@ -215,7 +217,9 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       log(`  ✓ Files cache WRITTEN  (${allFiles.length} files)`);
     }
   }
-  log(`  Active days: ${activeDates.length}  (${activeDates[0]!.date} → ${activeDates[activeDates.length - 1]!.date})`);
+  log(
+    `  Active days: ${activeDates.length}  (${activeDates[0]!.date} → ${activeDates[activeDates.length - 1]!.date})`,
+  );
   log('');
 
   if (args.dryrun) {
@@ -248,7 +252,9 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
   let filesProcessed = 0;
   const effectiveCursor: string | null = ctx.driveBootstrapCursor;
   const initialCursor = effectiveCursor;
-  log(`  Cursor (accounts.drive_bootstrap_cursor): ${effectiveCursor ?? 'none — starting from earliest active day'}`);
+  log(
+    `  Cursor (accounts.drive_bootstrap_cursor): ${effectiveCursor ?? 'none — starting from earliest active day'}`,
+  );
   log('');
 
   let finalCursor: string | null = effectiveCursor;
@@ -265,12 +271,14 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
     // signals to the queue and UI that bootstrap is done. Cursor stays
     // at the last processed day (or null if the drive was empty).
     if (!args.dryrun && effectiveCursor) {
-      await timed('persist_cursor', () =>
-        persistCursor(ctx.accountId, effectiveCursor, true),
-      );
+      await timed('persist_cursor', () => persistCursor(ctx.accountId, effectiveCursor, true));
     }
   } else {
-    log(rule(`Scan: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`));
+    log(
+      rule(
+        `Scan: ${nextDay.date}  (${nextDay.files.length} file${nextDay.files.length === 1 ? '' : 's'})`,
+      ),
+    );
     filesProcessed = nextDay.files.length;
 
     log('');
@@ -291,7 +299,9 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
 
     // ── Print synthesized status_markdowns for this scan ──────────────
     log('');
-    log(`  ── Synthesized (${outcome.synthesized.length} entit${outcome.synthesized.length === 1 ? 'y' : 'ies'}) ──`);
+    log(
+      `  ── Synthesized (${outcome.synthesized.length} entit${outcome.synthesized.length === 1 ? 'y' : 'ies'}) ──`,
+    );
     if (outcome.synthesized.length === 0) {
       log('     (no entities synthesized this scan)');
     }

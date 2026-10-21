@@ -98,9 +98,7 @@ export function loadConfig(): Config {
   }
   const parsed = EnvSchema.safeParse(cleaned);
   if (!parsed.success) {
-    const errors = parsed.error.errors
-      .map((e) => `  ${e.path.join('.')}: ${e.message}`)
-      .join('\n');
+    const errors = parsed.error.errors.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
     throw new Error(`Environment configuration invalid:\n${errors}`);
   }
   return parsed.data;
