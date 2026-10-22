@@ -28,7 +28,7 @@ The first time an account starts collecting Drive knowledge.
 
 - Account exists in DB with a non-NULL `drive_folder_id` (set via
   gub-admin's Data Sources page).
-- Bot user (`bot.clientdrives@anomaly.com`) has been shared on the
+- Bot user (`<drive-bot>@<workspace-domain>`) has been shared on the
   account's Drive folder with at least Viewer/Commenter access.
 - Bot's OAuth scopes include:
   - `drive.readonly`
@@ -443,7 +443,7 @@ applied before pushing the others.
 
 ### Cloud Run Job config
 
-`cloudbuild/dev.yaml`:
+`.github/workflows/deploy.yml` (the dev `FLAGS`):
 
 ```yaml
 - --tasks=1
@@ -495,7 +495,7 @@ then re-deploy (Cloud Run picks up `:latest`).
 
 ## Bot OAuth
 
-The bot user (`bot.clientdrives@anomaly.com`) holds an OAuth refresh
+The bot user (`<drive-bot>@<workspace-domain>`) holds an OAuth refresh
 token in the `bot_credentials` table. Operations:
 
 - **Initial grant / re-grant**: gub-admin Settings → Bot Credentials.
@@ -504,7 +504,7 @@ token in the `bot_credentials` table. Operations:
   `BOT_SCOPES.drive` array AND the GCP OAuth consent screen (Data
   Access). Then re-grant the bot through gub-admin UI.
 - **Share the bot on a new Drive folder**: from the Drive UI, add
-  `bot.clientdrives@anomaly.com` as Viewer (Commenter for stricter
+  `<drive-bot>@<workspace-domain>` as Viewer (Commenter for stricter
   visibility).
 
 ---

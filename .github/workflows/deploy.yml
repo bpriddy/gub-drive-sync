@@ -5,11 +5,15 @@
 # Auth is Workload Identity Federation (OIDC) — no service-account keys.
 # Required GitHub repository variables: GCP_REGION, GCP_PROJECT_ID,
 # GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT_EMAIL.
-# Required secret: GH_PACKAGES_TOKEN (read:packages).
+# Required secrets: GH_PACKAGES_TOKEN (read:packages), and for dev
+# DRIVE_ROOT_FOLDER_ID_DEV, GUB_ADMIN_BASE_URL_DEV, GUB_REVIEW_BASE_URL_DEV:
+# deployment identifiers stay out of this file and are masked in run logs.
+# The deploy fails before touching anything when one is unset.
 #
 # THIS WORKFLOW IS THE SINGLE SOURCE OF TRUTH FOR RUNTIME CONFIG (the FLAGS
-# array below). cloudbuild/<env>.yaml files are frozen provisioning/history
-# references; their Cloud Build triggers are disabled (CD cutover 2026-08-28).
+# array below). cloudbuild/staging.yaml and prod.yaml are frozen provisioning
+# references; their Cloud Build triggers are disabled (CD cutover 2026-08-28)
+# and the dev one is retired with cloudbuild/dev.yaml.
 # Only dev is ported — staging/prod arms fail loudly until provisioned.
 
 name: Deploy
@@ -83,9 +87,25 @@ jobs:
 
       # Unported environments fail HERE, before anything is touched.
       - name: Resolve environment config
+        env:
+          DRIVE_ROOT_FOLDER_ID_DEV: ${{ secrets.DRIVE_ROOT_FOLDER_ID_DEV }}
+          GUB_ADMIN_BASE_URL_DEV: ${{ secrets.GUB_ADMIN_BASE_URL_DEV }}
+          GUB_REVIEW_BASE_URL_DEV: ${{ secrets.GUB_REVIEW_BASE_URL_DEV }}
         run: |
           case "$ENVIRONMENT" in
-            dev) ;;
+            dev)
+              for name in DRIVE_ROOT_FOLDER_ID_DEV GUB_ADMIN_BASE_URL_DEV GUB_REVIEW_BASE_URL_DEV; do
+                if [ -z "${!name}" ]; then
+                  echo "::error::repository secret $name is not set; see the header of this workflow."
+                  exit 1
+                fi
+              done
+              {
+                echo "DRIVE_ROOT_FOLDER_ID=$DRIVE_ROOT_FOLDER_ID_DEV"
+                echo "GUB_ADMIN_BASE_URL=$GUB_ADMIN_BASE_URL_DEV"
+                echo "GUB_REVIEW_BASE_URL=$GUB_REVIEW_BASE_URL_DEV"
+              } >> "$GITHUB_ENV"
+              ;;
             *)
               echo "::error::environment '$ENVIRONMENT' is not ported to this workflow — cloudbuild/$ENVIRONMENT.yaml is the provisioning reference (note: prod differs — 1Gi memory, MAIL_DRIVER=mailgun)."
               exit 1
@@ -112,7 +132,8 @@ jobs:
           docker push --all-tags "$IMAGE"
           echo "IMAGE_URI=$IMAGE:$SHORT_SHA" >> "$GITHUB_ENV"
 
-      # FLAGS = the ported cloudbuild/dev.yaml args, verbatim. The container
+      # FLAGS = the dev runtime config (ported from the retired cloudbuild
+      # dev config; identifiers come from repository secrets). The container
       # entrypoint is the runner — no --command/--args, deliberately.
       - name: Update Cloud Run job
         run: |
@@ -127,7 +148,7 @@ jobs:
                 --cpu=1
                 "--service-account=$RUNTIME_SA"
                 "--set-cloudsql-instances=$CLOUDSQL"
-                "--set-env-vars=NODE_ENV=production,GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=$REGION,DRIVE_SYNC_JOB_NAME=$JOB,DRIVE_ROOT_FOLDER_ID=1kW8WUNh14AONTI5k9CcypS9uMX3Bou0V,DRIVE_DELAY_BETWEEN_ACCOUNTS_MS=5000,DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS=2000,DRIVE_MAX_FILE_SIZE_BYTES=314572800,DRIVE_PROPOSAL_TTL_DAYS=14,GEMINI_MAX_INPUT_CHARS=40000,MAIL_DRIVER=console,MAIL_FROM_NAME=GUB,MAILGUN_REGION=us,GUB_ADMIN_BASE_URL=https://gub-admin-dev-843516467880.us-central1.run.app,GUB_REVIEW_BASE_URL=https://gub-review-dev-843516467880.us-central1.run.app,SNAPSHOT_WRITE_FAILURE_LIMIT=0"
+                "--set-env-vars=NODE_ENV=production,GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=$REGION,DRIVE_SYNC_JOB_NAME=$JOB,DRIVE_ROOT_FOLDER_ID=$DRIVE_ROOT_FOLDER_ID,DRIVE_DELAY_BETWEEN_ACCOUNTS_MS=5000,DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS=2000,DRIVE_MAX_FILE_SIZE_BYTES=314572800,DRIVE_PROPOSAL_TTL_DAYS=14,GEMINI_MAX_INPUT_CHARS=40000,MAIL_DRIVER=console,MAIL_FROM_NAME=GUB,MAILGUN_REGION=us,GUB_ADMIN_BASE_URL=$GUB_ADMIN_BASE_URL,GUB_REVIEW_BASE_URL=$GUB_REVIEW_BASE_URL,SNAPSHOT_WRITE_FAILURE_LIMIT=0"
                 "--set-secrets=DATABASE_URL=gub-drive-sync-db-url-dev:latest,GUB_BOT_OAUTH_CLIENT_ID=gub-drive-sync-bot-oauth-client-id-dev:latest,GUB_BOT_OAUTH_CLIENT_SECRET=gub-drive-sync-bot-oauth-client-secret-dev:latest,GEMINI_API_KEY=gub-drive-sync-gemini-api-key-dev:latest,MAILGUN_API_KEY=gub-drive-sync-mailgun-api-key-dev:latest"
               )
               ;;

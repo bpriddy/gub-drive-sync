@@ -121,12 +121,15 @@ the mode; subsequent flags are mode-specific (`--sync-run-id=<uuid>` for
 
 ## CI / CD
 
-Same convention as the other GUB repos. Single Cloud Build trigger on
-`main` → `cloudbuild/dev.yaml`, deploying the Cloud Run Job
-`gub-drive-sync-dev`. `staging.yaml` / `prod.yaml` are committed for
-when prod exists; their triggers are added then. Unlike a Service, a
-Job has **no traffic/promotion step** — `jobs deploy` updates the
-definition and the next `jobs:run` uses the new image.
+GitHub Actions deploys: `.github/workflows/deploy.yml` builds the image
+and updates the Cloud Run Job `gub-drive-sync-dev` on every push to `main`
+(or a manual dispatch). That workflow is the single source of runtime
+config. Deployment identifiers are not in it: they come from repository
+secrets (listed in its header, masked in run logs), and a deploy with one
+unset fails before it touches anything. `cloudbuild/staging.yaml` / `prod.yaml` remain as
+provisioning references until those environments are ported. Unlike a
+Service, a Job has **no traffic/promotion step** — `jobs deploy` updates
+the definition and the next `jobs:run` uses the new image.
 
 ### First-time GCP bootstrap
 
@@ -200,11 +203,11 @@ rollback table.
 # DRY-RUN — detect + log the clusters that WOULD merge. No writes, no LLM
 # synthesis. Read the logged `outcome.clusters` to review before applying.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=merge-campaign-dupes,--account-name,chevy
+  --args=merge-campaign-dupes,--account-name,acme
 
 # APPLY — same detection, then merge every cluster ≥ 0.8 confidence.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=merge-campaign-dupes,--account-name,chevy,--confirm
+  --args=merge-campaign-dupes,--account-name,acme,--confirm
 
 # Optional: raise the floor (only merge ≥ 0.9), or target by id.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
@@ -224,7 +227,7 @@ redeploy:
 
 ```bash
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=merge-campaign-dupes,--account-name,chevy,--window,40,--vote-threshold,2
+  --args=merge-campaign-dupes,--account-name,acme,--window,40,--vote-threshold,2
 ```
 
 Review the result (the `outcome` object is logged as structured JSON):
@@ -232,14 +235,14 @@ Review the result (the `outcome` object is logged as structured JSON):
 ```bash
 gcloud logging read \
   'resource.labels.service_name="gub-drive-sync-dev" AND jsonPayload.msg="gub-drive-sync complete"' \
-  --project=os-test-491819 --limit=1 --format='value(jsonPayload.outcome)'
+  --project=<project-id> --limit=1 --format='value(jsonPayload.outcome)'
 ```
 
 Local equivalent (hits whatever `DATABASE_URL` points at):
 
 ```bash
-npm run merge-campaign-dupes -- --account-name chevy            # dry-run
-npm run merge-campaign-dupes -- --account-name chevy --confirm  # apply
+npm run merge-campaign-dupes -- --account-name acme             # dry-run
+npm run merge-campaign-dupes -- --account-name acme --confirm   # apply
 ```
 
 ### Complete per-account nuke (`clear-account`)
@@ -248,7 +251,7 @@ Clean-slate an account so a re-bootstrap starts blank. The account row
 survives (its `drive_folder_id` + business fields are kept); **everything
 else Drive-sync is wiped** in one transaction — child campaigns, all their
 changes/proposals/scan-logs/snapshots, the `drive_sync_runs` queue,
-`access_grants` (account + campaign), Chevy `audit_log` entries, and every
+`access_grants` (account + campaign), the account's `audit_log` entries, and every
 account sync/cache column (`drive_bootstrap_cursor`,
 `drive_structure_classification`, `drive_bootstrap_files`, …). This exists
 because the old per-account `clear` left bootstrap-cache + snapshot residue
@@ -259,11 +262,11 @@ that silently skipped re-classification/re-extraction.
 ```bash
 # DRY-RUN — counts what would be deleted/reset. No writes.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=clear-account,--account-name,chevy
+  --args=clear-account,--account-name,acme
 
 # APPLY — the full nuke.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=clear-account,--account-name,chevy,--confirm
+  --args=clear-account,--account-name,acme,--confirm
 ```
 
 **audit_log — dev vs prod:** the whole nuke is one transaction. In dev the

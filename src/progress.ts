@@ -216,7 +216,7 @@ export const progress = {
     write(c(GRAY, `  (${text})`));
   },
 
-  /** Before each per-entity scan: "→ Scanning account: Chevy". */
+  /** Before each per-entity scan: "→ Scanning account: Acme". */
   entity(label: string): void {
     write('');
     write(c(BOLD, `→ Scanning ${label}`));
@@ -249,13 +249,11 @@ export const progress = {
   /** End of one entity's scan. */
   entityDone(label: string, stats: EntityScanStats): void {
     const headSym = stats.filesErrored > 0 ? c(YELLOW, '✓') : c(GREEN, '✓');
-    const avg = stats.filesExtracted > 0
-      ? ` (${fmtMs(Math.round(stats.durationMs / stats.filesExtracted))} avg/file)`
-      : '';
-    const pieces = [
-      `${stats.filesSeen} files`,
-      `${stats.proposalsCreated} proposals`,
-    ];
+    const avg =
+      stats.filesExtracted > 0
+        ? ` (${fmtMs(Math.round(stats.durationMs / stats.filesExtracted))} avg/file)`
+        : '';
+    const pieces = [`${stats.filesSeen} files`, `${stats.proposalsCreated} proposals`];
     if (stats.notesWritten > 0) pieces.push(`${stats.notesWritten} notes`);
     if (stats.ambiguousWritten > 0) pieces.push(`${stats.ambiguousWritten} ambiguous`);
     if (stats.filesErrored > 0) pieces.push(c(RED, `${stats.filesErrored} errors`));
@@ -264,15 +262,26 @@ export const progress = {
 
   /** Notify phase result. */
   notify(ownersEmailed: number, orphansLogged: number, emailDriver: string): void {
-    write(`  ${ownersEmailed} owner(s) emailed, ${orphansLogged} orphan(s) logged  ${c(DIM, `[${emailDriver}]`)}`);
+    write(
+      `  ${ownersEmailed} owner(s) emailed, ${orphansLogged} orphan(s) logged  ${c(DIM, `[${emailDriver}]`)}`,
+    );
   },
 
   /** Closing block at end of run. */
   summary(s: RunSummary): void {
     write('');
-    const status = s.paused ? c(YELLOW, 'paused') : (s.errors > 0 ? c(YELLOW, 'complete (with errors)') : c(GREEN, 'complete'));
+    const status = s.paused
+      ? c(YELLOW, 'paused')
+      : s.errors > 0
+        ? c(YELLOW, 'complete (with errors)')
+        : c(GREEN, 'complete');
     write(c(BOLD, rule(`Drive sync ${status} (${fmtMs(s.durationMs)})`)));
-    write(c(DIM, `  ${s.accountsScanned} account(s), ${s.campaignsScanned} campaign(s), ${s.proposalsCreated} proposals, ${s.errors} errors`));
+    write(
+      c(
+        DIM,
+        `  ${s.accountsScanned} account(s), ${s.campaignsScanned} campaign(s), ${s.proposalsCreated} proposals, ${s.errors} errors`,
+      ),
+    );
     write('');
   },
 

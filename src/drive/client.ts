@@ -16,7 +16,7 @@
  *   1. Provision the Drive bot OAuth client + bot user out-of-band
  *      (per docs/proposals/bot-oauth-design.md setup runbook).
  *   2. Share each Drive folder the sync needs to read with
- *      bot.clientdrives@<domain> (or whatever the bot user is named).
+ *      <drive-bot>@<domain> (whatever the bot user is named).
  *   3. Authorize via gub-admin Settings → Sync Credentials → click
  *      Authorize on the 'drive' row.
  *

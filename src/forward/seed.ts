@@ -2,7 +2,7 @@
  * forward/seed.ts — one-shot historical edit-stats seed (design Q3).
  *
  * Replays windowed Activity queries back ~1 year (the probe-verified
- * retention horizon on Chevy; older events don't exist server-side) and
+ * retention horizon on the test account; older events don't exist server-side) and
  * upserts the same per-(file, day, actor) tallies the forward driver
  * maintains from now on. Stats only — no scanning, no proposals, no
  * cursor movement. Idempotent: re-running recomputes identical counts.

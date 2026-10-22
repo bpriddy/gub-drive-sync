@@ -4,7 +4,7 @@
  * Folders holding nothing but binary assets (fonts, images, video, design
  * files) never reach the per-file extraction prompt: extractText skips
  * every file on mime, so neither the location-context observation nor the
- * asset facts ("the brand typeface is Louis") ever fire for them. This
+ * asset facts ("the brand typeface is Brandface") ever fire for them. This
  * module covers that gap with ONE small LLM call per such folder, judging
  * from the only evidence available — the folder path and the file names.
  *
@@ -35,7 +35,7 @@ export interface InterpretAssetFolderInput {
   accountName: string | null;
   /** The campaign owning this folder's zone, or null in account space. */
   campaignName: string | null;
-  /** Breadcrumb path of the folder, e.g. "Chevy / Brand Assets / Fonts". */
+  /** Breadcrumb path of the folder, e.g. "Acme / Brand Assets / Fonts". */
   folderPath: string;
   fileNames: string[];
 }
@@ -80,8 +80,7 @@ function buildPrompt(input: InterpretAssetFolderInput): string {
   const shown = input.fileNames.slice(0, MAX_FILE_NAMES);
   const omitted = input.fileNames.length - shown.length;
   const listing =
-    shown.map((n) => `  - ${n}`).join('\n') +
-    (omitted > 0 ? `\n  … (+${omitted} more files)` : '');
+    shown.map((n) => `  - ${n}`).join('\n') + (omitted > 0 ? `\n  … (+${omitted} more files)` : '');
 
   return `You are looking at one folder from a client's shared Google Drive at an ad agency. Every file in it is a binary asset (fonts, images, video, design files) — there is no readable text, so the folder path and the file names are your only evidence.
 
@@ -92,8 +91,8 @@ FILES (${input.fileNames.length}):
 ${listing}
 
 If this folder is a meaningful asset collection — Fonts, Logos, Brand Assets, Photography, Visual Identity, Finals, Toolkits, and the like — emit observations:
-  - One locating it: name the folder by its full path, phrased as a fact about the entity ("Chevy's brand fonts live at Chevy / Brand Assets / Fonts"). Use the path verbatim — do not guess or abbreviate.
-  - One per concrete asset the names reveal: a typeface, a logo variant or lockup, a photography style ("Chevy's brand typeface is Louis", from Louis-Bold.ttf). Only assets the names actually establish — don't stretch ambiguous names.
+  - One locating it: name the folder by its full path, phrased as a fact about the entity ("Acme's brand fonts live at Acme / Brand Assets / Fonts"). Use the path verbatim — do not guess or abbreviate.
+  - One per concrete asset the names reveal: a typeface, a logo variant or lockup, a photography style ("Acme's brand typeface is Brandface", from Brandface-Bold.ttf). Only assets the names actually establish — don't stretch ambiguous names.
 
 Each observation: text (one sentence, specific), reasoning (one sentence citing the evidence), confidence (0.0–1.0, your subjective certainty).
 

@@ -190,7 +190,7 @@ export async function processBatch(
 
   // The scanned campaign's identity family: its own name + its pieces'
   // names. A subject tag matching ANY of these is ours — two folders, one
-  // campaign (BHAC's piece folder must never be treated as foreign).
+  // campaign (a campaign's own piece folder must never be treated as foreign).
   const ownIdentityNames: string[] =
     ctx.type === 'campaign'
       ? [ctx.name, ...(piecesById ? Array.from(piecesById.values()).map((p) => p.name) : [])]
@@ -199,7 +199,7 @@ export async function processBatch(
   // ── Restricted worklist (no probing — practice over polling) ─────────────
   // Policy (user ruling, 2026-08-14): we do NOT re-probe files we lack
   // permission to read. The organizational practice is to affirmatively
-  // share with the bot (bot.clientdrives@); the worklist + first-sighting
+  // share with the bot (the Drive bot user); the worklist + first-sighting
   // observation exist to FEED that practice — the admin page is the
   // "please share this" to-do list. A rescued file re-enters scans via its
   // next normal change event, and a successful extraction below
@@ -245,7 +245,7 @@ export async function processBatch(
 
   // Binaries-only folders: when EVERY file in a folder skips extraction on
   // mime (fonts, images, video), the per-file prompt never sees the folder
-  // — but path + file names are still evidence ("Fonts/Louis-Bold.ttf"
+  // — but path + file names are still evidence ("Fonts/Brand-Bold.ttf"
   // establishes the typeface). Collect unsupported-mime skips per parent
   // folder during the loop; folders that also produced readable text are
   // excluded afterwards (their extractable files already carry the

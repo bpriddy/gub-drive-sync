@@ -47,7 +47,7 @@ export interface IdeaRunFileResult {
 /**
  * One resolved idea AFTER match-and-merge collapse — what actually lands (or
  * would land) in the memory tier. `contributingDecks` is how many extracted
- * ideas folded into this one (BHAC's ~9 character-generator variants → 1).
+ * ideas folded into this one (one account's ~9 character-generator variants → 1).
  */
 export interface ResolvedIdea {
   action: 'create' | 'update';
@@ -164,7 +164,7 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
   // memory and merge (add + supersede) rather than snapshot per deck. Runs in
   // BOTH dry-run and apply so the preview shows the real collapse; only Phase 3
   // writes. `known` is the growing set (persisted ideas + creates planned this
-  // run), so duplicates within a single run collapse too — BHAC's first deck
+  // run), so duplicates within a single run collapse too — the first deck
   // creates the idea, the rest merge into it.
   const known: KnownIdea[] = (
     await prisma.idea.findMany({
