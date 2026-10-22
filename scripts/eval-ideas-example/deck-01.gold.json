@@ -1,0 +1,27 @@
+{
+  "name": "Example Co Spring Pitch R1.pptx",
+  "path": "Example Co / Spring Launch / Pitch",
+  "account": "Example Co",
+  "order": 1,
+  "deckType": "pitch",
+  "ideas": [
+    {
+      "key": "night-owl",
+      "name": "Night Owl Route",
+      "aliases": ["The Night Owl"],
+      "facets": [
+        "late-night radio takeover",
+        "owl mascot hosts and reads listeners' shift stories",
+        "tongue in cheek"
+      ]
+    },
+    {
+      "key": "kitchen-table",
+      "name": "Kitchen Table Stories",
+      "facets": [
+        "families film clips at the kitchen table after a night shift",
+        "social-first vertical video"
+      ]
+    }
+  ]
+}
