@@ -46,6 +46,9 @@ export interface NotifyResult {
   emailDriver: string;
 }
 
+const STAFF_MISSING_MESSAGE =
+  'Reviewer staff missing/inactive at notify time — proposal left pending';
+
 interface PendingRow {
   id: string;
   kind: string;
@@ -143,14 +146,31 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
         { reviewerStaffId, bucketSize: bucket.length },
         '[drive.notify] reviewer staff not active or lacks email — skipping batch',
       );
+      // One diagnostic per proposal, not one per notify run: the forward
+      // run notifies without a syncRunId, so every pending proposal of this
+      // reviewer comes back daily until it expires. Skip the ones already
+      // logged, and file the row under the proposal's own sync run.
+      const logged = await prisma.driveScanLog.findMany({
+        where: {
+          level: 'warn',
+          category: 'diagnostic',
+          message: STAFF_MISSING_MESSAGE,
+          OR: bucket.map((r) => ({ payload: { path: ['proposalId'], equals: r.id } })),
+        },
+        select: { payload: true },
+      });
+      const alreadyLogged = new Set(
+        logged.map((l) => (l.payload as { proposalId?: unknown } | null)?.proposalId),
+      );
       for (const r of bucket) {
+        if (alreadyLogged.has(r.id)) continue;
         await writeScanLog({
-          syncRunId: null,
+          syncRunId: r.syncRunId,
           accountId: r.accountId,
           campaignId: r.campaignId,
           level: 'warn',
           category: 'diagnostic',
-          message: 'Reviewer staff missing/inactive at notify time — proposal left pending',
+          message: STAFF_MISSING_MESSAGE,
           payload: { proposalId: r.id, reviewerStaffId },
         });
       }
@@ -163,7 +183,9 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
 
     // Summarize what's in the bundle for the email body.
     const newEntityGroups = new Set(
-      bucket.filter((r) => r.kind === 'new_entity' && r.proposalGroupId).map((r) => r.proposalGroupId!),
+      bucket
+        .filter((r) => r.kind === 'new_entity' && r.proposalGroupId)
+        .map((r) => r.proposalGroupId!),
     ).size;
     const fieldChanges = bucket.filter((r) => r.kind === 'field_change').length;
 
@@ -252,7 +274,9 @@ function renderReviewEmail(i: RenderInput): { subject: string; text: string; htm
     parts.push(`${i.fieldChanges} ${i.fieldChanges === 1 ? 'change' : 'changes'}`);
   }
   const summary = parts.length > 0 ? parts.join(' and ') : 'items';
-  const subject = `Drive sync: ${summary} need your review`;
+  // "1 change needs", but "2 changes need" and "1 new folder and 1 change need".
+  const singular = parts.length === 1 && i.newEntityGroups + i.fieldChanges === 1;
+  const subject = `Drive sync: ${summary} ${singular ? 'needs' : 'need'} your review`;
 
   const text = [
     `Hi ${i.reviewerName},`,

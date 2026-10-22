@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Prisma } from '@prisma/client';
 
 const mocks = vi.hoisted(() => ({
-  findFirst: vi.fn(),
   findMany: vi.fn(),
   create: vi.fn(),
 }));
@@ -10,7 +9,6 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../prisma', () => ({
   prisma: {
     driveChangeProposal: {
-      findFirst: mocks.findFirst,
       findMany: mocks.findMany,
       create: mocks.create,
     },
@@ -73,7 +71,6 @@ function makeInput(overrides: Partial<ProposeTargetInput> = {}): ProposeTargetIn
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
-  mocks.findFirst.mockReset().mockResolvedValue(null);
   mocks.findMany.mockReset().mockResolvedValue([]);
   mocks.create.mockReset().mockResolvedValue({});
 });
@@ -177,9 +174,9 @@ describe('proposeTarget: field_change rows', () => {
 });
 
 describe('proposeTarget: re-propose guard', () => {
-  it('looks for a pending field_change on the same target and property', async () => {
+  it('reads every live pending field_change on the same target and property', async () => {
     await proposeTarget(makeInput({ validatedChanges: [makeChange()] }));
-    expect(mocks.findFirst).toHaveBeenCalledWith({
+    expect(mocks.findMany).toHaveBeenCalledWith({
       where: {
         kind: 'field_change',
         entityType: 'campaign',
@@ -187,20 +184,22 @@ describe('proposeTarget: re-propose guard', () => {
         campaignId: 'camp-1',
         property: 'budget',
         state: 'pending',
+        // Past its expiry but not yet swept: no longer a card the reviewer can act on.
+        expiresAt: { gt: NOW },
       },
       select: { id: true, proposedValue: true },
     });
   });
 
   it('skips a change whose value equals the pending proposal and counts it', async () => {
-    mocks.findFirst.mockResolvedValue({ id: 'prop-1', proposedValue: 5000 });
+    mocks.findMany.mockResolvedValue([{ id: 'prop-1', proposedValue: 5000 }]);
     const result = await proposeTarget(makeInput({ validatedChanges: [makeChange()] }));
     expect(result).toEqual({ fieldProposals: 0, noteItems: 0, duplicatesSkipped: 1 });
     expect(mocks.create).not.toHaveBeenCalled();
   });
 
   it('compares structured values by content', async () => {
-    mocks.findFirst.mockResolvedValue({ id: 'prop-1', proposedValue: { a: 1, b: [2] } });
+    mocks.findMany.mockResolvedValue([{ id: 'prop-1', proposedValue: { a: 1, b: [2] } }]);
     const result = await proposeTarget(
       makeInput({ validatedChanges: [makeChange({ validatedValue: { a: 1, b: [2] } })] }),
     );
@@ -209,7 +208,7 @@ describe('proposeTarget: re-propose guard', () => {
   });
 
   it('treats a pending null and an undefined proposed value as identical', async () => {
-    mocks.findFirst.mockResolvedValue({ id: 'prop-1', proposedValue: null });
+    mocks.findMany.mockResolvedValue([{ id: 'prop-1', proposedValue: null }]);
     const result = await proposeTarget(
       makeInput({ validatedChanges: [makeChange({ validatedValue: undefined })] }),
     );
@@ -217,16 +216,36 @@ describe('proposeTarget: re-propose guard', () => {
   });
 
   it('still writes a new row when the pending proposal has a different value', async () => {
-    mocks.findFirst.mockResolvedValue({ id: 'prop-1', proposedValue: 4500 });
+    mocks.findMany.mockResolvedValue([{ id: 'prop-1', proposedValue: 4500 }]);
     const result = await proposeTarget(makeInput({ validatedChanges: [makeChange()] }));
     expect(result).toEqual({ fieldProposals: 1, noteItems: 0, duplicatesSkipped: 0 });
     expect(mocks.create).toHaveBeenCalledTimes(1);
   });
 
+  it('skips a value any pending card carries, even when a newer card holds another', async () => {
+    // A value was proposed (X), then a different one (Y); X comes back.
+    mocks.findMany.mockResolvedValue([
+      { id: 'prop-new', proposedValue: 4500 },
+      { id: 'prop-old', proposedValue: 5000 },
+    ]);
+    const result = await proposeTarget(makeInput({ validatedChanges: [makeChange()] }));
+    expect(result).toEqual({ fieldProposals: 0, noteItems: 0, duplicatesSkipped: 1 });
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it('writes a new row when no pending card carries the value', async () => {
+    mocks.findMany.mockResolvedValue([
+      { id: 'prop-a', proposedValue: 4500 },
+      { id: 'prop-b', proposedValue: 4000 },
+    ]);
+    const result = await proposeTarget(makeInput({ validatedChanges: [makeChange()] }));
+    expect(result).toEqual({ fieldProposals: 1, noteItems: 0, duplicatesSkipped: 0 });
+  });
+
   it('dedupes per change: skips the duplicate, writes the other', async () => {
-    mocks.findFirst
-      .mockResolvedValueOnce({ id: 'prop-1', proposedValue: 5000 })
-      .mockResolvedValueOnce(null);
+    mocks.findMany
+      .mockResolvedValueOnce([{ id: 'prop-1', proposedValue: 5000 }])
+      .mockResolvedValueOnce([]);
     const result = await proposeTarget(
       makeInput({
         validatedChanges: [
@@ -322,7 +341,7 @@ describe('proposeTarget: new-candidate fallback', () => {
     );
 
     expect(result).toEqual({ fieldProposals: 0, noteItems: 2, duplicatesSkipped: 0 });
-    expect(mocks.findFirst).not.toHaveBeenCalled();
+    expect(mocks.findMany).not.toHaveBeenCalled();
     expect(mocks.create).toHaveBeenCalledTimes(1);
     const data = mocks.create.mock.calls[0]![0].data;
     expect(data).toMatchObject({

@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   findMany: vi.fn(),
   updateMany: vi.fn(),
   staffFindUnique: vi.fn(),
+  scanLogFindMany: vi.fn(),
   send: vi.fn(),
   writeScanLog: vi.fn(),
   loggerInfo: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('../../prisma', () => ({
   prisma: {
     driveChangeProposal: { findMany: mocks.findMany, updateMany: mocks.updateMany },
     staff: { findUnique: mocks.staffFindUnique },
+    driveScanLog: { findMany: mocks.scanLogFindMany },
   },
 }));
 vi.mock('../../config', () => ({ config: mocks.config }));
@@ -82,6 +84,7 @@ beforeEach(() => {
     .mockReset()
     .mockImplementation(async ({ where }: { where: { id: string } }) => STAFF[where.id] ?? null);
   mocks.send.mockReset().mockResolvedValue(SENT);
+  mocks.scanLogFindMany.mockReset().mockResolvedValue([]);
   mocks.writeScanLog.mockReset().mockResolvedValue(undefined);
   mocks.loggerInfo.mockReset();
   mocks.loggerWarn.mockReset();
@@ -188,7 +191,7 @@ describe('notifyReviewers: grouping', () => {
     ]);
     await notifyReviewers();
     const msg = mocks.send.mock.calls[0]![0];
-    // Wording pinned as shipped, singular "need" included; a copy fix updates these strings.
+    // The verb agrees with the summary: plural for counts above 1 and for "X and Y".
     expect(msg.subject).toBe('Drive sync: 2 new folders and 2 changes need your review');
     expect(msg.text).toContain('Hi Ada Example,');
     expect(msg.text).toContain('found 2 new folders and 2 changes for accounts you own');
@@ -204,6 +207,24 @@ describe('notifyReviewers: grouping', () => {
     expect(mocks.send.mock.calls[0]![0].subject).toBe(
       'Drive sync: 1 new folder and 1 change need your review',
     );
+  });
+
+  it.each([
+    ['one change', [row({ id: 'p1' })], 'Drive sync: 1 change needs your review'],
+    [
+      'one new folder',
+      [row({ id: 'p1', kind: 'new_entity', proposalGroupId: 'grp-1' })],
+      'Drive sync: 1 new folder needs your review',
+    ],
+    [
+      'several changes',
+      [row({ id: 'p1' }), row({ id: 'p2' }), row({ id: 'p3' })],
+      'Drive sync: 3 changes need your review',
+    ],
+  ])('agrees the verb with the subject: %s', async (_label, rows, subject) => {
+    mocks.findMany.mockResolvedValue(rows);
+    await notifyReviewers();
+    expect(mocks.send.mock.calls[0]![0].subject).toBe(subject);
   });
 
   it('falls back to "items" when the bundle holds only other kinds', async () => {
@@ -303,7 +324,7 @@ describe('notifyReviewers: orphans', () => {
     const result = await notifyReviewers();
     expect(result).toMatchObject({ ownersEmailed: 1, proposalsNotified: 1, orphansLogged: 1 });
     expect(mocks.updateMany.mock.calls[0]![0].where).toEqual({ id: { in: ['p1'] } });
-    expect(mocks.send.mock.calls[0]![0].subject).toBe('Drive sync: 1 change need your review');
+    expect(mocks.send.mock.calls[0]![0].subject).toBe('Drive sync: 1 change needs your review');
   });
 });
 
@@ -318,8 +339,8 @@ describe('notifyReviewers: unusable reviewers', () => {
   ])('skips the batch for %s, logs each proposal and leaves it pending', async (_label, staff) => {
     mocks.staffFindUnique.mockResolvedValue(staff);
     mocks.findMany.mockResolvedValue([
-      row({ id: 'p1', accountId: 'acct-1', campaignId: null }),
-      row({ id: 'p2', accountId: 'acct-2', campaignId: 'camp-2' }),
+      row({ id: 'p1', accountId: 'acct-1', campaignId: null, syncRunId: 'run-1' }),
+      row({ id: 'p2', accountId: 'acct-2', campaignId: 'camp-2', syncRunId: 'run-2' }),
     ]);
 
     const result = await notifyReviewers();
@@ -329,7 +350,8 @@ describe('notifyReviewers: unusable reviewers', () => {
     expect(mocks.updateMany).not.toHaveBeenCalled();
     expect(mocks.writeScanLog.mock.calls.map((c) => c[0])).toEqual([
       {
-        syncRunId: null,
+        // Filed under the proposal's own sync run, not under no run at all.
+        syncRunId: 'run-1',
         accountId: 'acct-1',
         campaignId: null,
         level: 'warn',
@@ -338,7 +360,7 @@ describe('notifyReviewers: unusable reviewers', () => {
         payload: { proposalId: 'p1', reviewerStaffId: 'staff-1' },
       },
       {
-        syncRunId: null,
+        syncRunId: 'run-2',
         accountId: 'acct-2',
         campaignId: 'camp-2',
         level: 'warn',
@@ -347,6 +369,43 @@ describe('notifyReviewers: unusable reviewers', () => {
         payload: { proposalId: 'p2', reviewerStaffId: 'staff-1' },
       },
     ]);
+  });
+
+  it('writes the diagnostic once per proposal: later runs skip the ones already logged', async () => {
+    mocks.staffFindUnique.mockResolvedValue(null);
+    mocks.findMany.mockResolvedValue([row({ id: 'p1' }), row({ id: 'p2' })]);
+    mocks.scanLogFindMany.mockResolvedValue([
+      { payload: { proposalId: 'p1', reviewerStaffId: 'staff-1' } },
+    ]);
+
+    await notifyReviewers();
+
+    expect(mocks.scanLogFindMany).toHaveBeenCalledWith({
+      where: {
+        level: 'warn',
+        category: 'diagnostic',
+        message: 'Reviewer staff missing/inactive at notify time — proposal left pending',
+        OR: [
+          { payload: { path: ['proposalId'], equals: 'p1' } },
+          { payload: { path: ['proposalId'], equals: 'p2' } },
+        ],
+      },
+      select: { payload: true },
+    });
+    expect(mocks.writeScanLog.mock.calls.map((c) => c[0].payload.proposalId)).toEqual(['p2']);
+    // The Cloud Logging line still fires every run: the gap is still open.
+    expect(mocks.loggerWarn).toHaveBeenCalledWith(
+      { reviewerStaffId: 'staff-1', bucketSize: 2 },
+      '[drive.notify] reviewer staff not active or lacks email — skipping batch',
+    );
+  });
+
+  it('writes nothing when every proposal already carries the diagnostic', async () => {
+    mocks.staffFindUnique.mockResolvedValue(null);
+    mocks.findMany.mockResolvedValue([row({ id: 'p1' })]);
+    mocks.scanLogFindMany.mockResolvedValue([{ payload: { proposalId: 'p1' } }]);
+    await notifyReviewers();
+    expect(mocks.writeScanLog).not.toHaveBeenCalled();
   });
 
   it('continues with the next reviewer after skipping an unusable one', async () => {
