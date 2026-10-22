@@ -152,6 +152,14 @@ const EnvSchema = z.object({
         return z.NEVER;
       }
     }),
+  /**
+   * LOCAL A/B runs only (scripts/ab-thinking.ts, #69): when set, every
+   * preset call appends its rendered prompt and answer to
+   * `<dir>/<preset key>.jsonl` (src/ai/capture.ts). Records hold customer
+   * content, so a directory inside this repository is refused. Never set it
+   * in a deployed environment. Unset, the default, captures nothing.
+   */
+  GEMINI_CAPTURE_DIR: z.string().optional(),
   /** Drive / Docs / Slides / Sheets / Activity / People reads. */
   DRIVE_READ_TIMEOUT_MS: timeoutMs('60000'),
   /** Binary downloads (files.get alt=media), headers + body. */

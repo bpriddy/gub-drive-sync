@@ -41,7 +41,7 @@ const ObservationSchema = z.object({
   entity_campaign_name: z.string().nullable().optional(),
 });
 
-const PerFileResponseSchema = z.object({
+export const PerFileResponseSchema = z.object({
   // Whole-file classification gating the downstream idea-extraction call.
   // .catch('other') — a missing/invalid value must never fail the file;
   // it just means no idea extraction for it.

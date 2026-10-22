@@ -15,6 +15,7 @@ import { prisma } from '../prisma';
 import { logger } from '../logger';
 import { defaultLlm } from './gemini.client';
 import { thinkingLevelFor, type ThinkingLevelName } from './thinking';
+import { captureCall } from './capture';
 import type { LlmCompletionResult } from './ai.types';
 
 export interface RunPresetOptions {
@@ -70,6 +71,24 @@ export async function runPreset(
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
   });
+
+  if (config.GEMINI_CAPTURE_DIR) {
+    captureCall(config.GEMINI_CAPTURE_DIR, {
+      capturedAt: new Date().toISOString(),
+      key: opts.key,
+      model: preset.model,
+      temperature: Number(preset.temperature),
+      prompt,
+      responseSchema: opts.responseSchema ?? null,
+      timeoutMs: opts.timeoutMs ?? null,
+      thinkingLevel: thinkingLevel ?? null,
+      result: {
+        text: result.text,
+        finishReason: result.finishReason ?? null,
+        usage: result.usage ?? null,
+      },
+    });
+  }
 
   return { ...result, prompt };
 }
