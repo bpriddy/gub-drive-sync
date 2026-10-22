@@ -22,11 +22,7 @@ import {
   type CampaignNameDirectory,
   type EntityCtx,
 } from '../scan/batch-types';
-import {
-  persistStructureCache,
-  structureFingerprint,
-  type StructureCache,
-} from './days';
+import { persistStructureCache, structureFingerprint, type StructureCache } from './days';
 
 export interface StructureStageResult {
   attributor: Attributor;
