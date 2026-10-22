@@ -24,6 +24,7 @@
     "probe-revision-content": "tsx -r dotenv/config scripts/probe-revision-content.ts",
     "probe-drive-listing": "tsx -r dotenv/config scripts/probe-drive-listing.ts",
     "ab-thinking": "tsx -r dotenv/config scripts/ab-thinking.ts",
+    "classify-prompt-size": "tsx scripts/classify-prompt-size.ts",
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
