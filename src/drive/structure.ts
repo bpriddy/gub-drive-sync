@@ -233,13 +233,98 @@ async function walkFoldersRecursive(
   return out;
 }
 
+// ── Depth cap (CLASSIFY_DEPTH_CAP_MODE=auto, #69) ────────────────────────────
+//
+// Campaign roots sit a few levels down; most of a large tree is the material
+// inside them, which the classifier never labels. A capped prompt shows the
+// folders down to the cap, plus every anchor and its ancestors, and puts a
+// count of the hidden folders on their nearest shown ancestor. The entity
+// map still carries every folder, so a file below the cap attributes through
+// its ancestors as before.
+
+export interface CappedTree {
+  /** The shown folders, in their original depth-first order. */
+  folders: FolderNode[];
+  /** Hidden folder count per shown folder id, at the nearest shown ancestor. */
+  hiddenBelow: Map<string, number>;
+}
+
+/**
+ * Cap a depth-first folder list (as gatherFolders returns it) at `cap`,
+ * always keeping the folders in `keepIds` and their ancestors.
+ */
+export function capFolderTree(
+  folders: FolderNode[],
+  cap: number,
+  keepIds: Iterable<string>,
+): CappedTree {
+  const byId = new Map(folders.map((f) => [f.id, f]));
+  const shown = new Set(folders.filter((f) => f.depth <= cap).map((f) => f.id));
+  for (const id of keepIds) {
+    let current = byId.get(id);
+    while (current && !shown.has(current.id)) {
+      shown.add(current.id);
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+  }
+
+  const kept: FolderNode[] = [];
+  const hiddenBelow = new Map<string, number>();
+  const shownOwner = new Map<string, string | null>();
+  for (const f of folders) {
+    if (shown.has(f.id)) {
+      kept.push(f);
+      shownOwner.set(f.id, f.id);
+      continue;
+    }
+    // Parents precede children in depth-first order.
+    const owner = f.parentId ? (shownOwner.get(f.parentId) ?? null) : null;
+    shownOwner.set(f.id, owner);
+    if (owner) hiddenBelow.set(owner, (hiddenBelow.get(owner) ?? 0) + 1);
+  }
+  return { folders: kept, hiddenBelow };
+}
+
+/**
+ * The `auto` cap: one level below the deepest campaign root of the previous
+ * classification or campaign anchor still in the tree. With no previous
+ * campaign root, or none of them left in the tree, `defaultCap`.
+ * account_level entries do not count: the classifier may name a notable
+ * collection at any depth, and counting it would let the cap creep one
+ * level deeper with every reclassify.
+ */
+export function depthCapFor(
+  folders: FolderNode[],
+  classified: ReadonlyArray<Pick<ClassifiedFolder, 'folderId' | 'classification'>>,
+  anchorFolderIds: readonly string[],
+  defaultCap: number,
+): number {
+  const rootIds = classified
+    .filter((c) => c.classification !== 'account_level')
+    .map((c) => c.folderId);
+  if (rootIds.length === 0) return defaultCap;
+  const depthById = new Map(folders.map((f) => [f.id, f.depth]));
+  let deepest = 0;
+  for (const id of [...rootIds, ...anchorFolderIds]) {
+    deepest = Math.max(deepest, depthById.get(id) ?? 0);
+  }
+  return deepest > 0 ? deepest + 1 : defaultCap;
+}
+
 // ── Tree rendering for the prompt ────────────────────────────────────────────
 
-function renderTree(rootLabel: string, rootFolderId: string, folders: FolderNode[]): string {
+function renderTree(
+  rootLabel: string,
+  rootFolderId: string,
+  folders: FolderNode[],
+  hiddenBelow?: ReadonlyMap<string, number>,
+): string {
   const lines = [`${rootLabel}/  [id: ${rootFolderId}]  (account root)`];
   for (const f of folders) {
     const indent = '  '.repeat(f.depth);
-    lines.push(`${indent}${f.name}/  [id: ${f.id}]`);
+    const hidden = hiddenBelow?.get(f.id) ?? 0;
+    const more = hidden > 0 ? `  (+${hidden} subfolder${hidden === 1 ? '' : 's'})` : '';
+    lines.push(`${indent}${f.name}/  [id: ${f.id}]${more}`);
   }
   return lines.join('\n');
 }
@@ -255,13 +340,15 @@ function renderExistingCampaigns(anchors: ExistingCampaignAnchor[]): string {
 
 // ── Prompt (hardcoded inline for Stage 1 iteration) ──────────────────────────
 
-function buildPrompt(args: {
+export function buildPrompt(args: {
   accountName: string;
   rootFolderId: string;
   folders: FolderNode[];
   anchors: ExistingCampaignAnchor[];
+  /** From capFolderTree: hidden folder counts to show on capped nodes. */
+  hiddenBelow?: ReadonlyMap<string, number> | undefined;
 }): string {
-  const tree = renderTree(args.accountName, args.rootFolderId, args.folders);
+  const tree = renderTree(args.accountName, args.rootFolderId, args.folders, args.hiddenBelow);
   const existing = renderExistingCampaigns(args.anchors);
 
   return `You are mapping the folder topology of an agency account's Google Drive so the sync pipeline knows which campaign each file belongs to.
@@ -308,6 +395,11 @@ export async function classifyFolders(args: {
   rootFolderId: string;
   folders: FolderNode[];
   existingCampaigns: ExistingCampaignAnchor[];
+  /**
+   * Show the model folders down to this depth only, plus every anchor and
+   * its ancestors (CLASSIFY_DEPTH_CAP_MODE=auto). Unset: the whole tree.
+   */
+  depthCap?: number | undefined;
 }): Promise<EntityMap> {
   const folders = args.folders;
 
@@ -323,12 +415,33 @@ export async function classifyFolders(args: {
     };
   }
 
+  const capped =
+    args.depthCap === undefined
+      ? null
+      : capFolderTree(
+          folders,
+          args.depthCap,
+          args.existingCampaigns.map((a) => a.driveFolderId),
+        );
   const prompt = buildPrompt({
     accountName: args.accountName,
     rootFolderId: args.rootFolderId,
-    folders,
+    folders: capped?.folders ?? folders,
     anchors: args.existingCampaigns,
+    hiddenBelow: capped?.hiddenBelow,
   });
+  if (capped) {
+    logger.info(
+      {
+        accountId: args.accountId,
+        depthCap: args.depthCap,
+        shownFolders: capped.folders.length,
+        hiddenFolders: folders.length - capped.folders.length,
+        promptChars: prompt.length,
+      },
+      '[drive.structure] classify tree capped',
+    );
+  }
 
   const completion = await defaultLlm.complete({
     model: STRUCTURE_MODEL,

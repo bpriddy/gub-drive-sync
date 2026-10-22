@@ -5,13 +5,16 @@
 // fingerprints before reusing — the behavior the cache comment always
 // promised ("for forward sync, we'll re-gather + re-hash + compare").
 
+import { config } from '../config';
 import { prisma } from '../prisma';
 import {
   buildAttributor,
   classifyFolders,
+  depthCapFor,
   gatherFolders,
   overlayPieceAnchors,
   type Attributor,
+  type ClassifiedFolder,
   type EntityMap,
   type PieceAnchor,
 } from '../drive/structure';
@@ -23,6 +26,12 @@ import {
   type EntityCtx,
 } from '../scan/batch-types';
 import { persistStructureCache, structureFingerprint, type StructureCache } from './days';
+
+/** The cached classification's entries; [] when there is none. */
+function cachedClassified(cached: StructureCache | null): ClassifiedFolder[] {
+  const classified = (cached?.entityMap as Partial<EntityMap> | undefined)?.classified;
+  return Array.isArray(classified) ? classified : [];
+}
 
 export interface StructureStageResult {
   attributor: Attributor;
@@ -82,6 +91,21 @@ export async function resolveAccountStructure(
     if (isTTY) process.stdout.write('\r' + ' '.repeat(40) + '\r');
     log(`  Gathered ${folders.length} folders.`);
 
+    // CLASSIFY_DEPTH_CAP_MODE=auto: the classifier sees the tree down to one
+    // level below the deepest campaign root it found last time or campaign
+    // anchor, not the whole tree.
+    const anchorFolderIds = existingCampaigns.map((c) => c.driveFolderId);
+    const depthCap =
+      config.CLASSIFY_DEPTH_CAP_MODE === 'auto'
+        ? depthCapFor(
+            folders,
+            cachedClassified(cached),
+            anchorFolderIds,
+            config.CLASSIFY_DEFAULT_DEPTH_CAP,
+          )
+        : undefined;
+    if (depthCap !== undefined) log(`  Classify depth cap: ${depthCap}`);
+
     const fingerprint = structureFingerprint(
       folders.map((f) => ({ id: f.id, name: f.name, parentId: f.parentId })),
     );
@@ -101,6 +125,7 @@ export async function resolveAccountStructure(
           rootFolderId: ctx.folderId,
           folders,
           existingCampaigns,
+          depthCap,
         }),
       );
       if (opts.persistCache) {

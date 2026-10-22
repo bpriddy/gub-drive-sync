@@ -80,6 +80,20 @@ const EnvSchema = z.object({
     .default('0')
     .transform(Number)
     .pipe(z.number().int().min(0)),
+  /**
+   * Folder classify prompt size (#69). `off` (the default) sends the whole
+   * folder tree. `auto` sends folders down to one level below the deepest
+   * campaign root of the previous classification or campaign anchor, plus
+   * every anchor and its ancestors; deeper folders appear as a count on their
+   * shown ancestor.
+   */
+  CLASSIFY_DEPTH_CAP_MODE: z.enum(['off', 'auto']).default('off'),
+  /** The `auto` cap for an account with no previous campaign root. */
+  CLASSIFY_DEFAULT_DEPTH_CAP: z
+    .string()
+    .default('5')
+    .transform(Number)
+    .pipe(z.number().int().min(1)),
 
   // ── AI / Gemini ──────────────────────────────────────────────────────────
   GEMINI_API_KEY: z.string().optional(),
