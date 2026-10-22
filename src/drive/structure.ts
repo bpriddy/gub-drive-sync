@@ -54,6 +54,19 @@ const STRUCTURE_TEMPERATURE = 0.2;
 const MAX_OUTPUT_TOKENS = 65535;
 export const STRUCTURE_RESOLUTION_VERSION = 'drive.structure_resolution.v1-inline';
 
+/** gemini-3.5-flash input token limit. */
+export const CLASSIFY_INPUT_TOKEN_LIMIT = 1_048_576;
+/**
+ * Classify prompt tokens per folder shown, measured on a whole-tree prompt
+ * (about 259k tokens for about 6.75k folders, instructions and anchors
+ * included). Only an estimate: folder names vary in length.
+ */
+export const CLASSIFY_TOKENS_PER_FOLDER = 38;
+
+export function estimateClassifyTokens(shownFolders: number): number {
+  return shownFolders * CLASSIFY_TOKENS_PER_FOLDER;
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface FolderNode {

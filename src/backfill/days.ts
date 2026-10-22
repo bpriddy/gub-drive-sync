@@ -146,6 +146,11 @@ export interface StructureCache {
   folders: unknown;
   classifierPromptVersion?: string;
   classifierModelId?: string;
+  /**
+   * ISO time of the last uncapped classify in CLASSIFY_DEPTH_CAP_MODE=auto
+   * (the weekly full pass). Absent in `off` mode and before the first pass.
+   */
+  fullPassAt?: string;
 }
 
 /**
