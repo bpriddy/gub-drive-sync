@@ -133,7 +133,7 @@ An EXECUTION is a distinct thing this campaign actually produced or is producing
 
 MONEY AND DELIVERY PAPERWORK ARE EXECUTION EVIDENCE. A budget allocation ("$700k to film production"), an active purchase order, a signed estimate, a production-partner award, scripts/storyboards, or delivery paperwork (ATA forms, broadcast/cinema distribution) prove an execution exists even when no document ever names it — the anchor deliverable often just goes by the campaign's own name. Surface such executions, named by what they are ("Commercial", "Hero Film", "Launch Spot") when the dossier gives no title.
 
-JOB NUMBERS ARE HARD IDENTITY. When the dossier ties an execution to a job number (bracket codes like GMCHV55000216) or the campaign's anchor job number applies, report it — the same job number always means the same execution.
+JOB NUMBERS ARE HARD IDENTITY. When the dossier ties an execution to a job number (bracket codes like ACME55000216) or the campaign's anchor job number applies, report it — the same job number always means the same execution.
 
 List the executions this campaign comprises, according to the dossier:
 - name: what the work is called (short; use the dossier's own naming when it has one, or the execution class when unnamed)

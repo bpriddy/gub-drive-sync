@@ -91,8 +91,8 @@ FILES (${input.fileNames.length}):
 ${listing}
 
 If this folder is a meaningful asset collection — Fonts, Logos, Brand Assets, Photography, Visual Identity, Finals, Toolkits, and the like — emit observations:
-  - One locating it: name the folder by its full path, phrased as a fact about the entity ("Chevy's brand fonts live at Chevy / Brand Assets / Fonts"). Use the path verbatim — do not guess or abbreviate.
-  - One per concrete asset the names reveal: a typeface, a logo variant or lockup, a photography style ("Chevy's brand typeface is Louis", from Louis-Bold.ttf). Only assets the names actually establish — don't stretch ambiguous names.
+  - One locating it: name the folder by its full path, phrased as a fact about the entity ("Acme's brand fonts live at Acme / Brand Assets / Fonts"). Use the path verbatim — do not guess or abbreviate.
+  - One per concrete asset the names reveal: a typeface, a logo variant or lockup, a photography style ("Acme's brand typeface is Brandface", from Brandface-Bold.ttf). Only assets the names actually establish — don't stretch ambiguous names.
 
 Each observation: text (one sentence, specific), reasoning (one sentence citing the evidence), confidence (0.0–1.0, your subjective certainty).
 
