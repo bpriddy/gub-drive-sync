@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   findMany: vi.fn(),
   updateMany: vi.fn(),
   staffFindUnique: vi.fn(),
+  scanLogFindMany: vi.fn(),
   send: vi.fn(),
   writeScanLog: vi.fn(),
   loggerInfo: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('../../prisma', () => ({
   prisma: {
     driveChangeProposal: { findMany: mocks.findMany, updateMany: mocks.updateMany },
     staff: { findUnique: mocks.staffFindUnique },
+    driveScanLog: { findMany: mocks.scanLogFindMany },
   },
 }));
 vi.mock('../../config', () => ({ config: mocks.config }));
@@ -82,6 +84,7 @@ beforeEach(() => {
     .mockReset()
     .mockImplementation(async ({ where }: { where: { id: string } }) => STAFF[where.id] ?? null);
   mocks.send.mockReset().mockResolvedValue(SENT);
+  mocks.scanLogFindMany.mockReset().mockResolvedValue([]);
   mocks.writeScanLog.mockReset().mockResolvedValue(undefined);
   mocks.loggerInfo.mockReset();
   mocks.loggerWarn.mockReset();
@@ -318,8 +321,8 @@ describe('notifyReviewers: unusable reviewers', () => {
   ])('skips the batch for %s, logs each proposal and leaves it pending', async (_label, staff) => {
     mocks.staffFindUnique.mockResolvedValue(staff);
     mocks.findMany.mockResolvedValue([
-      row({ id: 'p1', accountId: 'acct-1', campaignId: null }),
-      row({ id: 'p2', accountId: 'acct-2', campaignId: 'camp-2' }),
+      row({ id: 'p1', accountId: 'acct-1', campaignId: null, syncRunId: 'run-1' }),
+      row({ id: 'p2', accountId: 'acct-2', campaignId: 'camp-2', syncRunId: 'run-2' }),
     ]);
 
     const result = await notifyReviewers();
@@ -329,7 +332,8 @@ describe('notifyReviewers: unusable reviewers', () => {
     expect(mocks.updateMany).not.toHaveBeenCalled();
     expect(mocks.writeScanLog.mock.calls.map((c) => c[0])).toEqual([
       {
-        syncRunId: null,
+        // Filed under the proposal's own sync run, not under no run at all.
+        syncRunId: 'run-1',
         accountId: 'acct-1',
         campaignId: null,
         level: 'warn',
@@ -338,7 +342,7 @@ describe('notifyReviewers: unusable reviewers', () => {
         payload: { proposalId: 'p1', reviewerStaffId: 'staff-1' },
       },
       {
-        syncRunId: null,
+        syncRunId: 'run-2',
         accountId: 'acct-2',
         campaignId: 'camp-2',
         level: 'warn',
@@ -347,6 +351,43 @@ describe('notifyReviewers: unusable reviewers', () => {
         payload: { proposalId: 'p2', reviewerStaffId: 'staff-1' },
       },
     ]);
+  });
+
+  it('writes the diagnostic once per proposal: later runs skip the ones already logged', async () => {
+    mocks.staffFindUnique.mockResolvedValue(null);
+    mocks.findMany.mockResolvedValue([row({ id: 'p1' }), row({ id: 'p2' })]);
+    mocks.scanLogFindMany.mockResolvedValue([
+      { payload: { proposalId: 'p1', reviewerStaffId: 'staff-1' } },
+    ]);
+
+    await notifyReviewers();
+
+    expect(mocks.scanLogFindMany).toHaveBeenCalledWith({
+      where: {
+        level: 'warn',
+        category: 'diagnostic',
+        message: 'Reviewer staff missing/inactive at notify time — proposal left pending',
+        OR: [
+          { payload: { path: ['proposalId'], equals: 'p1' } },
+          { payload: { path: ['proposalId'], equals: 'p2' } },
+        ],
+      },
+      select: { payload: true },
+    });
+    expect(mocks.writeScanLog.mock.calls.map((c) => c[0].payload.proposalId)).toEqual(['p2']);
+    // The Cloud Logging line still fires every run: the gap is still open.
+    expect(mocks.loggerWarn).toHaveBeenCalledWith(
+      { reviewerStaffId: 'staff-1', bucketSize: 2 },
+      '[drive.notify] reviewer staff not active or lacks email — skipping batch',
+    );
+  });
+
+  it('writes nothing when every proposal already carries the diagnostic', async () => {
+    mocks.staffFindUnique.mockResolvedValue(null);
+    mocks.findMany.mockResolvedValue([row({ id: 'p1' })]);
+    mocks.scanLogFindMany.mockResolvedValue([{ payload: { proposalId: 'p1' } }]);
+    await notifyReviewers();
+    expect(mocks.writeScanLog).not.toHaveBeenCalled();
   });
 
   it('continues with the next reviewer after skipping an unusable one', async () => {
