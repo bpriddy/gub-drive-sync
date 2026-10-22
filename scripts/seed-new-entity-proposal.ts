@@ -23,7 +23,7 @@
  *   # Seed a new campaign under an existing account, with two observations:
  *   npm run seed:new-entity -- \
  *     --entity-type campaign \
- *     --name "Diageo Spring Pitch" \
+ *     --name "Acme Spring Pitch" \
  *     --parent-account-id <uuid> \
  *     --source-drive-folder-id <drive-folder-id> \
  *     --reviewer-staff-id <uuid> \

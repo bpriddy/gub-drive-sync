@@ -231,12 +231,12 @@ export async function detectCampaignClusters(args: {
 
 // ── Deterministic round-robin clustering ────────────────────────────────────
 //
-// A single LLM call over a large roster (e.g. Chevy's 404 campaigns) is
+// A single LLM call over a large roster (e.g. an account's 404 campaigns) is
 // unreliable — the model can't exhaustively group hundreds of names in one
 // shot (observed: 1 cluster one run, 20+ the next).
 //
 // Sorting variants adjacent is brittle (assumes duplicates share a prefix:
-// "Red Tag" vs "Chevy Red Tag Holiday Event" never sort together). Random
+// "Spring Sale" vs "Acme Spring Sale Holiday Event" never sort together). Random
 // shuffles fix that but pay a coupon-collector penalty — to GUARANTEE every
 // pair has shared a window you'd need ~(N/W)·ln(#pairs) rounds, ~15× the floor.
 //

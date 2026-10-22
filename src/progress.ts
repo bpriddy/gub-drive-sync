@@ -216,7 +216,7 @@ export const progress = {
     write(c(GRAY, `  (${text})`));
   },
 
-  /** Before each per-entity scan: "→ Scanning account: Chevy". */
+  /** Before each per-entity scan: "→ Scanning account: Acme". */
   entity(label: string): void {
     write('');
     write(c(BOLD, `→ Scanning ${label}`));

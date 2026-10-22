@@ -2,7 +2,7 @@
  * probe-permission-test.ts — Definitive permission-vs-API test.
  *
  * Background:
- *   Probing the Chevy drive showed revisions.list returns 0 for actively-
+ *   Probing the test account's drive showed revisions.list returns 0 for actively-
  *   edited Google-native files. Two hypotheses:
  *
  *     (P) Permissions: the bot has Viewer/Commenter role on those files,

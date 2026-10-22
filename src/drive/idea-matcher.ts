@@ -3,9 +3,9 @@
  *
  * An idea is a LIVING entity, not a per-deck snapshot. The same creative
  * concept shows up across many decks (a pitch, then refinement rounds, then a
- * creative review) under drifting names and reworded facets — BHAC's "LMA
- * Character Generator" appeared ~9 times as "Character Creator Portal",
- * "American Favorites Dealer Kit", "AI Character Web Experience"… all ONE idea.
+ * creative review) under drifting names and reworded facets — one account's
+ * "Character Generator" appeared ~9 times as "Character Creator Portal",
+ * "Dealer Kit", "AI Character Web Experience"… all ONE idea.
  *
  * So before persisting a freshly-extracted idea we ask: is this the SAME idea
  * as one we already know for this account? If yes, we MERGE its facets into the

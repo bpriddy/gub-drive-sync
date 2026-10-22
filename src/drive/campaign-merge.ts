@@ -130,7 +130,7 @@ type ClusterOutcome =
 //
 // A campaign = a name + a year. "Truck Season 2025" and a Truck Season under
 // the 2024 folder are TWO campaigns. The year is STRUCTURAL: project folders
-// live under year folders (… / 2026 / 13. Chevy | BHAC …), captured in
+// live under year folders (… / 2026 / 13. Acme | Program B …), captured in
 // campaign.drive_folder_path at creation. The detector clusters by name
 // meaning only; this gate then keeps together only same-year members.
 //

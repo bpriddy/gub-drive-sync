@@ -45,7 +45,7 @@ producing**: a commercial, a social series, a merch/collectible line, a tool,
 an activation. Not a discipline, not a workstream, not an unproduced concept.
 
 - **Identity = job number, when one exists — hard and authoritative.**
-  Agency bracket codes on project folders (`[GMCHV55000216]`) are
+  Agency bracket codes on project folders (`[ACME55000216]`) are
   billing-grade identity: same number = same piece always; different numbers
   = different pieces always; job-number matching OUTRANKS all name/meaning
   matching. Name identity is the fallback for content-born pieces until a

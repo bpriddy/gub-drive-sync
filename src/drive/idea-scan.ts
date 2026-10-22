@@ -7,7 +7,7 @@
  * idea extraction (which re-verifies the gate itself — the two calls agree by
  * design), then the account-scoped match+merge (add new facets, supersede
  * refined ones), then persistence (idea + idea_changes) — the same
- * add-and-overwrite semantics the extract-ideas harness validated on BHAC.
+ * add-and-overwrite semantics the extract-ideas harness validated on a test campaign.
  *
  * A context object carries the per-scan known-ideas cache: loaded lazily on
  * the first deck, then advanced in memory as ideas are created/merged, so

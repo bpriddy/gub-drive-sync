@@ -3,7 +3,7 @@
 Status: DRAFT for team review, 2026-08-13. Builds on the scan-core
 extraction (`src/scan/` — PR `v2/scan-core-extraction`) and the decision
 record in [edit-stats-decision.md](./edit-stats-decision.md) (scope
-granted + probe-verified: Activity API live, ~1y retention on Chevy).
+granted + probe-verified: Activity API live, ~1y retention on the test account).
 
 ## What Phase 1 delivers
 
@@ -141,7 +141,7 @@ across years of history), per the human-reviews-AI contract.
 
 ## Validation plan (pre-live, DB nukeable)
 
-1. Dev, Chevy: set cursor = bootstrap completion; make a handful of
+1. Dev, test account: set cursor = bootstrap completion; make a handful of
    real Drive edits; run one forward row via admin Sync; verify dossier
    deltas carry the real event day and `drive_edit_stats` rows appear
    with resolved emails.

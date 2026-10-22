@@ -4,7 +4,7 @@
  * Folders holding nothing but binary assets (fonts, images, video, design
  * files) never reach the per-file extraction prompt: extractText skips
  * every file on mime, so neither the location-context observation nor the
- * asset facts ("the brand typeface is Louis") ever fire for them. This
+ * asset facts ("the brand typeface is Brandface") ever fire for them. This
  * module covers that gap with ONE small LLM call per such folder, judging
  * from the only evidence available — the folder path and the file names.
  *
@@ -35,7 +35,7 @@ export interface InterpretAssetFolderInput {
   accountName: string | null;
   /** The campaign owning this folder's zone, or null in account space. */
   campaignName: string | null;
-  /** Breadcrumb path of the folder, e.g. "Chevy / Brand Assets / Fonts". */
+  /** Breadcrumb path of the folder, e.g. "Acme / Brand Assets / Fonts". */
   folderPath: string;
   fileNames: string[];
 }

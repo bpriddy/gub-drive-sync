@@ -42,7 +42,7 @@ The Activity API is the only source that records **every** actor's edit
 events (including simultaneous co-editing), which is what makes the
 all-editors bar reachable at event granularity.
 
-## Verified facts (probe-activity, Chevy drive, 2026-07-20)
+## Verified facts (probe-activity, test account drive, 2026-07-20)
 
 - Bot scope **granted**: `drive.activity.readonly` consented via
   gub-bot-oauth (the scope was an uncommitted edit in `src/bots.ts`;

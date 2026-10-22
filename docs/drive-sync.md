@@ -540,7 +540,7 @@ Cloud Run Job resource limits (terraform / cloudbuild yaml):
 
 | Setting | Value | Why |
 |---|---|---|
-| `--memory` | 2Gi | OOM'd at 1Gi on Chevy's large day-buckets. The `[mem]` heap watcher logs every 30s for diagnostics. |
+| `--memory` | 2Gi | OOM'd at 1Gi on the largest account's day-buckets. The `[mem]` heap watcher logs every 30s for diagnostics. |
 | `--cpu` | 1 | I/O-bound (Drive + Gemini). 1 CPU is enough. |
 | `--task-timeout` | 86400s (24h) | Conservative cap; individual chunks aim for ~5-45 min. |
 | `--parallelism` | 1 | One execution per Job at a time. Continuation chains chunks; in-execution synth is parallel via worker pool. |
