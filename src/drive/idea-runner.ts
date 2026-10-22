@@ -96,13 +96,18 @@ export function renderFacets(facets: string[]): string {
   return facets.map((f) => `- ${f}`).join('\n');
 }
 
-/** Order-insensitive set equality — skip no-op updates so re-runs don't churn. */
+/**
+ * Order-insensitive equality (case and surrounding space ignored) — skip
+ * no-op updates so re-runs don't churn. Compared as multisets: a merge that
+ * collapses a distinct row into a duplicate of another (['a','b'] → ['a','a'])
+ * is a change and must be written, not skipped.
+ */
 export function facetsEqual(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
-  const norm = (xs: string[]) => new Set(xs.map((x) => x.trim().toLowerCase()));
-  const sa = norm(a);
-  for (const x of norm(b)) if (!sa.has(x)) return false;
-  return true;
+  const norm = (xs: string[]) => xs.map((x) => x.trim().toLowerCase()).sort();
+  const na = norm(a);
+  const nb = norm(b);
+  return na.every((x, i) => x === nb[i]);
 }
 
 export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise<IdeaRunResult> {
