@@ -9,6 +9,7 @@ import { config } from '../config';
 import { prisma } from '../prisma';
 import {
   buildAttributor,
+  capFolderTree,
   classifyFolders,
   depthCapFor,
   gatherFolders,
@@ -106,13 +107,25 @@ export async function resolveAccountStructure(
         : undefined;
     if (depthCap !== undefined) log(`  Classify depth cap: ${depthCap}`);
 
-    const fingerprint = structureFingerprint(
-      folders.map((f) => ({ id: f.id, name: f.name, parentId: f.parentId })),
-    );
+    // Fingerprint the tree the classifier sees: with a cap, a change below it
+    // no longer triggers a reclassify.
+    const fingerprintAt = (cap: number | undefined): string =>
+      structureFingerprint(
+        (cap === undefined ? folders : capFolderTree(folders, cap, anchorFolderIds).folders).map(
+          (f) => ({ id: f.id, name: f.name, parentId: f.parentId }),
+        ),
+      );
+    const fingerprint = fingerprintAt(depthCap);
     if (cached?.entityMap && cached.fingerprint === fingerprint) {
       log(`  ✓ Structure cache VALID  (fingerprint=${fingerprint.slice(0, 12)}… unchanged)`);
       log(`    Skipping ~1m45s LLM classify.`);
-      entityMap = cached.entityMap as EntityMap;
+      const reused = cached.entityMap as EntityMap;
+      // A capped fingerprint misses folders created or moved below the cap:
+      // attribute through this run's folder list, not the cached one.
+      entityMap =
+        depthCap === undefined
+          ? reused
+          : { ...reused, allFolders: folders, folderCount: folders.length };
     } else {
       if (cached?.entityMap) {
         log(`  Structure drift detected (fingerprint changed) — re-classifying.`);
@@ -129,12 +142,25 @@ export async function resolveAccountStructure(
         }),
       );
       if (opts.persistCache) {
+        // Store what the next run computes on an unchanged tree: its cap
+        // comes from this classification, not the previous one.
+        const nextFingerprint =
+          depthCap === undefined
+            ? fingerprint
+            : fingerprintAt(
+                depthCapFor(
+                  folders,
+                  entityMap.classified,
+                  anchorFolderIds,
+                  config.CLASSIFY_DEFAULT_DEPTH_CAP,
+                ),
+              );
         await persistStructureCache(ctx.accountId, {
-          fingerprint,
+          fingerprint: nextFingerprint,
           entityMap,
           folders,
         });
-        log(`  ✓ Structure cache WRITTEN  (fingerprint=${fingerprint.slice(0, 12)}…)`);
+        log(`  ✓ Structure cache WRITTEN  (fingerprint=${nextFingerprint.slice(0, 12)}…)`);
       }
     }
   }
