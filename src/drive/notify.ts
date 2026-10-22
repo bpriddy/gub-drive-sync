@@ -274,7 +274,9 @@ function renderReviewEmail(i: RenderInput): { subject: string; text: string; htm
     parts.push(`${i.fieldChanges} ${i.fieldChanges === 1 ? 'change' : 'changes'}`);
   }
   const summary = parts.length > 0 ? parts.join(' and ') : 'items';
-  const subject = `Drive sync: ${summary} need your review`;
+  // "1 change needs", but "2 changes need" and "1 new folder and 1 change need".
+  const singular = parts.length === 1 && i.newEntityGroups + i.fieldChanges === 1;
+  const subject = `Drive sync: ${summary} ${singular ? 'needs' : 'need'} your review`;
 
   const text = [
     `Hi ${i.reviewerName},`,

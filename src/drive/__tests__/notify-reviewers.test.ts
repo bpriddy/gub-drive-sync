@@ -191,7 +191,7 @@ describe('notifyReviewers: grouping', () => {
     ]);
     await notifyReviewers();
     const msg = mocks.send.mock.calls[0]![0];
-    // Wording pinned as shipped, singular "need" included; a copy fix updates these strings.
+    // The verb agrees with the summary: plural for counts above 1 and for "X and Y".
     expect(msg.subject).toBe('Drive sync: 2 new folders and 2 changes need your review');
     expect(msg.text).toContain('Hi Ada Example,');
     expect(msg.text).toContain('found 2 new folders and 2 changes for accounts you own');
@@ -207,6 +207,24 @@ describe('notifyReviewers: grouping', () => {
     expect(mocks.send.mock.calls[0]![0].subject).toBe(
       'Drive sync: 1 new folder and 1 change need your review',
     );
+  });
+
+  it.each([
+    ['one change', [row({ id: 'p1' })], 'Drive sync: 1 change needs your review'],
+    [
+      'one new folder',
+      [row({ id: 'p1', kind: 'new_entity', proposalGroupId: 'grp-1' })],
+      'Drive sync: 1 new folder needs your review',
+    ],
+    [
+      'several changes',
+      [row({ id: 'p1' }), row({ id: 'p2' }), row({ id: 'p3' })],
+      'Drive sync: 3 changes need your review',
+    ],
+  ])('agrees the verb with the subject: %s', async (_label, rows, subject) => {
+    mocks.findMany.mockResolvedValue(rows);
+    await notifyReviewers();
+    expect(mocks.send.mock.calls[0]![0].subject).toBe(subject);
   });
 
   it('falls back to "items" when the bundle holds only other kinds', async () => {
@@ -306,7 +324,7 @@ describe('notifyReviewers: orphans', () => {
     const result = await notifyReviewers();
     expect(result).toMatchObject({ ownersEmailed: 1, proposalsNotified: 1, orphansLogged: 1 });
     expect(mocks.updateMany.mock.calls[0]![0].where).toEqual({ id: { in: ['p1'] } });
-    expect(mocks.send.mock.calls[0]![0].subject).toBe('Drive sync: 1 change need your review');
+    expect(mocks.send.mock.calls[0]![0].subject).toBe('Drive sync: 1 change needs your review');
   });
 });
 
