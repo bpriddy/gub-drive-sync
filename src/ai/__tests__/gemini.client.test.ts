@@ -28,6 +28,7 @@ vi.mock('../../logger', () => ({ logger: loggerMock }));
 import { GeminiLlmDriver } from '../gemini.client';
 import { isRetryableLlmError, LlmTimeoutError } from '../retryable';
 import { llmUsageByTag, resetLlmUsage } from '../usage-tally';
+import { config } from '../../config';
 
 function okResponse(text = '{"ok":true}', finishReason = 'STOP'): Response {
   return new Response(
@@ -319,5 +320,53 @@ describe('GeminiLlmDriver usage line', () => {
         maxTokensFinishes: 0,
       },
     ]);
+  });
+});
+
+describe('GeminiLlmDriver thinking level from GEMINI_THINKING_BY_TAG', () => {
+  const sentConfig = (): Record<string, unknown> => {
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body)) as {
+      generationConfig?: Record<string, unknown>;
+    };
+    return body.generationConfig ?? {};
+  };
+
+  beforeEach(() => {
+    fetchMock.mockImplementation(async () => okResponse());
+  });
+
+  afterEach(() => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = undefined;
+  });
+
+  it('sends no thinking parameter when the map is empty or absent', async () => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = {};
+    await driver().complete(REQ);
+    expect(sentConfig()).not.toHaveProperty('thinkingConfig');
+  });
+
+  it('sends the mapped level for a tag, by exact tag or call-type name', async () => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = {
+      'unit.test': 'LOW',
+      distill: 'MINIMAL',
+    };
+    await driver().complete(REQ);
+    expect(sentConfig()).toMatchObject({ thinkingConfig: { thinkingLevel: 'LOW' } });
+    fetchMock.mockClear();
+    await driver().complete({ ...REQ, tag: 'drive.distillation.v1' });
+    expect(sentConfig()).toMatchObject({ thinkingConfig: { thinkingLevel: 'MINIMAL' } });
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      expect.objectContaining({ tag: 'drive.distillation.v1', thinkingLevel: 'MINIMAL' }),
+      '[gemini] generateContent finished',
+    );
+  });
+
+  it("never adds a level to a caller's own thinking budget (the two together are a 400)", async () => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = {
+      'unit.test': 'LOW',
+    };
+    await driver().complete({ ...REQ, thinkingBudget: 0 });
+    expect(sentConfig()).toMatchObject({ thinkingConfig: { thinkingBudget: 0 } });
+    expect(sentConfig()['thinkingConfig']).not.toHaveProperty('thinkingLevel');
   });
 });

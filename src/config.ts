@@ -7,6 +7,7 @@
  * needed: this Job has no HTTP surface, no auth issuance, no CORS.
  */
 import { z } from 'zod';
+import { parseThinkingMap } from './ai/thinking';
 
 /** A per-request timeout in ms; `0` disables it (the pre-timeout behaviour). */
 const timeoutMs = (fallback: string) =>
@@ -132,6 +133,25 @@ const EnvSchema = z.object({
   GEMINI_TIMEOUT_CLASSIFY_MS: timeoutMs('420000'),
   /** Every other Gemini call (synthesis, ideas, asset folders, merges…). */
   GEMINI_TIMEOUT_DEFAULT_MS: timeoutMs('300000'),
+
+  /**
+   * Thinking level per Gemini call (#69): a JSON object from a call tag, or
+   * a short call-type name such as "interpret" or "distill" (src/ai/
+   * thinking.ts), to MINIMAL | LOW | MEDIUM | HIGH. Empty, the default,
+   * sends no thinking parameter: every call runs at the model's default
+   * level, as before. That is the rollback.
+   */
+  GEMINI_THINKING_BY_TAG: z
+    .string()
+    .default('{}')
+    .transform((raw, ctx) => {
+      try {
+        return parseThinkingMap(raw);
+      } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: (err as Error).message });
+        return z.NEVER;
+      }
+    }),
   /** Drive / Docs / Slides / Sheets / Activity / People reads. */
   DRIVE_READ_TIMEOUT_MS: timeoutMs('60000'),
   /** Binary downloads (files.get alt=media), headers + body. */

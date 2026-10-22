@@ -29,6 +29,7 @@ import { jitteredDelayMs } from '../backoff';
 import { isRetryableLlmError, LlmTimeoutError } from './retryable';
 import { raiseFetchTimeouts, requiredFetchTimeoutMs } from './fetch-timeouts';
 import { recordLlmUsage } from './usage-tally';
+import { thinkingLevelFor } from './thinking';
 import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } from './ai.types';
 
 /**
@@ -94,6 +95,13 @@ export class GeminiLlmDriver implements LlmDriver {
     // Per-attempt deadline. httpOptions.timeout makes the SDK abort the
     // fetch and send X-Server-Timeout so the server gives up too.
     const timeoutMs = req.timeoutMs ?? config.GEMINI_TIMEOUT_DEFAULT_MS;
+    // A caller's own thinking setting wins. Otherwise GEMINI_THINKING_BY_TAG
+    // decides, and a tag it does not map sends no thinking parameter (#69).
+    const thinkingLevel =
+      req.thinkingLevel ??
+      (req.thinkingBudget === undefined
+        ? thinkingLevelFor(req.tag, config.GEMINI_THINKING_BY_TAG ?? {})
+        : undefined);
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const attemptStartedAt = Date.now();
@@ -110,8 +118,8 @@ export class GeminiLlmDriver implements LlmDriver {
             ...(req.maxOutputTokens ? { maxOutputTokens: req.maxOutputTokens } : {}),
             ...(req.thinkingBudget !== undefined
               ? { thinkingConfig: { thinkingBudget: req.thinkingBudget } }
-              : req.thinkingLevel !== undefined
-                ? { thinkingConfig: { thinkingLevel: req.thinkingLevel as ThinkingLevel } }
+              : thinkingLevel !== undefined
+                ? { thinkingConfig: { thinkingLevel: thinkingLevel as ThinkingLevel } }
                 : {}),
           },
         });
@@ -158,6 +166,7 @@ export class GeminiLlmDriver implements LlmDriver {
             attempt,
             finishReason,
             blockReason: res.promptFeedback?.blockReason ?? null,
+            thinkingLevel: thinkingLevel ?? null,
             durationMs: Date.now() - attemptStartedAt,
             promptTokens: usage?.promptTokens ?? null,
             thoughtsTokens: usage?.thoughtsTokens ?? null,
@@ -282,9 +291,17 @@ function allowConfiguredDeadlines(): void {
   );
 }
 
+function logThinkingLevels(): void {
+  const levels = config.GEMINI_THINKING_BY_TAG;
+  if (Object.keys(levels).length > 0) {
+    logger.info({ levels }, '[llm] thinking levels by call tag');
+  }
+}
+
 function createDriver(): LlmDriver {
   if (config.GEMINI_USE_ENTERPRISE && config.GCP_PROJECT_ID) {
     allowConfiguredDeadlines();
+    logThinkingLevels();
     logger.info(
       { project: config.GCP_PROJECT_ID, location: config.GEMINI_LOCATION },
       '[llm] Gemini Enterprise Agent Platform (ADC auth)',
@@ -296,6 +313,7 @@ function createDriver(): LlmDriver {
   }
   if (config.GEMINI_API_KEY) {
     allowConfiguredDeadlines();
+    logThinkingLevels();
     return new GeminiLlmDriver({ apiKey: config.GEMINI_API_KEY });
   }
   logger.warn(
