@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "kind": "eval-ideas-run",
+  "startedAt": "2026-01-01T00:00:00.000Z",
+  "finishedAt": "2026-01-01T00:01:00.000Z",
+  "driver": "synthetic-example",
+  "model": "hand-written, not a model output",
+  "maxUsd": 1,
+  "spentUsd": 0,
+  "stoppedByBudget": null,
+  "calls": [],
+  "decks": [
+    {
+      "id": "deck-01",
+      "deckType": "pitch",
+      "ideas": [
+        {
+          "name": "Night Owl Route",
+          "facets": [
+            "late-night radio takeover from midnight to 5 am",
+            "owl mascot hosts the show and reads shift stories",
+            "warm, tongue in cheek"
+          ]
+        },
+        {
+          "name": "Kitchen Table Stories",
+          "facets": [
+            "families film short clips at the kitchen table after a night shift",
+            "social-first vertical video"
+          ]
+        },
+        {
+          "name": "Coffee that keeps night workers going",
+          "facets": ["positions the coffee as the night-shift drink"]
+        }
+      ],
+      "error": null
+    },
+    {
+      "id": "deck-02",
+      "deckType": "creative_review",
+      "ideas": [
+        {
+          "name": "The Night Owl Podcast",
+          "facets": [
+            "radio takeover grows into a weekly podcast",
+            "owl mascot host",
+            "best shift stories become posters"
+          ]
+        },
+        {
+          "name": "Pocket Postcards",
+          "facets": [
+            "illustrated postcards tucked into cup sleeves",
+            "thank-you note to a night worker"
+          ]
+        },
+        {
+          "name": "Night Owl posters",
+          "facets": ["best listener shift stories become posters"]
+        }
+      ],
+      "error": null
+    },
+    { "id": "deck-03", "deckType": "other", "ideas": [], "error": null },
+    {
+      "id": "deck-04",
+      "deckType": "pitch",
+      "ideas": [
+        {
+          "name": "Night Shift Heroes",
+          "facets": [
+            "documentary series following three night-shift workers",
+            "earnest tone",
+            "long-form on the brand's channel"
+          ]
+        }
+      ],
+      "error": null
+    }
+  ],
+  "merge": {
+    "ran": true,
+    "decisions": [
+      {
+        "account": "Example Co",
+        "deckId": "deck-01",
+        "ideaIndex": 0,
+        "clusterId": "row-1",
+        "action": "create"
+      },
+      {
+        "account": "Example Co",
+        "deckId": "deck-01",
+        "ideaIndex": 1,
+        "clusterId": "row-2",
+        "action": "create"
+      },
+      {
+        "account": "Example Co",
+        "deckId": "deck-01",
+        "ideaIndex": 2,
+        "clusterId": "row-3",
+        "action": "create"
+      },
+      {
+        "account": "Example Co",
+        "deckId": "deck-02",
+        "ideaIndex": 0,
+        "clusterId": "row-1",
+        "action": "update"
+      },
+      {
+        "account": "Example Co",
+        "deckId": "deck-02",
+        "ideaIndex": 1,
+        "clusterId": "row-4",
+        "action": "create"
+      },
+      {
+        "account": "Example Co",
+        "deckId": "deck-02",
+        "ideaIndex": 2,
+        "clusterId": "row-1",
+        "action": "noop"
+      },
+      {
+        "account": "Example Co",
+        "deckId": "deck-04",
+        "ideaIndex": 0,
+        "clusterId": "row-1",
+        "action": "update"
+      }
+    ],
+    "clusters": [
+      {
+        "id": "row-1",
+        "account": "Example Co",
+        "name": "Night Owl Route",
+        "facets": [
+          "weekly podcast grown from a late-night radio takeover",
+          "owl mascot hosts the show",
+          "owl mascot hosts the show.",
+          "documentary series following night-shift workers"
+        ]
+      },
+      {
+        "id": "row-2",
+        "account": "Example Co",
+        "name": "Kitchen Table Stories",
+        "facets": [
+          "families film short clips at the kitchen table after a night shift",
+          "social-first vertical video"
+        ]
+      },
+      {
+        "id": "row-3",
+        "account": "Example Co",
+        "name": "Coffee that keeps night workers going",
+        "facets": ["positions the coffee as the night-shift drink"]
+      },
+      {
+        "id": "row-4",
+        "account": "Example Co",
+        "name": "Pocket Postcards",
+        "facets": [
+          "illustrated postcards tucked into cup sleeves",
+          "thank-you note to a night worker"
+        ]
+      }
+    ]
+  }
+}

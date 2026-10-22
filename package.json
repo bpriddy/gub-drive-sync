@@ -10,6 +10,7 @@
     "dev": "tsx -r dotenv/config src/main.ts",
     "typecheck": "prisma generate && tsc --noEmit",
     "test": "vitest run",
+    "eval-ideas": "tsx -r dotenv/config scripts/eval-ideas.ts",
     "seed:status": "tsx -r dotenv/config scripts/seed-status-proposal.ts",
     "seed:new-entity": "tsx -r dotenv/config scripts/seed-new-entity-proposal.ts",
     "backfill": "tsx -r dotenv/config src/backfill/index.ts",
