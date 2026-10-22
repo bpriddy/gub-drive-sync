@@ -94,19 +94,100 @@ this (the operator-facing label switches based on bootstrap state).
 
 ## Forward sync (after bootstrap)
 
-Once bootstrap completes, the account moves to forward sync:
+Once bootstrap completes, the account moves to forward sync, the
+Activity-driven driver in `src/forward/run.ts` (design:
+[`forward-sync-v2-design.md`](./forward-sync-v2-design.md)):
 
-- Cloud Scheduler triggers daily at ~02:00 UTC (configurable in
-  terraform).
-- Engine reads `accounts.drive_activity_page_token`, polls Drive
-  Activity API for changes since that token, processes only the
-  changed files, advances the token.
-- Per-file stamping uses actual edit timestamps from the activity
-  events (not synthetic "today" dates).
+- The Cloud Scheduler job `drive-poll-<env>` starts the Job in mode
+  `forward-all`. That queues one `forward` run per bootstrap-completed
+  account and drains the queue in the same execution. The job kept its old
+  `drive-poll` name because renaming it would recreate it.
+- Each run asks the Drive Activity API for everything under the account's
+  Drive root in `(drive_forward_cursor_at, now]`, re-reading the last 2
+  minutes (`OVERLAP_MS`) to absorb ingestion lag. It asks for 500
+  activities per page (a size hint: a page can hold more, fewer or none)
+  and follows `nextPageToken` until none is returned.
+- Every changed file is scanned once, in one batch dated by the run (the
+  run's UTC date), however many days it changed on. The scan proposes;
+  review applies.
+- Edit stats (`drive_edit_stats`): one row per (file, editor) holding the
+  count for the whole window, dated by the run. A retry replaces its own
+  rows.
+- The cursor moves to the run's end time only after the scan and the edit
+  stats are written. A failed run leaves it where it was, so the retry
+  reads the whole window again.
+- Reviewers are notified at the end of each run that changed something.
 
-**Status today**: forward mode runs through the same engine path as
-bootstrap (walks modifiedTime buckets). True Activity-driven forward
-sync is the next milestone.
+### Cadence
+
+The schedule has two owners, one after the other:
+
+1. **Terraform sets the initial value.** GUB `terraform/drive_poll.tf`
+   creates the job from `drive_poll_initial_schedule` and
+   `drive_poll_time_zone` (`terraform/variables.tf`).
+2. **gub-admin owns it afterwards.** The job's `schedule` and `paused`
+   are in `lifecycle.ignore_changes`, so a later `terraform apply` never
+   resets them. Change the cadence in gub-admin → Data Sources → Google
+   Drive → Poll scheduler (every 1, 2, 6 or 12 hours, daily at 7am ET, or
+   weekly on Mondays at 7am ET), and pause or resume it there.
+
+| Environment | Initial schedule (terraform) | Live | Notes |
+|---|---|---|---|
+| dev | `0 7 * * *`, America/New_York: the variable default (`environments/dev.tfvars` does not override it) | Daily at 07:00 New York (11:00 UTC in summer time, 12:00 in winter), enabled; checked 2026-10-22 | Stays daily: a weekly window would skew the test data. |
+| staging, prod | No tfvars file yet, so the same default applies when they are created | Not deployed | Choose daily or weekly when the environment is set up; read the next section before choosing weekly. |
+
+### Before switching an environment to weekly
+
+No part of the run is built around 24 hours: the window is whatever lies
+between the cursor and now, and nothing caps files, events or proposals. A
+7-day window should run end to end, but no weekly run has been tried yet.
+What changes, on one dev account: the daily column covers the 27 of 30
+daily runs (2026-09-22 to 2026-10-21) that found changes, and the weekly
+column sums 7 consecutive runs. The weekly figures are upper bounds,
+because a file changed on several days is scanned once in a weekly window.
+
+| | Daily run | Weekly run |
+|---|---|---|
+| Activity events | median ~200, max 420 (about 1 page) | median ~1,000, max ~1,500 (about 2–3 pages) |
+| Changed files scanned | median 18, max 66 | up to ~150 |
+| Run time | 6–18 min | up to about 40–60 min (the task timeout is 24 h) |
+| Observations per account in one distillation call | median 30, max 134 | up to ~180 at the median, ~280 at most |
+
+- **Distillation is the risk.** Stage 3 sends every observation of an
+  account or campaign to the model in one call. In those 30 daily runs,
+  3 distillations failed: two hit rate limits, and one answer was cut off
+  on a 96-observation account batch (a 134-observation batch succeeded in
+  another run). Weekly batches would be about 2–6 times larger, and a weekly
+  run sends many more model calls at once. A failed distillation either
+  loses that entity's proposals for the window, or, where failed
+  distillations hold the cursor, fails the run; a failure caused by the
+  batch size then repeats on every retry. Split large batches, or try one
+  weekly window on a test account, before any environment runs weekly.
+- **A failed window can cost a week.** The queue retries a failed run (3
+  attempts; where retries run inside the same execution, about 1 and 2
+  minutes apart). If every attempt fails, or the process dies (for example
+  out of memory), the window waits for the next scheduled execution: under
+  a weekly cadence a week later, and the window has grown by another week.
+- **Alerts.** If the stalled-run alert in GUB terraform
+  (`drive_forward_run_stalled`, switched by
+  `drive_forward_stall_alert_enabled`) is enabled for the environment, it
+  expects a completed forward run about every 25 hours, so under a weekly
+  cadence it stays open six days a week: turn it off there. An alert on a
+  log-based metric cannot look back further than 25 hours, so a weekly
+  check needs another signal.
+- **Edit stats.** A week of edits is dated by the run day. Totals per
+  editor stay right, but a per-day view shows the whole week on that day.
+- **Review.** Reviewers get one notification per run, so one per week for
+  the whole week's proposals (about 55 on the dev account). Proposals
+  expire after `DRIVE_PROPOSAL_TTL_DAYS` (14), that is after two weekly runs.
+- **Freshness.** What the scan writes itself is refreshed once a week:
+  piece status texts and, where the scan records file snapshots, the Drive
+  file-name index. Account and campaign status texts follow the review:
+  they change when a reviewer approves a proposal.
+
+To switch, pick "Weekly, Mondays at 7am ET" in the Poll scheduler and save;
+to switch back, pick "Daily at 7am ET". The first run after switching back
+covers everything since the last weekly run.
 
 ---
 
