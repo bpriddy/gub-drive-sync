@@ -121,12 +121,15 @@ the mode; subsequent flags are mode-specific (`--sync-run-id=<uuid>` for
 
 ## CI / CD
 
-Same convention as the other GUB repos. Single Cloud Build trigger on
-`main` → `cloudbuild/dev.yaml`, deploying the Cloud Run Job
-`gub-drive-sync-dev`. `staging.yaml` / `prod.yaml` are committed for
-when prod exists; their triggers are added then. Unlike a Service, a
-Job has **no traffic/promotion step** — `jobs deploy` updates the
-definition and the next `jobs:run` uses the new image.
+GitHub Actions deploys: `.github/workflows/deploy.yml` builds the image
+and updates the Cloud Run Job `gub-drive-sync-dev` on every push to `main`
+(or a manual dispatch). That workflow is the single source of runtime
+config. Deployment identifiers are not in it: they come from repository
+secrets (listed in its header, masked in run logs), and a deploy with one
+unset fails before it touches anything. `cloudbuild/staging.yaml` / `prod.yaml` remain as
+provisioning references until those environments are ported. Unlike a
+Service, a Job has **no traffic/promotion step** — `jobs deploy` updates
+the definition and the next `jobs:run` uses the new image.
 
 ### First-time GCP bootstrap
 

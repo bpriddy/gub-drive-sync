@@ -471,10 +471,12 @@ src/heal/                       Drive-aware staff/account healing (older).
 prisma/schema.prisma            Mirrored schema (drive_sync_runs +
                                 accounts/campaigns fields).
 
-cloudbuild/
-  dev.yaml                      Cloud Build trigger for dev environment.
-                                --memory=2Gi --cpu=1. Heartbeat watcher
-                                in engine relies on this headroom.
+.github/workflows/deploy.yml    Deploys the dev Cloud Run Job. Its FLAGS
+                                are the runtime config: --memory=2Gi
+                                --cpu=1. Heartbeat watcher in engine
+                                relies on this headroom.
+cloudbuild/                     staging.yaml / prod.yaml: provisioning
+                                references for unported environments.
 
 docs/
   drive-sync.md                 This file.

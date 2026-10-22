@@ -443,7 +443,7 @@ applied before pushing the others.
 
 ### Cloud Run Job config
 
-`cloudbuild/dev.yaml`:
+`.github/workflows/deploy.yml` (the dev `FLAGS`):
 
 ```yaml
 - --tasks=1
