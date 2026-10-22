@@ -26,7 +26,7 @@ vi.mock('../../config', () => ({
 vi.mock('../../logger', () => ({ logger: loggerMock }));
 
 import { GeminiLlmDriver } from '../gemini.client';
-import { isRetryableLlmError, LlmTimeoutError } from '../retryable';
+import { isRetryableLlmError, LlmTimeoutError, LlmTruncatedError } from '../retryable';
 import { llmUsageByTag, resetLlmUsage } from '../usage-tally';
 import { config } from '../../config';
 
@@ -223,8 +223,10 @@ describe('GeminiLlmDriver per-attempt deadline', () => {
 
 describe('GeminiLlmDriver finish logging', () => {
   it('logs finishReason for every completed call at INFO', async () => {
-    fetchMock.mockResolvedValue(okResponse('{"truncat', 'MAX_TOKENS'));
-    await driver().complete(REQ);
+    // A cut-off answer is still a completed call: its INFO line comes first,
+    // then the truncation guard fails the attempt.
+    fetchMock.mockImplementation(async () => okResponse('{"truncat', 'MAX_TOKENS'));
+    await expect(driver().complete(REQ)).rejects.toBeInstanceOf(LlmTruncatedError);
     expect(loggerMock.info).toHaveBeenCalledWith(
       expect.objectContaining({
         model: 'gemini-test',
@@ -368,5 +370,54 @@ describe('GeminiLlmDriver thinking level from GEMINI_THINKING_BY_TAG', () => {
     await driver().complete({ ...REQ, thinkingBudget: 0 });
     expect(sentConfig()).toMatchObject({ thinkingConfig: { thinkingBudget: 0 } });
     expect(sentConfig()['thinkingConfig']).not.toHaveProperty('thinkingLevel');
+  });
+});
+
+describe('GeminiLlmDriver truncation guard', () => {
+  it('treats a MAX_TOKENS answer as a failed attempt and retries it', async () => {
+    fetchMock
+      .mockResolvedValueOnce(okResponse('{"cut', 'MAX_TOKENS'))
+      .mockResolvedValueOnce(okResponse('{"ok":true}', 'STOP'));
+    const res = await driver().complete({ ...REQ, maxOutputTokens: 16384 });
+    expect(res.text).toBe('{"ok":true}');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tag: 'unit.test',
+        attempt: 1,
+        maxAttempts: 2,
+        maxOutputTokens: 16384,
+        outputTokens: 3,
+      }),
+      '[gemini] answer cut off at the output token limit',
+    );
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ attempt: 1, retryable: true, willRetry: true }),
+      '[gemini] generateContent attempt failed',
+    );
+  });
+
+  it('fails the call after two cut-off attempts, instead of returning a fragment', async () => {
+    fetchMock.mockImplementation(async () => okResponse('{"cut', 'MAX_TOKENS'));
+    await expect(driver().complete(REQ)).rejects.toBeInstanceOf(LlmTruncatedError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sleeps).toHaveLength(1);
+  });
+
+  it('counts the cut-off attempts in the per-tag totals', async () => {
+    resetLlmUsage();
+    fetchMock
+      .mockResolvedValueOnce(okResponse('{"cut', 'MAX_TOKENS'))
+      .mockResolvedValueOnce(okResponse());
+    await driver().complete(REQ);
+    expect(llmUsageByTag()).toEqual([
+      expect.objectContaining({ tag: 'unit.test', calls: 2, maxTokensFinishes: 1 }),
+    ]);
+  });
+
+  it('is classified as retryable', () => {
+    expect(isRetryableLlmError(new LlmTruncatedError({ thoughtsTokens: 1, outputTokens: 2 }))).toBe(
+      true,
+    );
   });
 });

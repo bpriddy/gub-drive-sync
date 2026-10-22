@@ -30,9 +30,30 @@ export class LlmTimeoutError extends Error {
   }
 }
 
+/**
+ * An answer that stopped at the output token limit (finishReason
+ * MAX_TOKENS). Its JSON is cut off mid-way, and thinking counts against the
+ * limit, so a long think can leave no room for the answer. Treated as a
+ * failed attempt: retried, and if every attempt is cut off the caller gets
+ * a failure instead of a parse error on a fragment.
+ */
+export class LlmTruncatedError extends Error {
+  readonly thoughtsTokens: number | null;
+  readonly outputTokens: number | null;
+  constructor(usage: { thoughtsTokens: number | null; outputTokens: number | null }) {
+    super(
+      `[gemini] answer cut off at the output token limit (thoughts ${usage.thoughtsTokens ?? '?'}, output ${usage.outputTokens ?? '?'})`,
+    );
+    this.name = 'LlmTruncatedError';
+    this.thoughtsTokens = usage.thoughtsTokens;
+    this.outputTokens = usage.outputTokens;
+  }
+}
+
 export function isRetryableLlmError(err: unknown): boolean {
   if (!err) return false;
   if (err instanceof LlmTimeoutError) return true;
+  if (err instanceof LlmTruncatedError) return true;
   // API-level errors carry a typed HTTP status (SDK-recommended handling).
   if (err instanceof ApiError) return isRetryableHttpStatus(err.status);
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();

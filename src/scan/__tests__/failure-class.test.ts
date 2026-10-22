@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '@google/genai';
 import { isTransientFailure } from '../failure-class';
+import { LlmTruncatedError } from '../../ai/retryable';
 
 describe('isTransientFailure', () => {
   it('accepts what a re-run of the window can recover', () => {
@@ -27,5 +28,11 @@ describe('isTransientFailure', () => {
     expect(isTransientFailure(new SyntaxError('Unexpected end of JSON input'))).toBe(false);
     expect(isTransientFailure({ code: 'P2002', message: 'Unique constraint failed' })).toBe(false);
     expect(isTransientFailure(null)).toBe(false);
+  });
+
+  it('drops an answer still cut off after the call retried it, instead of holding the cursor', () => {
+    expect(
+      isTransientFailure(new LlmTruncatedError({ thoughtsTokens: 60000, outputTokens: 900 })),
+    ).toBe(false);
   });
 });

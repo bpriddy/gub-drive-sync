@@ -1,6 +1,6 @@
 // Part of the scan core (src/scan/) — which failures a re-run of the same
 // window can recover. Config-free so the unit suite runs it hermetically.
-import { isRetryableLlmError } from '../ai/retryable';
+import { isRetryableLlmError, LlmTruncatedError } from '../ai/retryable';
 import { isRateLimitError, isTransientTransportError } from '../drive/retry';
 
 /**
@@ -18,6 +18,11 @@ const TRANSIENT_PRISMA_CODES = new Set(['P1001', 'P1002', 'P1008', 'P1017', 'P20
  * counted-and-dropped.
  */
 export function isTransientFailure(err: unknown): boolean {
+  // An answer still cut off at the output limit after the driver's own
+  // retries is a property of the prompt, not of the moment: a re-run of
+  // the window would hit it again and hold the cursor every day. Counted
+  // and dropped, as the parse failure it used to surface as was.
+  if (err instanceof LlmTruncatedError) return false;
   if (isRetryableLlmError(err)) return true;
   if (isRateLimitError(err) || isTransientTransportError(err)) return true;
   const code = (err as { code?: unknown } | null)?.code;

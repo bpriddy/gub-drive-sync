@@ -26,7 +26,7 @@ import { ApiError, GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google
 import { config } from '../config';
 import { logger } from '../logger';
 import { jitteredDelayMs } from '../backoff';
-import { isRetryableLlmError, LlmTimeoutError } from './retryable';
+import { isRetryableLlmError, LlmTimeoutError, LlmTruncatedError } from './retryable';
 import { raiseFetchTimeouts, requiredFetchTimeoutMs } from './fetch-timeouts';
 import { recordLlmUsage } from './usage-tally';
 import { thinkingLevelFor } from './thinking';
@@ -42,6 +42,11 @@ import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } f
  * time. Classification lives in ./retryable (isRetryableLlmError).
  */
 const MAX_ATTEMPTS = 3;
+/**
+ * A cut-off answer gets one more try, not two: the same prompt at the same
+ * level usually thinks just as long, and each try bills the whole think.
+ */
+const MAX_TRUNCATED_ATTEMPTS = 2;
 const BASE_BACKOFF_MS = 1000; // nominal 1s → 3s (3^attempt), jittered ×[0.5, 1.5)
 
 /** Longest error text carried on the WARN line — enough for status + reason. */
@@ -174,6 +179,29 @@ export class GeminiLlmDriver implements LlmDriver {
           },
           '[gemini] generateContent finished',
         );
+        if (finishReason === 'MAX_TOKENS') {
+          // A cut-off answer is a failed attempt, never a result: the catch
+          // below retries it like a 5xx. Raising maxOutputTokens alone is
+          // not the fix, since thinking counts against the same limit.
+          logger.warn(
+            {
+              model: req.model,
+              tag: req.tag,
+              attempt,
+              maxAttempts: MAX_TRUNCATED_ATTEMPTS,
+              maxOutputTokens: req.maxOutputTokens ?? null,
+              thinkingLevel: thinkingLevel ?? null,
+              promptTokens: usage?.promptTokens ?? null,
+              thoughtsTokens: usage?.thoughtsTokens ?? null,
+              outputTokens: usage?.outputTokens ?? null,
+            },
+            '[gemini] answer cut off at the output token limit',
+          );
+          throw new LlmTruncatedError({
+            thoughtsTokens: usage?.thoughtsTokens ?? null,
+            outputTokens: usage?.outputTokens ?? null,
+          });
+        }
         if (attempt > 1) {
           logger.info(
             { model: req.model, tag: req.tag, attempt },
@@ -197,7 +225,9 @@ export class GeminiLlmDriver implements LlmDriver {
             : caught;
         lastErr = err;
         const retryable = isRetryableLlmError(err);
-        const willRetry = retryable && attempt < MAX_ATTEMPTS;
+        const maxAttempts =
+          err instanceof LlmTruncatedError ? MAX_TRUNCATED_ATTEMPTS : MAX_ATTEMPTS;
+        const willRetry = retryable && attempt < maxAttempts;
         // Full error object stays at debug: callers (distill, interpret,
         // etc.) handle the user-facing error display via progress.* +
         // drive_scan_logs. Successful retries log at info above so we know
@@ -216,7 +246,7 @@ export class GeminiLlmDriver implements LlmDriver {
             model: req.model,
             tag: req.tag,
             attempt,
-            maxAttempts: MAX_ATTEMPTS,
+            maxAttempts,
             status: err instanceof ApiError ? err.status : null,
             retryable,
             willRetry,
