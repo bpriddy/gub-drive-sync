@@ -80,8 +80,7 @@ function buildPrompt(input: InterpretAssetFolderInput): string {
   const shown = input.fileNames.slice(0, MAX_FILE_NAMES);
   const omitted = input.fileNames.length - shown.length;
   const listing =
-    shown.map((n) => `  - ${n}`).join('\n') +
-    (omitted > 0 ? `\n  … (+${omitted} more files)` : '');
+    shown.map((n) => `  - ${n}`).join('\n') + (omitted > 0 ? `\n  … (+${omitted} more files)` : '');
 
   return `You are looking at one folder from a client's shared Google Drive at an ad agency. Every file in it is a binary asset (fonts, images, video, design files) — there is no readable text, so the folder path and the file names are your only evidence.
 

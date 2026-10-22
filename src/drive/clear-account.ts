@@ -62,9 +62,7 @@ export interface ClearAccountResult {
   };
 }
 
-async function resolveAccount(
-  opts: ClearAccountOptions,
-): Promise<{ id: string; name: string }> {
+async function resolveAccount(opts: ClearAccountOptions): Promise<{ id: string; name: string }> {
   if (!opts.accountId && !opts.accountName) {
     throw new Error('clearAccount requires accountId or accountName');
   }
@@ -78,16 +76,12 @@ async function resolveAccount(
         select: { id: true, name: true },
       });
   if (!account) {
-    throw new Error(
-      `account not found (${opts.accountId ?? `name~"${opts.accountName}"`})`,
-    );
+    throw new Error(`account not found (${opts.accountId ?? `name~"${opts.accountName}"`})`);
   }
   return account;
 }
 
-export async function clearAccountComplete(
-  opts: ClearAccountOptions,
-): Promise<ClearAccountResult> {
+export async function clearAccountComplete(opts: ClearAccountOptions): Promise<ClearAccountResult> {
   const account = await resolveAccount(opts);
 
   // ── Collect the id sets we need for scoping + audit purge. ──────────────

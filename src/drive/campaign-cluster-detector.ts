@@ -96,10 +96,7 @@ const RESPONSE_SCHEMA: ResponseSchema = {
   required: ['clusters'],
 };
 
-function buildPrompt(args: {
-  accountName: string;
-  campaigns: CampaignForClustering[];
-}): string {
+function buildPrompt(args: { accountName: string; campaigns: CampaignForClustering[] }): string {
   // Names only. The orchestrator picks the canonical row in code
   // (folder-anchored > has markdown > oldest) and only consumes the GROUPING,
   // so the model never needs markdown/folder/date — feeding them just inflated

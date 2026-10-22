@@ -55,7 +55,9 @@ export interface DerivePiecesResult {
   matchedExisting: number;
   created: number;
   belowFloor: number;
-  executions: Array<DerivedExecution & { outcome: 'matched' | 'created' | 'would-create' | 'below-floor' }>;
+  executions: Array<
+    DerivedExecution & { outcome: 'matched' | 'created' | 'would-create' | 'below-floor' }
+  >;
   /** Null when the campaign has no dossier to read yet. */
   skippedNoDossier: boolean;
 }
@@ -258,7 +260,9 @@ export async function deriveCampaignPieces(args: {
 
     // Belt-and-braces name idempotency (folder-less pieces have no unique
     // folder key): an existing same-named piece means match, not create.
-    const collision = campaign.pieces.find((p) => p.name.trim().toLowerCase() === name.toLowerCase());
+    const collision = campaign.pieces.find(
+      (p) => p.name.trim().toLowerCase() === name.toLowerCase(),
+    );
     if (collision) {
       base.matchedExisting += 1;
       base.executions.push({ ...entry, outcome: 'matched' });
@@ -281,7 +285,11 @@ export async function deriveCampaignPieces(args: {
       });
       if (holder) {
         logger.warn(
-          { jobNumber: mintJobNumber, holderPieceId: holder.id, holderCampaignId: holder.campaignId },
+          {
+            jobNumber: mintJobNumber,
+            holderPieceId: holder.id,
+            holderCampaignId: holder.campaignId,
+          },
           '[drive.piece-derive] job number already held by a piece of another campaign — minting WITHOUT it',
         );
         mintJobNumber = null;

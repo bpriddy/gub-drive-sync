@@ -31,10 +31,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { logger } from '../logger';
 import { buildCampaignCurrentState } from './schema';
-import {
-  detectCampaignClustersWindowed,
-  type DetectedCluster,
-} from './campaign-cluster-detector';
+import { detectCampaignClustersWindowed, type DetectedCluster } from './campaign-cluster-detector';
 import { mergeCampaignMarkdowns, type VariantMarkdown } from './campaign-merge-synthesizer';
 import { extractJobNumber } from './job-number';
 
@@ -127,12 +124,7 @@ export interface RunCampaignMergeOptions {
 }
 
 type ClusterOutcome =
-  | 'merged'
-  | 'would-merge'
-  | 'skipped'
-  | 'failed'
-  | 'below-confidence'
-  | 'year-blocked';
+  'merged' | 'would-merge' | 'skipped' | 'failed' | 'below-confidence' | 'year-blocked';
 
 // ── Year gate ────────────────────────────────────────────────────────────────
 //
@@ -266,9 +258,7 @@ async function resolveAccount(
         select: { id: true, name: true },
       });
   if (!account) {
-    throw new Error(
-      `account not found (${opts.accountId ?? `name~"${opts.accountName}"`})`,
-    );
+    throw new Error(`account not found (${opts.accountId ?? `name~"${opts.accountName}"`})`);
   }
   return account;
 }
@@ -390,7 +380,10 @@ async function applyCluster(
       // the global unique index would abort the whole merge tx otherwise.
       const variantJobNumber = extractJobNumber(v.name);
       const jobNumberTaken = variantJobNumber
-        ? await tx.campaignPiece.findFirst({ where: { jobNumber: variantJobNumber }, select: { id: true } })
+        ? await tx.campaignPiece.findFirst({
+            where: { jobNumber: variantJobNumber },
+            select: { id: true },
+          })
         : null;
       const piece = await tx.campaignPiece.create({
         data: {
@@ -467,7 +460,12 @@ export async function runCampaignMerge(
   );
 
   logger.info(
-    { accountId: account.id, accountName: account.name, campaignCount: campaigns.length, apply: opts.apply },
+    {
+      accountId: account.id,
+      accountName: account.name,
+      campaignCount: campaigns.length,
+      apply: opts.apply,
+    },
     '[campaign-merge] detecting duplicate clusters (sliding-window)',
   );
 
@@ -508,7 +506,10 @@ export async function runCampaignMerge(
           canonicalName: cluster.canonicalName,
           droppedUnknownYear: partition.droppedUnknownYear,
           droppedSingleton: partition.droppedSingleton,
-          subClusters: partition.subClusters.map((s) => ({ year: s.year, size: s.variantIds.length + 1 })),
+          subClusters: partition.subClusters.map((s) => ({
+            year: s.year,
+            size: s.variantIds.length + 1,
+          })),
         },
         '[campaign-merge] year gate partitioned cluster',
       );

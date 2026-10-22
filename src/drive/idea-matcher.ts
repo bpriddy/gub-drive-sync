@@ -73,10 +73,16 @@ const RESPONSE_SCHEMA: ResponseSchema = {
   required: ['match_index', 'merged_facets'],
 };
 
-function buildPrompt(args: { accountName: string | null; newIdea: NewIdea; candidates: KnownIdea[] }): string {
+function buildPrompt(args: {
+  accountName: string | null;
+  newIdea: NewIdea;
+  candidates: KnownIdea[];
+}): string {
   const candidateBlock = args.candidates
     .map((c, i) => {
-      const facets = c.facets.length ? c.facets.map((f) => `      - ${f}`).join('\n') : '      (no facets yet)';
+      const facets = c.facets.length
+        ? c.facets.map((f) => `      - ${f}`).join('\n')
+        : '      (no facets yet)';
       return `[${i + 1}] ${c.name}\n${facets}`;
     })
     .join('\n\n');
@@ -155,7 +161,8 @@ export async function matchAndMergeIdea(args: {
   const mergedFacets = parsed.merged_facets.map((f) => f.trim()).filter(Boolean);
   // Defensive: an empty merge would blank the idea. Never let a merge delete
   // everything — fall back to the union if the model returned nothing usable.
-  const safeFacets = mergedFacets.length > 0 ? mergedFacets : dedupeUnion(matched.facets, args.newIdea.facets);
+  const safeFacets =
+    mergedFacets.length > 0 ? mergedFacets : dedupeUnion(matched.facets, args.newIdea.facets);
 
   return { matchId: matched.id, mergedFacets: safeFacets };
 }

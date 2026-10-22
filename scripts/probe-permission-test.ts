@@ -86,7 +86,8 @@ async function main(): Promise<void> {
   try {
     const meta = await drive.files.get({
       fileId: args.fileId,
-      fields: 'id, name, mimeType, createdTime, modifiedTime, capabilities(canEdit, canReadRevisions, canModifyContent), permissions(role, emailAddress)',
+      fields:
+        'id, name, mimeType, createdTime, modifiedTime, capabilities(canEdit, canReadRevisions, canModifyContent), permissions(role, emailAddress)',
       supportsAllDrives: true,
     });
     console.log(`  name:          ${meta.data.name}`);

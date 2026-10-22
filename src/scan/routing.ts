@@ -37,7 +37,6 @@ export function isForeignCampaignTag(tagRaw: string, ownNames: string[]): boolea
   return true;
 }
 
-
 /**
  * Synthesized status_markdown for a NEW campaign candidate uses this
  * empty state for the at-a-glance bullets (no DB row exists yet).
@@ -49,7 +48,6 @@ export const EMPTY_CAMPAIGN_STATE: CampaignCurrentState = {
   live_at: null,
   ends_at: null,
 };
-
 
 type RouteCampaignObsResult =
   | { kind: 'discard' }

@@ -148,7 +148,10 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
       }
     } catch (err) {
       extractionErrors++;
-      logger.warn({ err, fileId: file.id, fileName: file.name }, '[drive.idea-runner] file failed — skipped');
+      logger.warn(
+        { err, fileId: file.id, fileName: file.name },
+        '[drive.idea-runner] file failed — skipped',
+      );
     }
   }
 
@@ -182,7 +185,10 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
         }));
       } catch (err) {
         // Matcher failure must not lose the idea — fall back to a plain create.
-        logger.warn({ err, ideaName: idea.name }, '[drive.idea-runner] match failed — creating as new');
+        logger.warn(
+          { err, ideaName: idea.name },
+          '[drive.idea-runner] match failed — creating as new',
+        );
         matchId = null;
         mergedFacets = idea.facets;
       }
@@ -194,16 +200,37 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
         // so a same-run create-then-match still climbs 1→2 correctly.
         decksInto.set(matchId, (decksInto.get(matchId) ?? 0) + 1);
         if (facetsEqual(target.facets, mergedFacets)) {
-          events.push({ kind: 'noop', targetId: matchId, name: target.name, previousFacets: target.facets, facets: target.facets, sourceFileId: f.fileId });
+          events.push({
+            kind: 'noop',
+            targetId: matchId,
+            name: target.name,
+            previousFacets: target.facets,
+            facets: target.facets,
+            sourceFileId: f.fileId,
+          });
         } else {
-          events.push({ kind: 'update', targetId: matchId, name: target.name, previousFacets: target.facets, facets: mergedFacets, sourceFileId: f.fileId });
+          events.push({
+            kind: 'update',
+            targetId: matchId,
+            name: target.name,
+            previousFacets: target.facets,
+            facets: mergedFacets,
+            sourceFileId: f.fileId,
+          });
           target.facets = mergedFacets; // advance the in-memory memory
         }
       } else {
         const synthId = `new:${synthSeq++}`;
         known.push({ id: synthId, name: idea.name, facets: mergedFacets });
         decksInto.set(synthId, 1);
-        events.push({ kind: 'create', targetId: synthId, name: idea.name, previousFacets: [], facets: mergedFacets, sourceFileId: f.fileId });
+        events.push({
+          kind: 'create',
+          targetId: synthId,
+          name: idea.name,
+          previousFacets: [],
+          facets: mergedFacets,
+          sourceFileId: f.fileId,
+        });
       }
     }
   }
@@ -255,7 +282,10 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
           // failed earlier this run — skip rather than write against a non-uuid.
           if (id.startsWith('new:')) {
             persistErrors++;
-            logger.warn({ targetId: ev.targetId, name: ev.name }, '[drive.idea-runner] update skipped — its create failed');
+            logger.warn(
+              { targetId: ev.targetId, name: ev.name },
+              '[drive.idea-runner] update skipped — its create failed',
+            );
             continue;
           }
           await prisma.$transaction([
@@ -275,7 +305,10 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
         // noop: idea re-stated with nothing new — no write.
       } catch (err) {
         persistErrors++;
-        logger.warn({ err, kind: ev.kind, name: ev.name, sourceFileId: ev.sourceFileId }, '[drive.idea-runner] persist failed — skipped');
+        logger.warn(
+          { err, kind: ev.kind, name: ev.name, sourceFileId: ev.sourceFileId },
+          '[drive.idea-runner] persist failed — skipped',
+        );
       }
     }
   }
@@ -313,7 +346,19 @@ export async function runIdeaExtraction(opts: RunIdeaExtractionOptions): Promise
   const ideasUnchanged = events.filter((e) => e.kind === 'noop').length;
 
   logger.info(
-    { folderId: opts.folderId, apply: opts.apply, filesSeen, deckFiles, ideasFound, ideasResolved: resolved.length, ideasCreated, ideasUpdated, ideasPersisted, changesLogged, persistErrors },
+    {
+      folderId: opts.folderId,
+      apply: opts.apply,
+      filesSeen,
+      deckFiles,
+      ideasFound,
+      ideasResolved: resolved.length,
+      ideasCreated,
+      ideasUpdated,
+      ideasPersisted,
+      changesLogged,
+      persistErrors,
+    },
     '[drive.idea-runner] complete',
   );
 
@@ -419,5 +464,7 @@ export async function resolveIdeaTarget(args: {
     };
   }
 
-  throw new Error('pass --campaign-name <name> or --folder-id <drive folder id> to target a folder');
+  throw new Error(
+    'pass --campaign-name <name> or --folder-id <drive folder id> to target a folder',
+  );
 }
