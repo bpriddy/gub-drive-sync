@@ -48,8 +48,15 @@ export interface ForwardArgs {
 export async function runForward(fargs: ForwardArgs): Promise<BackfillRunResult> {
   const prevCapture = getLogCapture();
   if (fargs.captureLog) setLogCapture(fargs.captureLog);
+  const startedAt = Date.now();
   try {
     return await runForwardInner(fargs);
+  } catch (err) {
+    // The success path prints the run summary itself. A failed run, whose
+    // window repeats because the cursor is held, needs its token totals
+    // (and its MAX_TOKENS count) most.
+    printPhaseSummary(Date.now() - startedAt);
+    throw err;
   } finally {
     setLogCapture(prevCapture);
   }

@@ -28,6 +28,7 @@ import { logger } from '../logger';
 import { jitteredDelayMs } from '../backoff';
 import { isRetryableLlmError, LlmTimeoutError } from './retryable';
 import { raiseFetchTimeouts, requiredFetchTimeoutMs } from './fetch-timeouts';
+import { recordLlmUsage } from './usage-tally';
 import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } from './ai.types';
 
 /**
@@ -115,6 +116,7 @@ export class GeminiLlmDriver implements LlmDriver {
           },
         });
         const text = res.text ?? '';
+        const finishReason = res.candidates?.[0]?.finishReason ?? null;
         const u = res.usageMetadata;
         const usage: LlmUsage | undefined = u
           ? {
@@ -122,10 +124,29 @@ export class GeminiLlmDriver implements LlmDriver {
               thoughtsTokens: u.thoughtsTokenCount ?? null,
               outputTokens: u.candidatesTokenCount ?? null,
               totalTokens: u.totalTokenCount ?? null,
+              cachedContentTokens: u.cachedContentTokenCount ?? null,
             }
           : undefined;
-        if (usage) {
-          logger.debug({ model: req.model, tag: req.tag, ...usage }, '[gemini] usage');
+        // Every attempt is billed, so every attempt counts toward the
+        // run's per-tag totals (printed in the run summary).
+        recordLlmUsage(req.tag, usage, finishReason);
+        if (u && usage) {
+          // INFO since bpriddy/gub-drive-sync#69: tokens per call type,
+          // thoughts included, are the input to the thinking-level choice.
+          // The provider's own field names ride alongside the older keys.
+          logger.info(
+            {
+              model: req.model,
+              tag: req.tag,
+              ...usage,
+              promptTokenCount: u.promptTokenCount ?? null,
+              candidatesTokenCount: u.candidatesTokenCount ?? null,
+              thoughtsTokenCount: u.thoughtsTokenCount ?? null,
+              cachedContentTokenCount: u.cachedContentTokenCount ?? null,
+              finishReason,
+            },
+            '[gemini] usage',
+          );
         }
         // One INFO line per completed call. finishReason tells a clean STOP
         // from a MAX_TOKENS truncation or a SAFETY block — the cases that
@@ -135,7 +156,7 @@ export class GeminiLlmDriver implements LlmDriver {
             model: req.model,
             tag: req.tag,
             attempt,
-            finishReason: res.candidates?.[0]?.finishReason ?? null,
+            finishReason,
             blockReason: res.promptFeedback?.blockReason ?? null,
             durationMs: Date.now() - attemptStartedAt,
             promptTokens: usage?.promptTokens ?? null,
@@ -156,6 +177,7 @@ export class GeminiLlmDriver implements LlmDriver {
           model: req.model,
           raw: res,
           ...(usage ? { usage } : {}),
+          finishReason,
         };
       } catch (caught) {
         // The SDK's deadline surfaces as fetch's bare AbortError ("This

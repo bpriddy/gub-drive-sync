@@ -2,6 +2,7 @@
 // by every driver (day-walk backfill today; the Activity forward driver next).
 import { logger } from '../logger';
 import { log, rule, fmtMs } from './output';
+import { llmUsageByTag, resetLlmUsage } from '../ai/usage-tally';
 
 // ── Phase timing ─────────────────────────────────────────────────────────────
 //
@@ -57,8 +58,51 @@ const PHASE_LABELS: Record<string, string> = {
   persist_cursor: 'Persist cursor (DB)',
 };
 
+/**
+ * Gemini tokens per call tag for this run, thoughts included (they bill as
+ * output). Printed just before the phase timing so both stay inside the
+ * log_summary tail.
+ */
+function printLlmUsageSummary(): void {
+  const rows = llmUsageByTag();
+  if (rows.length === 0) return;
+  const n = (v: number) => v.toLocaleString('en-US');
+  const sum = (pick: (r: (typeof rows)[number]) => number) => rows.reduce((s, r) => s + pick(r), 0);
+  const table = [
+    ['tag', 'calls', 'prompt', 'cached', 'output', 'thoughts'],
+    ...rows.map((r) => [
+      r.tag + (r.maxTokensFinishes > 0 ? ` (${r.maxTokensFinishes} MAX_TOKENS)` : ''),
+      n(r.calls),
+      n(r.promptTokens),
+      n(r.cachedContentTokens),
+      n(r.outputTokens),
+      n(r.thoughtsTokens),
+    ]),
+    [
+      'total',
+      n(sum((r) => r.calls)),
+      n(sum((r) => r.promptTokens)),
+      n(sum((r) => r.cachedContentTokens)),
+      n(sum((r) => r.outputTokens)),
+      n(sum((r) => r.thoughtsTokens)),
+    ],
+  ];
+  const widths = table[0]!.map((_, c) => Math.max(...table.map((row) => row[c]!.length)));
+  log('');
+  log(rule('LLM tokens by call tag (this scan)'));
+  for (const row of table) {
+    log(
+      '  ' +
+        row
+          .map((cell, c) => (c === 0 ? cell.padEnd(widths[c]!) : cell.padStart(widths[c]!)))
+          .join('  '),
+    );
+  }
+}
+
 export function printPhaseSummary(wallClockMs: number): void {
   if (!phaseTimer) return;
+  printLlmUsageSummary();
   const { rows, totalMs: instrumentedMs } = phaseTimer.summary();
   if (rows.length === 0) return;
   log('');
@@ -109,4 +153,5 @@ function printPeakMemory(): void {
 /** Fresh timer for a new run (was `phaseTimer = new PhaseTimer()` inline). */
 export function resetPhaseTimer(): void {
   phaseTimer = new PhaseTimer();
+  resetLlmUsage();
 }

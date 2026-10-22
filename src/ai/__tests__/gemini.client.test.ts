@@ -27,6 +27,7 @@ vi.mock('../../logger', () => ({ logger: loggerMock }));
 
 import { GeminiLlmDriver } from '../gemini.client';
 import { isRetryableLlmError, LlmTimeoutError } from '../retryable';
+import { llmUsageByTag, resetLlmUsage } from '../usage-tally';
 
 function okResponse(text = '{"ok":true}', finishReason = 'STOP'): Response {
   return new Response(
@@ -247,5 +248,76 @@ describe('GeminiLlmDriver finish logging', () => {
       expect.objectContaining({ attempt: 2, finishReason: 'STOP' }),
       '[gemini] generateContent finished',
     );
+  });
+});
+
+describe('GeminiLlmDriver usage line', () => {
+  function usageResponse(finishReason = 'STOP'): Response {
+    return new Response(
+      JSON.stringify({
+        candidates: [{ content: { role: 'model', parts: [{ text: '{}' }] }, finishReason }],
+        usageMetadata: {
+          promptTokenCount: 1200,
+          candidatesTokenCount: 300,
+          thoughtsTokenCount: 4100,
+          cachedContentTokenCount: 800,
+          totalTokenCount: 5600,
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }
+
+  it('logs tokens per call at INFO, with the old keys and the provider field names', async () => {
+    fetchMock.mockResolvedValue(usageResponse());
+    const res = await driver().complete(REQ);
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      {
+        model: 'gemini-test',
+        tag: 'unit.test',
+        promptTokens: 1200,
+        thoughtsTokens: 4100,
+        outputTokens: 300,
+        totalTokens: 5600,
+        cachedContentTokens: 800,
+        promptTokenCount: 1200,
+        candidatesTokenCount: 300,
+        thoughtsTokenCount: 4100,
+        cachedContentTokenCount: 800,
+        finishReason: 'STOP',
+      },
+      '[gemini] usage',
+    );
+    expect(loggerMock.debug).not.toHaveBeenCalledWith(expect.anything(), '[gemini] usage');
+    expect(res.finishReason).toBe('STOP');
+    expect(res.usage).toMatchObject({ thoughtsTokens: 4100, cachedContentTokens: 800 });
+  });
+
+  it('adds every attempt to the per-tag totals', async () => {
+    resetLlmUsage();
+    fetchMock.mockImplementation(async () => usageResponse());
+    await driver().complete(REQ);
+    await driver().complete({ ...REQ, tag: 'other.tag' });
+    await driver().complete(REQ);
+    expect(llmUsageByTag()).toEqual([
+      {
+        tag: 'unit.test',
+        calls: 2,
+        promptTokens: 2400,
+        cachedContentTokens: 1600,
+        outputTokens: 600,
+        thoughtsTokens: 8200,
+        maxTokensFinishes: 0,
+      },
+      {
+        tag: 'other.tag',
+        calls: 1,
+        promptTokens: 1200,
+        cachedContentTokens: 800,
+        outputTokens: 300,
+        thoughtsTokens: 4100,
+        maxTokensFinishes: 0,
+      },
+    ]);
   });
 });
