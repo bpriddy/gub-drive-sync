@@ -54,16 +54,12 @@ export interface ProposeTargetResult {
 }
 
 function toJson(value: unknown): Prisma.InputJsonValue | typeof Prisma.JsonNull {
-  return value === null || value === undefined
-    ? Prisma.JsonNull
-    : (value as Prisma.InputJsonValue);
+  return value === null || value === undefined ? Prisma.JsonNull : (value as Prisma.InputJsonValue);
 }
 
 export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeTargetResult> {
   const { ctx, validatedChanges, notes } = input;
-  const expiresAt = new Date(
-    Date.now() + config.DRIVE_PROPOSAL_TTL_DAYS * 24 * 60 * 60 * 1000,
-  );
+  const expiresAt = new Date(Date.now() + config.DRIVE_PROPOSAL_TTL_DAYS * 24 * 60 * 60 * 1000);
   const reviewer = {
     reviewerEmail: ctx.reviewerEmail ?? null,
     reviewerStaffId: ctx.reviewerStaffId ?? null,
@@ -119,8 +115,7 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
     });
     if (
       pending &&
-      JSON.stringify(pending.proposedValue ?? null) ===
-        JSON.stringify(vc.validatedValue ?? null)
+      JSON.stringify(pending.proposedValue ?? null) === JSON.stringify(vc.validatedValue ?? null)
     ) {
       duplicatesSkipped++;
       continue;
@@ -219,9 +214,7 @@ async function writeNoteBatch(args: {
   reviewer: { reviewerEmail: string | null; reviewerStaffId: string | null };
   expiresAt: Date;
 }): Promise<void> {
-  const unionSources = Array.from(
-    new Set(args.items.flatMap((n) => n.source_file_ids)),
-  );
+  const unionSources = Array.from(new Set(args.items.flatMap((n) => n.source_file_ids)));
   await prisma.driveChangeProposal.create({
     data: {
       kind: 'additional_update',

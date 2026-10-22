@@ -163,7 +163,9 @@ export async function notifyReviewers(input: NotifyInput = {}): Promise<NotifyRe
 
     // Summarize what's in the bundle for the email body.
     const newEntityGroups = new Set(
-      bucket.filter((r) => r.kind === 'new_entity' && r.proposalGroupId).map((r) => r.proposalGroupId!),
+      bucket
+        .filter((r) => r.kind === 'new_entity' && r.proposalGroupId)
+        .map((r) => r.proposalGroupId!),
     ).size;
     const fieldChanges = bucket.filter((r) => r.kind === 'field_change').length;
 
