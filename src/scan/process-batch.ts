@@ -3,6 +3,8 @@
 import { prisma } from '../prisma';
 import { extractText } from '../drive/extract';
 import {
+  CONTENT_UNCHANGED_SKIP_REASON,
+  TRASHED_SKIP_REASON,
   loadLastExtractedHashes,
   reportSnapshotWriteFailure,
   snapshotForScanOutcome,
@@ -50,12 +52,7 @@ import {
 import type { ExtractedIdea } from '../drive/idea-extraction';
 import type { TraversedFile } from '../drive/types';
 import { config } from '../config';
-import {
-  CONTENT_UNCHANGED_SKIP_REASON,
-  binaryContentHash,
-  contentHashFor,
-  contentZone,
-} from './content-gate';
+import { binaryContentHash, contentHashFor, contentZone } from './content-gate';
 import { log, fmtBytes, fmtMs } from './output';
 import { timed } from './timing';
 import { runWithConcurrency } from './util';
@@ -174,17 +171,20 @@ export async function processBatch(
     try {
       priorHashes = await timed('content_gate_lookup', () =>
         loadLastExtractedHashes(
+          ctx.accountId,
           batch.map((f) => f.id),
           notAfter,
         ),
       );
     } catch (err) {
-      const code = (err as { code?: unknown }).code;
+      // The code only: the error can embed the query's arguments (file ids).
+      const raw = (err as { code?: unknown }).code;
+      const code = typeof raw === 'string' ? raw : 'unknown';
       logger.warn(
-        { accountId: ctx.accountId, code: typeof code === 'string' ? code : 'unknown' },
+        { accountId: ctx.accountId, code },
         '[scan.content-gate] hash lookup failed — interpreting every file',
       );
-      log(`  ⚠ unchanged-content lookup failed (${summarizeError(err)}) — interpreting every file`);
+      log(`  ⚠ unchanged-content lookup failed (${code}) — interpreting every file`);
     }
   }
 
@@ -401,11 +401,19 @@ export async function processBatch(
     // Forward runs fetch each changed file by id, and files.get also returns
     // a file in the trash; the listings exclude trashed files in their query.
     if (config.SKIP_UNCHANGED_CONTENT === 'on' && file.trashed === true) {
-      return { file, attribution, kind: 'skip', skipReason: 'trashed' };
+      return { file, attribution, kind: 'skip', skipReason: TRASHED_SKIP_REASON };
     }
     const zone = contentZone(attribution);
+    const ideasOn = ideaCtx !== null;
     const prior = priorHashes?.get(file.id);
-    if (prior !== undefined && prior === binaryContentHash(file, zone)) {
+    // A file on the restricted worklist is never skipped before the download:
+    // the read is the probe that resolves its row. After the read it may still
+    // match and skip the model.
+    if (
+      prior !== undefined &&
+      !restrictedRowIds.has(file.id) &&
+      prior === binaryContentHash(file, zone, ideasOn)
+    ) {
       return {
         file,
         attribution,
@@ -430,7 +438,7 @@ export async function processBatch(
       // (src/scan/content-gate.ts). Off: the extractor's md5, as before.
       const contentHash =
         config.SKIP_UNCHANGED_CONTENT === 'on'
-          ? contentHashFor(file, extraction.text, zone)
+          ? contentHashFor(file, extraction.text, zone, ideasOn)
           : extraction.contentHash;
       if (prior !== undefined && prior === contentHash) {
         return {
@@ -492,7 +500,12 @@ export async function processBatch(
         kind: 'ok',
         extractor: extraction.extractor,
         textLength: extraction.text.length,
-        contentHash,
+        // A failed idea extraction must not mark the file as fully read: with
+        // the hash on its row, the gate would never retry the ideas. Without
+        // it, the row stays extracted and the next event re-reads the file.
+        ...(ideaCandidates === 'failed' && config.SKIP_UNCHANGED_CONTENT === 'on'
+          ? {}
+          : { contentHash }),
         res,
         ideaCandidates,
       };
@@ -509,14 +522,17 @@ export async function processBatch(
 
     if (o.kind === 'skip' && o.unchanged) {
       filesUnchanged++;
+      // The file has text (it was interpreted before): its folder is not a
+      // binaries-only folder for the asset-folder pass.
+      foldersWithText.add(file.parents?.[0] ?? parentPathOf(file));
       if (o.unchanged === 'before_download') filesUnchangedBeforeDownload++;
       log(
         `    ⏭ ${file.name}  unchanged since its last interpret — model calls skipped${o.unchanged === 'before_download' ? ' (no download)' : ''}`,
       );
-      // The content WAS read: a probed restricted file is reachable again, so
-      // its worklist row resolves as after a full read. Guarded like the
-      // 'empty' branch below.
-      if (o.unchanged === 'after_read' && restrictedRowIds.has(file.id)) {
+      // The content WAS read (a restricted file is never skipped before the
+      // download): a probed file is reachable again, so its worklist row
+      // resolves as after a full read. Guarded like the 'empty' branch below.
+      if (restrictedRowIds.has(file.id)) {
         filesRestored++;
         log(`      🔓 previously restricted — now readable; worklist row resolved`);
         if (infraWrites) {
@@ -537,7 +553,7 @@ export async function processBatch(
       const detail = o.skipDetail ? ` (${o.skipDetail})` : '';
       log(`    ⊘ ${file.name}  [${file.mimeType}]  skip: ${o.skipReason}${detail}`);
       filesSkipped++;
-      if (o.skipReason === 'trashed') filesTrashed++;
+      if (o.skipReason === TRASHED_SKIP_REASON) filesTrashed++;
       if (o.skipReason === 'unsupported_mime') {
         const folderKey = file.parents?.[0] ?? parentPathOf(file);
         const rec = binaryOnlyFolders.get(folderKey);
@@ -822,6 +838,7 @@ export async function processBatch(
               : attribution.campaignFolderId
             : null;
         log(`      ◆ ${res.deckType} deck — merging ${ideas.length} idea(s)…`);
+        const ideaErrorsBefore = ideaCtx.stats.ideaErrors;
         await timed('idea_merge', () =>
           mergeIdeaCandidates(ideaCtx, {
             file,
@@ -829,6 +846,11 @@ export async function processBatch(
             ideas,
           }),
         );
+        // Same rule as a failed extraction: the merge counts and swallows its
+        // error, so drop the hash and let the gate retry the file.
+        if (ideaCtx.stats.ideaErrors > ideaErrorsBefore && config.SKIP_UNCHANGED_CONTENT === 'on') {
+          delete o.contentHash;
+        }
       }
 
       // A probed file that fully extracted is restored — resolve its

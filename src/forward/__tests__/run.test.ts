@@ -13,7 +13,7 @@ const m = vi.hoisted(() => ({
   queryActivityWindow: vi.fn(),
   processBatch: vi.fn(),
   notifyReviewers: vi.fn(),
-  lastCompletedRunAt: vi.fn(),
+  gateCutoff: vi.fn(),
 }));
 
 vi.mock('../../config', () => ({ config: {} }));
@@ -38,7 +38,7 @@ vi.mock('../../backfill/structure-stage', () => ({
   })),
 }));
 vi.mock('../../scan/process-batch', () => ({ processBatch: m.processBatch }));
-vi.mock('../../scan/content-gate', () => ({ lastCompletedRunAt: m.lastCompletedRunAt }));
+vi.mock('../../scan/content-gate', () => ({ gateCutoff: m.gateCutoff }));
 vi.mock('../../scan/output', () => ({
   log: vi.fn(),
   rule: (t: string) => t,
@@ -175,29 +175,29 @@ describe('runForward unchanged-content gate', () => {
 
   it('flag off: no cutoff read, no gate', async () => {
     await run();
-    expect(m.lastCompletedRunAt).not.toHaveBeenCalled();
+    expect(m.gateCutoff).not.toHaveBeenCalled();
     expect(gateArg()).toBeNull();
   });
 
   it('flag on: the gate compares with rows up to the last completed run', async () => {
     flagOn();
     const done = new Date('2026-10-18T06:00:00Z');
-    m.lastCompletedRunAt.mockResolvedValue(done);
+    m.gateCutoff.mockResolvedValue(done);
     await run();
-    expect(m.lastCompletedRunAt).toHaveBeenCalledWith('acc-1');
+    expect(m.gateCutoff).toHaveBeenCalledWith('acc-1');
     expect(gateArg()).toEqual({ notAfter: done });
   });
 
   it('flag on, no completed run yet: no gate, every file is interpreted', async () => {
     flagOn();
-    m.lastCompletedRunAt.mockResolvedValue(null);
+    m.gateCutoff.mockResolvedValue(null);
     await run();
     expect(gateArg()).toBeNull();
   });
 
   it('flag on, cutoff unreadable: fails open (no gate) and the window still commits', async () => {
     flagOn();
-    m.lastCompletedRunAt.mockRejectedValue(new Error('connection reset'));
+    m.gateCutoff.mockRejectedValue(new Error('connection reset'));
     await run();
     expect(gateArg()).toBeNull();
     expect(cursorAdvanced()).toBe(true);

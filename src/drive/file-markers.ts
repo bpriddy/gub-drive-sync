@@ -8,7 +8,7 @@ import type { drive_v3 } from 'googleapis';
 import type { TraversedFile } from './types';
 
 /**
- * The content markers FILE_FIELDS requests, keeping only the fields Drive
+ * The content markers fileFields() requests, keeping only the fields Drive
  * returned. The unchanged-content gate (src/scan/content-gate.ts) reads them.
  */
 export function contentMarkers(

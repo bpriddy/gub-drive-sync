@@ -25,7 +25,7 @@ import { loadEntity } from '../backfill/entity';
 import { DEFAULT_CONCURRENCY, type Args, type BackfillRunResult } from '../backfill/args';
 import { resolveAccountStructure } from '../backfill/structure-stage';
 import { processBatch } from '../scan/process-batch';
-import { lastCompletedRunAt } from '../scan/content-gate';
+import { gateCutoff } from '../scan/content-gate';
 import { isTransientFailure } from '../scan/failure-class';
 import { log, rule, fmtMs, getLogCapture, setLogCapture } from '../scan/output';
 import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
@@ -250,14 +250,14 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
   let filesUnchanged = 0;
   if (files.length > 0) {
     // Unchanged-content gate (SKIP_UNCHANGED_CONTENT=on). It trusts only the
-    // snapshot rows written by the account's last completed run: a retried
-    // window's failed attempt wrote rows whose observations may never have
-    // landed. No completed run yet, or a failed read: every file is
-    // interpreted, as with the flag off.
+    // snapshot rows written up to the account's last completed run (less a
+    // clock-skew margin): a retried window's failed attempt wrote rows whose
+    // observations may never have landed. No completed run yet, or a failed
+    // read: every file is interpreted, as with the flag off.
     let unchangedGate: { notAfter: Date } | null = null;
     if (config.SKIP_UNCHANGED_CONTENT === 'on') {
       try {
-        const notAfter = await lastCompletedRunAt(fargs.accountId);
+        const notAfter = await gateCutoff(fargs.accountId);
         if (notAfter) {
           unchangedGate = { notAfter };
           log(`  ⏭ unchanged-content gate on — compared with rows up to ${notAfter.toISOString()}`);

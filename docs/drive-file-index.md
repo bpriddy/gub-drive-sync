@@ -79,15 +79,29 @@ Its form depends on `SKIP_UNCHANGED_CONTENT`:
 
 - `off` (the default), and every v1 row: an md5 of the full extracted text.
 - `on` (v2 rows): a versioned hash from `src/scan/content-gate.ts`, of what
-  the interpret prompt depends on.
+  the model calls after the gate depend on. Both forms include the gate's
+  epoch (`GATE_EPOCH`), the name, the path, the zone and whether the ideas
+  tier runs for the account.
   - `v2:` + sha256 of the prompt-visible text (the first
-    `GEMINI_MAX_INPUT_CHARS` characters and whether the text was cut), the
-    name, the path and the zone.
-  - `bin:` + sha256 of Drive's `md5Checksum` (or `version`), the name, the
-    path and the zone, for downloaded files. Known before the download.
+    `GEMINI_MAX_INPUT_CHARS` characters and whether the text was cut). When
+    the ideas tier runs, it also covers a digest of the full text of a cut
+    file, because idea extraction reads all of it. Used for Google-native
+    files, shortcuts, and downloads that came without a content marker.
+  - `bin:` + sha256 of Drive's content marker (`md5Checksum`, else
+    `headRevisionId`, else `version`) and `GEMINI_MAX_INPUT_CHARS`, for
+    downloaded files. Known before the download.
+
+  Left out on purpose: the modified time and editor (they change on every
+  edit), the "N chars omitted" count, the known-campaigns vocabulary and the
+  entity states. The prompt preset, the model and the extractor version are
+  left out too: after such a change, bump `GATE_EPOCH` to re-interpret every
+  file once.
 
   An md5 never equals either form, so turning the flag on re-interprets
   each file once.
+
+  An extracted row whose idea extraction or merge failed carries no hash, so
+  the gate retries that file on its next event.
 
 A consumer that needs "interpreted" must read **v2 rows only** (they leave
 `sync_run_id` NULL — see the caveat above) or accept v1's weaker meaning.
@@ -105,7 +119,38 @@ NULL on an extracted row. Otherwise:
 | `skipped` | A v2 skip outcome that carried no reason (defensive; not expected). | v2 |
 | `index_refresh` | A listing-only row: the file was seen in a Drive listing and nothing was extracted. | the catch-up |
 | `trashed` | The file is in the Drive trash (forward runs fetch files by id, which also returns trashed ones); nothing was read. | v2, `SKIP_UNCHANGED_CONTENT=on` |
-| `content_unchanged` | The content hash matched the file's last extracted row written by the account's last completed run, so interpret and idea extraction did not run. That older extracted row stays the file's source. | v2 forward runs, `SKIP_UNCHANGED_CONTENT=on` |
+| `content_unchanged` | The content hash matched the hash on the file's newest relevant row in the account (see "The unchanged-content gate" below), so interpret and idea extraction did not run. The older extracted row stays the file's source. | v2 forward runs, `SKIP_UNCHANGED_CONTENT=on` |
+
+## The unchanged-content gate
+
+With `SKIP_UNCHANGED_CONTENT=on`, the forward run compares each file's
+content hash with ONE row: the file's newest row in this account, once rows
+that record no reading are looked through (`content_unchanged`, `trashed`,
+`index_refresh`).
+
+The gate skips the file only when that row meets all three conditions:
+- it is an extracted row with a hash;
+- it was written at or before the cutoff;
+- its hash matches.
+
+The cutoff is the account's last completed `drive_sync_runs` row, less 60 s
+for clock skew. Rows after the cutoff may come from an attempt whose later
+stages failed: H2's window-commit gate retries the window, and the first
+attempt has already written extracted rows. A newer `extract_error`,
+`restricted` or other skip row vetoes the skip, and the gate never falls
+back to an older row.
+
+A file on the restricted worklist is always read: the read is the probe that
+resolves its row.
+
+The gate fails open. With no completed run yet, an unreadable cutoff or a
+failed lookup, every file is interpreted, as with the flag off.
+
+Known gap: a row written by an attempt that never committed counts as
+committed once any LATER run of the account completes. One case is a
+manual bootstrap that completes between a failed forward attempt and its
+retry. Closing it needs each row's run id (`drive_sync_run_id`, which the
+index work adds): then only rows of completed runs would count.
 
 ## A write that fails
 
@@ -219,7 +264,7 @@ extracted when v1 scans it.
 
 ## Readers
 
-All of them are in GUB:
+The readers outside this repo are all in GUB:
 
 - **File-name search** takes the **latest row per
   file** — whatever its kind — for `name`, `path`, `mime_type`, `modified_time`
@@ -235,10 +280,21 @@ failed on it) is searchable by name but appears in no `_sources` list, and a
 file whose newest row is a skip still shows up there through its older
 extracted row.
 
-None of them filters on `skip_reason`, so `trashed` and `content_unchanged`
-rows need no reader change. A `content_unchanged` file keeps its older
-extracted row in `_sources` and cited-file resolution (same content), and
-file-name search reads the new row's current name and path. In this repo,
-v1's delta rule (`checkDelta`) and the catch-up (`snapshot-refresh.ts`) read
-the latest row's modified time, name and path, which a `content_unchanged`
-row records as current.
+None of the GUB readers filters on `skip_reason`, so `trashed` and
+`content_unchanged` rows need no reader change there.
+- A `content_unchanged` file keeps its older extracted row in `_sources` and
+  in cited-file resolution: the content is the same.
+- That row's `scanned_at` no longer moves with each touch, so such a file
+  stops climbing `_sources`, which is ordered newest-first.
+- File-name search reads the new row's current name and path.
+
+In this repo:
+- v1's delta rule (`checkDelta`) reads the latest row except `index_refresh`
+  ones. It counts `content_unchanged` and `trashed` rows, which record the
+  current modified time. A v1 scan would then treat a restored trashed file as
+  unchanged. Only v1 is affected.
+- The catch-up (`snapshot-refresh.ts`) reads the latest row's name, path and
+  modified time, which a `content_unchanged` row records as current.
+
+A trashed file (flag on) is skipped unread, so an edit made just before it
+was trashed is not interpreted.

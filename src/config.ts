@@ -103,11 +103,12 @@ const EnvSchema = z.object({
   /**
    * Content-aware skips in the scan core. `off` (the default) is the behaviour
    * before them. `on`:
+   *   - Drive is asked for the files' content markers (drive/client.ts fileFields);
    *   - a trashed file is skipped (skip_reason 'trashed');
    *   - snapshot rows carry the versioned content hash (src/scan/content-gate.ts);
    *   - the forward run skips interpret and idea extraction for a file whose
-   *     content hash matches its last extracted row from before the account's
-   *     last completed run (skip_reason 'content_unchanged').
+   *     content hash matches its newest committed extracted row
+   *     (skip_reason 'content_unchanged'; docs/drive-file-index.md).
    */
   SKIP_UNCHANGED_CONTENT: z.enum(['off', 'on']).default('off'),
   /**

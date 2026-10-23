@@ -42,7 +42,7 @@ export interface TraversedFile {
    */
   shortcutTarget?: { id: string; mimeType: string };
   /**
-   * Drive's content markers (FILE_FIELDS; drive/client.ts contentMarkers).
+   * Drive's content markers (drive/client.ts fileFields, drive/file-markers.ts).
    * `version` grows on every change to the file, metadata included.
    * `md5Checksum` and `headRevisionId` exist only for blob files (PDF,
    * Office, text), never for Google-native ones. `trashed` is true for a file

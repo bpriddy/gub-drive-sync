@@ -173,7 +173,22 @@ export async function driveClient(): Promise<drive_v3.Drive> {
 
 /** Fields we always request on a file. */
 export const FILE_FIELDS =
-  'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType),version,md5Checksum,headRevisionId,trashed';
+  'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType)';
+
+/** Drive's content markers, read by the unchanged-content gate (src/scan/content-gate.ts). */
+export const CONTENT_MARKER_FIELDS = 'version,md5Checksum,headRevisionId,trashed';
+
+/**
+ * The per-file fields every listing and files.get asks for: FILE_FIELDS, plus
+ * the content markers when SKIP_UNCHANGED_CONTENT is on. Off, the request is
+ * exactly the one before the gate (and the bootstrap files cache, which
+ * stores TraversedFiles, does not grow).
+ */
+export function fileFields(): string {
+  return config.SKIP_UNCHANGED_CONTENT === 'on'
+    ? `${FILE_FIELDS},${CONTENT_MARKER_FIELDS}`
+    : FILE_FIELDS;
+}
 
 /**
  * Items per `files.list` page: the documented maximum. Drive may still
@@ -194,7 +209,7 @@ export async function listFolderChildren(folderId: string): Promise<drive_v3.Sch
     const res = await driveLimiter.run(() =>
       client.files.list({
         q: `'${folderId}' in parents and trashed = false`,
-        fields: `nextPageToken, files(${FILE_FIELDS})`,
+        fields: `nextPageToken, files(${fileFields()})`,
         pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
@@ -440,7 +455,7 @@ export async function listSharedDriveFiles(
         driveId,
         q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
         orderBy,
-        fields: `nextPageToken, files(${FILE_FIELDS})`,
+        fields: `nextPageToken, files(${fileFields()})`,
         pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
@@ -478,10 +493,15 @@ export async function listSharedDriveFiles(
 }
 
 /**
- * Fields for the flat file listing. FILE_FIELDS carries Drive's content
- * markers itself now; the name stays for the flat listing's callers.
+ * Fields for the flat file listing: as before the gate, FILE_FIELDS plus
+ * `version` and `md5Checksum` (for a later check of which files really
+ * changed); with SKIP_UNCHANGED_CONTENT on, fileFields(), which holds them.
  */
-export const FLAT_FILE_FIELDS = FILE_FIELDS;
+export function flatFileFields(): string {
+  return config.SKIP_UNCHANGED_CONTENT === 'on'
+    ? fileFields()
+    : `${FILE_FIELDS},version,md5Checksum`;
+}
 
 /**
  * Flat-list every non-folder file in a shared drive, keeping only the files
@@ -510,7 +530,7 @@ export async function listDriveFilesFlat(
           driveId,
           q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
           orderBy: 'createdTime',
-          fields: `nextPageToken, files(${FLAT_FILE_FIELDS})`,
+          fields: `nextPageToken, files(${flatFileFields()})`,
           pageSize: LIST_PAGE_SIZE,
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
@@ -529,7 +549,7 @@ export async function listDriveFilesFlat(
 }
 
 /**
- * Fetch one file's metadata (FILE_FIELDS) by id. Returns null on 404 /
+ * Fetch one file's metadata (fileFields()) by id. Returns null on 404 /
  * gone — the forward driver treats vanished files as skips (the
  * Activity window may reference items deleted moments later).
  *
@@ -543,7 +563,7 @@ export async function getFileMetadata(fileId: string): Promise<drive_v3.Schema$F
   try {
     const res = await withTransientRetry(() =>
       driveLimiter.run(() =>
-        client.files.get({ fileId, fields: FILE_FIELDS, supportsAllDrives: true }),
+        client.files.get({ fileId, fields: fileFields(), supportsAllDrives: true }),
       ),
     );
     return res.data;

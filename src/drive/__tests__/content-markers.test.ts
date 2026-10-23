@@ -4,11 +4,14 @@ import { describe, expect, it, vi } from 'vitest';
 // none of them is exercised here.
 vi.mock('googleapis', () => ({ google: { drive: () => ({}) } }));
 vi.mock('../../workspace', () => ({ buildBotOAuthClient: async () => ({}) }));
-vi.mock('../../config', () => ({
-  config: { DRIVE_READ_TIMEOUT_MS: 60_000, DRIVE_MEDIA_TIMEOUT_MS: 300_000 },
+const cfg = vi.hoisted(() => ({
+  DRIVE_READ_TIMEOUT_MS: 60_000,
+  DRIVE_MEDIA_TIMEOUT_MS: 300_000,
+  SKIP_UNCHANGED_CONTENT: 'off' as 'off' | 'on',
 }));
+vi.mock('../../config', () => ({ config: cfg }));
 
-const { FILE_FIELDS, FLAT_FILE_FIELDS } = await import('../client');
+const { FILE_FIELDS, fileFields, flatFileFields } = await import('../client');
 const { contentMarkers } = await import('../file-markers');
 
 describe('contentMarkers', () => {
@@ -33,16 +36,24 @@ describe('contentMarkers', () => {
   });
 });
 
-describe('FILE_FIELDS', () => {
-  it('requests the four content markers', () => {
-    const fields = FILE_FIELDS.split(',');
-    for (const f of ['version', 'md5Checksum', 'headRevisionId', 'trashed']) {
-      expect(fields).toContain(f);
-    }
+describe('fileFields', () => {
+  const MARKERS = ['version', 'md5Checksum', 'headRevisionId', 'trashed'];
+
+  it('flag off: exactly the request before the gate', () => {
+    cfg.SKIP_UNCHANGED_CONTENT = 'off';
+    expect(fileFields()).toBe(FILE_FIELDS);
+    for (const f of MARKERS) expect(FILE_FIELDS.split(',')).not.toContain(f);
+    // The flat listing kept its own two markers before the gate.
+    expect(flatFileFields()).toBe(`${FILE_FIELDS},version,md5Checksum`);
   });
 
-  it('the flat listing asks for each field once', () => {
-    const fields = FLAT_FILE_FIELDS.split(',');
-    expect(new Set(fields).size).toBe(fields.length);
+  it('flag on: every listing and files.get ask for the four markers, each once', () => {
+    cfg.SKIP_UNCHANGED_CONTENT = 'on';
+    for (const fields of [fileFields(), flatFileFields()]) {
+      const list = fields.split(',');
+      for (const f of MARKERS) expect(list).toContain(f);
+      expect(new Set(list).size).toBe(list.length);
+    }
+    cfg.SKIP_UNCHANGED_CONTENT = 'off';
   });
 });
