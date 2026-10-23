@@ -36,6 +36,11 @@ export interface LlmCompletionRequest {
    * thinkingBudget — set at most one.
    */
   thinkingLevel?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH';
+  /**
+   * Per-attempt deadline in ms (0 = none). Omit to use
+   * GEMINI_TIMEOUT_DEFAULT_MS. A timed-out attempt is retried like a 408.
+   */
+  timeoutMs?: number;
 }
 
 export interface LlmUsage {

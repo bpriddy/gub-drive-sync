@@ -15,6 +15,7 @@
 // call in the process while it waited. Wrapping means each attempt re-enters
 // the queue and gets paced like any other call.
 
+import { jitteredDelayMs } from '../backoff';
 import { logger } from '../logger';
 
 /**
@@ -35,7 +36,11 @@ export function isTransientTransportError(err: unknown): boolean {
     status?: number;
     response?: { status?: number };
     message?: string;
+    error?: { type?: string };
   };
+  // A request that ran past its gaxios `timeout` (node-fetch FetchError,
+  // wrapped by gaxios with no response): a stall, not a refusal.
+  if (e.error?.type === 'request-timeout' || e.error?.type === 'body-timeout') return true;
   const numericCode = typeof e.code === 'string' ? Number(e.code) : e.code;
   const status =
     (Number.isFinite(numericCode) ? (numericCode as number) : undefined) ??
@@ -54,7 +59,21 @@ export function isTransientTransportError(err: unknown): boolean {
   ) {
     return true;
   }
-  return typeof e.message === 'string' && /socket hang up|network socket disconnected/i.test(e.message);
+  return (
+    typeof e.message === 'string' && /socket hang up|network socket disconnected/i.test(e.message)
+  );
+}
+
+/**
+ * A request this Job aborted at its own deadline. `code: 'ETIMEDOUT'` puts
+ * it in the transient class (isTransientTransportError) on purpose.
+ */
+export class RequestTimeoutError extends Error {
+  readonly code = 'ETIMEDOUT';
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'RequestTimeoutError';
+  }
 }
 
 /**
@@ -72,7 +91,8 @@ export async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
       return await fn();
     } catch (err) {
       if (!isTransientTransportError(err) || attempt === MAX_ATTEMPTS) throw err;
-      const backoffMs = 1000 * Math.pow(2, attempt - 1);
+      // Nominal 1 s → 2 s, jittered so parallel workers don't retry in step.
+      const backoffMs = jitteredDelayMs(1000 * Math.pow(2, attempt - 1));
       logger.warn(
         { attempt, MAX_ATTEMPTS, backoffMs, err: err instanceof Error ? err.message : String(err) },
         '[drive.retry] transient transport fault — retrying',
@@ -82,4 +102,56 @@ export async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
   }
   // Unreachable: the loop either returns or throws on the last attempt.
   throw new Error('withTransientRetry: exhausted without result');
+}
+
+/** 403 reasons that mean "rate-limited, try again". */
+const RATE_LIMIT_REASONS = new Set(['userRateLimitExceeded', 'rateLimitExceeded', 'quotaExceeded']);
+
+type ReasonList = Array<{ reason?: string } | null | undefined>;
+
+/**
+ * Drive/Workspace rate-limit signal — back off and try again:
+ *   - 429, whatever its body says (newer APIs answer RESOURCE_EXHAUSTED
+ *     with no `errors[].reason` at all);
+ *   - 403 carrying a rate-limit reason.
+ * Other 403s (auth, permissions) are NOT retryable and should propagate
+ * immediately.
+ *
+ * Reasons are read wherever googleapis left them: `errors` on the error,
+ * the parsed body, or — for `responseType: 'stream'` calls (media
+ * downloads) — the raw JSON text gaxios read off the stream, where neither
+ * `code` nor `errors` is set. Missing that last shape made a rate-limited
+ * download look like a permission error (see isDrivePermissionError).
+ */
+export function isRateLimitError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    code?: number | string;
+    status?: number;
+    errors?: ReasonList;
+    response?: { status?: number; data?: unknown };
+  };
+  const code =
+    typeof e.code === 'number'
+      ? e.code
+      : typeof e.code === 'string' && /^\d+$/.test(e.code)
+        ? Number(e.code)
+        : undefined;
+  const status = code ?? e.status ?? e.response?.status;
+  if (status === 429) return true;
+  if (status !== 403) return false;
+  return reasonsOf(e).some((r) => RATE_LIMIT_REASONS.has(r));
+}
+
+function reasonsOf(e: { errors?: ReasonList; response?: { data?: unknown } }): string[] {
+  let body = e.response?.data;
+  if (typeof body === 'string') {
+    try {
+      body = JSON.parse(body);
+    } catch {
+      body = undefined;
+    }
+  }
+  const bodyErrors = (body as { error?: { errors?: ReasonList } } | undefined)?.error?.errors;
+  return [...(e.errors ?? []), ...(bodyErrors ?? [])].map((x) => x?.reason ?? '');
 }

@@ -3,7 +3,8 @@
  *
  * Given a TraversedFile, return an ExtractionOutcome:
  *   - { kind: 'ok', text, contentHash, extractor } for supported files
- *   - { kind: 'skip', reason } for folders, unsupported mime, oversized, or empty
+ *   - { kind: 'skip', reason } for folders, unsupported mime, oversized, empty,
+ *     or a Google-native file whose text is over NATIVE_MAX_CHARS
  *
  * Skip reasons route to drive_scan_logs with the matching category.
  *
@@ -32,15 +33,11 @@
 
 import crypto from 'node:crypto';
 import mammoth from 'mammoth';
-import {
-  google,
-  type docs_v1,
-  type slides_v1,
-  type sheets_v4,
-} from 'googleapis';
+import { google, type docs_v1, type slides_v1, type sheets_v4 } from 'googleapis';
 import { config } from '../config';
 import { logger } from '../logger';
-import { downloadFileBuffer } from './client';
+import { withDownloadedFile } from './download';
+import { pacedCall } from './pacing';
 import { buildBotOAuthClient } from '../workspace';
 import type { ExtractionOutcome, ExtractionSkip, TraversedFile } from './types';
 
@@ -56,6 +53,20 @@ const MIME = {
   DOCX: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   PPTX: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 } as const;
+
+/**
+ * True for the mimes extractText downloads (its PDF, DOCX, PPTX and text/*
+ * branches) rather than reading through a Google API. Only these files carry
+ * an md5Checksum, so only these can be compared before the download.
+ */
+export function isDownloadedMime(mimeType: string): boolean {
+  return (
+    mimeType === MIME.PDF ||
+    mimeType === MIME.DOCX ||
+    mimeType === MIME.PPTX ||
+    mimeType.startsWith('text/')
+  );
+}
 
 // All scopes the extractor needs. The 'drive' bot must have consented to
 // all of these at authorize time; runtime helper verifies via subset check.
@@ -78,21 +89,21 @@ let cachedSheets: sheets_v4.Sheets | null = null;
 async function docsClient(): Promise<docs_v1.Docs> {
   if (cachedDocs) return cachedDocs;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedDocs = google.docs({ version: 'v1', auth });
+  cachedDocs = google.docs({ version: 'v1', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedDocs;
 }
 
 async function slidesClient(): Promise<slides_v1.Slides> {
   if (cachedSlides) return cachedSlides;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedSlides = google.slides({ version: 'v1', auth });
+  cachedSlides = google.slides({ version: 'v1', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedSlides;
 }
 
 async function sheetsClient(): Promise<sheets_v4.Sheets> {
   if (cachedSheets) return cachedSheets;
   const auth = await buildBotOAuthClient('drive', EXTRACT_SCOPES);
-  cachedSheets = google.sheets({ version: 'v4', auth });
+  cachedSheets = google.sheets({ version: 'v4', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedSheets;
 }
 
@@ -110,6 +121,34 @@ function ok(text: string, extractor: string): ExtractionOutcome {
   return { kind: 'ok', text: trimmed, contentHash: hash(trimmed), extractor };
 }
 
+/**
+ * Character guard for the Google-native walkers. They have no byte size to
+ * check before the read — the API returns the whole structure — so the cap is
+ * on the walked text: over NATIVE_MAX_CHARS the file is skipped (not
+ * truncated) and logged. This bounds what goes on to hashing, the LLM stage
+ * and the DB, NOT the API response, which is already in memory when the walker
+ * returns.
+ */
+function nativeOutcome(
+  text: string,
+  extractor: 'gdoc' | 'gslides' | 'gsheet',
+  fileId: string,
+): ExtractionOutcome {
+  const limit = config.NATIVE_MAX_CHARS;
+  if (text.length > limit) {
+    logger.warn(
+      { fileId, extractor, chars: text.length, limit },
+      '[drive.extract] native text over NATIVE_MAX_CHARS — skipped',
+    );
+    return {
+      kind: 'skip',
+      reason: 'too_many_chars',
+      detail: `extractor=${extractor} chars=${text.length} limit=${limit}`,
+    };
+  }
+  return ok(text, extractor);
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -118,7 +157,9 @@ function ok(text: string, extractor: string): ExtractionOutcome {
  * dedicated APIs that return structured content — no full-file byte
  * transfer happens, so the cost is content-window-truncation (handled
  * downstream in interpret.ts) rather than transfer/memory. A 300 MB
- * Google Slides deck is API-traversed, not downloaded.
+ * Google Slides deck is API-traversed, not downloaded. What those walkers
+ * return is capped separately, by characters (NATIVE_MAX_CHARS, see
+ * nativeOutcome).
  */
 function tooLargeForBinaryDownload(file: TraversedFile): ExtractionSkip | null {
   if (file.size && file.size > config.DRIVE_MAX_FILE_SIZE_BYTES) {
@@ -151,7 +192,11 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
   let isShortcutFollow = false;
   if (file.mimeType === MIME.SHORTCUT) {
     if (!file.shortcutTarget) {
-      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut without resolved target' };
+      return {
+        kind: 'skip',
+        reason: 'unsupported_mime',
+        detail: 'shortcut without resolved target',
+      };
     }
     if (file.shortcutTarget.mimeType === MIME.GOOGLE_FOLDER) {
       return {
@@ -161,7 +206,11 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
       };
     }
     if (file.shortcutTarget.mimeType === MIME.SHORTCUT) {
-      return { kind: 'skip', reason: 'unsupported_mime', detail: 'shortcut chain (single-level follow only)' };
+      return {
+        kind: 'skip',
+        reason: 'unsupported_mime',
+        detail: 'shortcut chain (single-level follow only)',
+      };
     }
     effective = {
       ...file,
@@ -173,7 +222,8 @@ export function predictExtractionSkip(file: TraversedFile): ExtractionSkip | nul
   }
 
   switch (effective.mimeType) {
-    // Google-native: API-traversed, no size cap.
+    // Google-native: API-traversed, no size cap here (the character guard
+    // needs the walked text, so it can't be predicted from metadata).
     case MIME.GOOGLE_DOC:
     case MIME.GOOGLE_SLIDES:
     case MIME.GOOGLE_SHEET:
@@ -239,62 +289,95 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
 
   try {
     switch (effectiveFile.mimeType) {
-      // ── Google-native: API-traversed, NO size cap. Content-window
+      // ── Google-native: API-traversed, NO byte size cap; the walked text is
+      //    capped by NATIVE_MAX_CHARS (nativeOutcome). Content-window
       //    truncation handled downstream by GEMINI_MAX_INPUT_CHARS.
       case MIME.GOOGLE_DOC:
-        return ok(await extractGoogleDoc(effectiveFile.id), 'gdoc');
+        return nativeOutcome(await extractGoogleDoc(effectiveFile.id), 'gdoc', effectiveFile.id);
       case MIME.GOOGLE_SLIDES:
-        return ok(await extractGoogleSlides(effectiveFile.id), 'gslides');
+        return nativeOutcome(
+          await extractGoogleSlides(effectiveFile.id),
+          'gslides',
+          effectiveFile.id,
+        );
       case MIME.GOOGLE_SHEET:
-        return ok(await extractGoogleSheets(effectiveFile.id), 'gsheet');
+        return nativeOutcome(
+          await extractGoogleSheets(effectiveFile.id),
+          'gsheet',
+          effectiveFile.id,
+        );
 
       // ── Binary downloads: size cap already checked in predictExtractionSkip.
-      case MIME.PDF: {
-        const buf = await downloadFileBuffer(effectiveFile.id);
-        // Import lazily to keep the parser off the module init path.
-        //
-        // `unpdf` is a thin modern wrapper over `pdfjs-dist`'s legacy
-        // build — the build Mozilla maintains specifically for Node /
-        // serverless environments without DOM globals. We deliberately
-        // do NOT use pdf-parse: v1.x is unmaintained (last release
-        // 2019), and v2.x is a rewrite on top of the non-legacy
-        // pdfjs-dist build that expects browser globals (DOMMatrix,
-        // Path2D, ImageData) and throws in Node without `canvas`
-        // native-dep polyfills. unpdf is the actively-maintained
-        // primitive that exists precisely because of v2's breakage.
-        //
-        // We construct the PDFDocumentProxy explicitly (rather than
-        // passing raw bytes to extractText) so we can set pdfjs's
-        // `verbosity` level. Default is WARNINGS, which spams the log
-        // with harmless TrueType-font notes like "TT: undefined
-        // function: 32" — those don't affect text extraction but
-        // drown out real signal. verbosity: 0 = ERRORS only.
-        const { getDocumentProxy, extractText } = await import('unpdf');
-        const pdf = await getDocumentProxy(new Uint8Array(buf), { verbosity: 0 });
-        const { text } = await extractText(pdf, { mergePages: true });
-        return ok(text, 'pdf');
-      }
-      case MIME.DOCX: {
-        const buf = await downloadFileBuffer(effectiveFile.id);
-        const { value } = await mammoth.extractRawText({ buffer: buf });
-        return ok(value, 'docx');
-      }
-      case MIME.PPTX: {
-        const buf = await downloadFileBuffer(effectiveFile.id);
-        // Import lazily to keep officeparser off the module init path —
-        // it has a heavy zlib/xml unpack chain we'd rather defer.
-        // officeparser flattens to plain text; slide boundaries and
-        // speaker notes are mostly preserved as runs of lines. For
-        // richer visual understanding (charts/photos/layout), see the
-        // future "rich pipeline" plan in docs/status-markdown-plan.md.
-        const { parseOfficeAsync } = await import('officeparser');
-        const text = await parseOfficeAsync(buf);
-        return ok(text, 'pptx');
-      }
+      //    Each branch downloads and parses inside withDownloadedFile's byte
+      //    reservation, sized from effectiveFile.size (a missing size counts as
+      //    heavy). `return await`, so a failure still lands in the catch below.
+      case MIME.PDF:
+        return await withDownloadedFile(effectiveFile, async (buf) => {
+          // Import lazily to keep the parser off the module init path.
+          //
+          // `unpdf` is a thin modern wrapper over `pdfjs-dist`'s legacy
+          // build — the build Mozilla maintains specifically for Node /
+          // serverless environments without DOM globals. We deliberately
+          // do NOT use pdf-parse: v1.x is unmaintained (last release
+          // 2019), and v2.x is a rewrite on top of the non-legacy
+          // pdfjs-dist build that expects browser globals (DOMMatrix,
+          // Path2D, ImageData) and throws in Node without `canvas`
+          // native-dep polyfills. unpdf is the actively-maintained
+          // primitive that exists precisely because of v2's breakage.
+          //
+          // We construct the PDFDocumentProxy explicitly (rather than
+          // passing raw bytes to extractText) so we can set pdfjs's
+          // `verbosity` level. Default is WARNINGS, which spams the log
+          // with harmless TrueType-font notes like "TT: undefined
+          // function: 32" — those don't affect text extraction but
+          // drown out real signal. verbosity: 0 = ERRORS only.
+          //
+          // The bytes go in as a VIEW over the download, not as
+          // `new Uint8Array(buf)`, which copies the whole file next to the
+          // original. How the pdf.js bundled in unpdf 1.6.2 treats `data`
+          // (its getDataProp): it throws on a Node Buffer; it uses a
+          // Uint8Array as-is only when it covers its whole ArrayBuffer, and
+          // copies any other view. A large download owns its ArrayBuffer (Node
+          // pools only Buffers under Buffer.poolSize / 2 = 4 KiB), so the view
+          // is used without a copy; a small pooled Buffer is a slice of the
+          // shared pool, which pdf.js copies itself, so it never owns the pool.
+          // pdf.js also TRANSFERS the ArrayBuffer it is given to its worker
+          // side, which detaches `buf`: do not read `buf` after this call.
+          const { getDocumentProxy, extractText } = await import('unpdf');
+          const view = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+          const pdf = await getDocumentProxy(view, { verbosity: 0 });
+          // Destroy the document before the reservation is released: pdf.js
+          // keeps the transferred bytes alive until then, which would put the
+          // file's memory outside the budget until the next PDF replaces it.
+          try {
+            const { text } = await extractText(pdf, { mergePages: true });
+            return ok(text, 'pdf');
+          } finally {
+            await pdf.destroy();
+          }
+        });
+      case MIME.DOCX:
+        return await withDownloadedFile(effectiveFile, async (buf) => {
+          const { value } = await mammoth.extractRawText({ buffer: buf });
+          return ok(value, 'docx');
+        });
+      case MIME.PPTX:
+        return await withDownloadedFile(effectiveFile, async (buf) => {
+          // Import lazily to keep officeparser off the module init path —
+          // it has a heavy zlib/xml unpack chain we'd rather defer.
+          // officeparser flattens to plain text; slide boundaries and
+          // speaker notes are mostly preserved as runs of lines. For
+          // richer visual understanding (charts/photos/layout), see the
+          // future "rich pipeline" plan in docs/status-markdown-plan.md.
+          const { parseOfficeAsync } = await import('officeparser');
+          const text = await parseOfficeAsync(buf);
+          return ok(text, 'pptx');
+        });
       default: {
         if (effectiveFile.mimeType.startsWith('text/')) {
-          const buf = await downloadFileBuffer(effectiveFile.id);
-          return ok(buf.toString('utf-8'), 'plaintext');
+          return await withDownloadedFile(effectiveFile, async (buf) =>
+            ok(buf.toString('utf-8'), 'plaintext'),
+          );
         }
         // predictExtractionSkip would have caught this above; defensive
         // fall-through in case extractText gets called with a file the
@@ -320,7 +403,7 @@ export async function extractText(file: TraversedFile): Promise<ExtractionOutcom
 
 export async function extractGoogleDoc(documentId: string): Promise<string> {
   const client = await docsClient();
-  const res = await client.documents.get({ documentId });
+  const res = await pacedCall('docs', () => client.documents.get({ documentId }));
   const doc = res.data;
   const parts: string[] = [];
 
@@ -351,9 +434,7 @@ function walkDocStructuralElement(el: docs_v1.Schema$StructuralElement): string 
 function walkDocParagraph(p: docs_v1.Schema$Paragraph): string {
   // Each paragraph element already ends with \n in Google's content (the
   // textRun's content string includes the trailing newline). Just join.
-  return (p.elements ?? [])
-    .map((e) => e.textRun?.content ?? '')
-    .join('');
+  return (p.elements ?? []).map((e) => e.textRun?.content ?? '').join('');
 }
 
 function walkDocTable(t: docs_v1.Schema$Table): string {
@@ -381,7 +462,7 @@ function walkDocTable(t: docs_v1.Schema$Table): string {
 
 export async function extractGoogleSlides(presentationId: string): Promise<string> {
   const client = await slidesClient();
-  const res = await client.presentations.get({ presentationId });
+  const res = await pacedCall('slides', () => client.presentations.get({ presentationId }));
   const pres = res.data;
   const parts: string[] = [];
 
@@ -406,10 +487,7 @@ export async function extractGoogleSlides(presentationId: string): Promise<strin
     // (a separate page entirely). We section them off so Gemini sees them
     // as notes, not main slide content.
     const notesEls = slide.slideProperties?.notesPage?.pageElements ?? [];
-    const notes = notesEls
-      .map(walkSlidesPageElement)
-      .join('')
-      .trim();
+    const notes = notesEls.map(walkSlidesPageElement).join('').trim();
     if (notes) {
       parts.push(`\n### Speaker notes\n${notes}\n`);
     }
@@ -422,9 +500,7 @@ export async function extractGoogleSlides(presentationId: string): Promise<strin
 
 function walkSlidesPageElement(el: slides_v1.Schema$PageElement): string {
   if (el.shape?.text) {
-    const text = (el.shape.text.textElements ?? [])
-      .map((te) => te.textRun?.content ?? '')
-      .join('');
+    const text = (el.shape.text.textElements ?? []).map((te) => te.textRun?.content ?? '').join('');
     return text ? text.replace(/\n+$/, '') + '\n' : '';
   }
   if (el.table) {
@@ -464,10 +540,12 @@ export async function extractGoogleSheets(spreadsheetId: string): Promise<string
   const client = await sheetsClient();
 
   // Step 1: enumerate sheets.
-  const meta = await client.spreadsheets.get({
-    spreadsheetId,
-    fields: 'properties.title,sheets.properties(title,sheetId)',
-  });
+  const meta = await pacedCall('sheets', () =>
+    client.spreadsheets.get({
+      spreadsheetId,
+      fields: 'properties.title,sheets.properties(title,sheetId)',
+    }),
+  );
 
   const workbookTitle = meta.data.properties?.title;
   const sheetTitles = (meta.data.sheets ?? [])
@@ -477,11 +555,13 @@ export async function extractGoogleSheets(spreadsheetId: string): Promise<string
   if (sheetTitles.length === 0) return '';
 
   // Step 2: batch values fetch. One range per sheet, naming the whole sheet.
-  const values = await client.spreadsheets.values.batchGet({
-    spreadsheetId,
-    ranges: sheetTitles,
-    valueRenderOption: 'FORMATTED_VALUE',
-  });
+  const values = await pacedCall('sheets', () =>
+    client.spreadsheets.values.batchGet({
+      spreadsheetId,
+      ranges: sheetTitles,
+      valueRenderOption: 'FORMATTED_VALUE',
+    }),
+  );
 
   const parts: string[] = [];
   if (workbookTitle) parts.push(`# ${workbookTitle}\n\n`);

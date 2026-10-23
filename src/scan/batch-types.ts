@@ -1,9 +1,6 @@
 // Part of the scan core (src/scan/) — mode-agnostic batch machinery shared
 // by every driver (day-walk backfill today; the Activity forward driver next).
-import type {
-  AccountCurrentState,
-  CampaignCurrentState,
-} from '../drive/schema';
+import type { AccountCurrentState, CampaignCurrentState } from '../drive/schema';
 import type { CampaignObservation } from '../drive/interpret';
 import type { EntityMap } from '../drive/structure';
 import type { IdeaScanStats } from '../drive/idea-scan';
@@ -15,6 +12,10 @@ import type { IdeaScanStats } from '../drive/idea-scan';
  * dossiers, and the driver-owned cursor/cache fields. Constructed by the
  * DRIVER (src/backfill/entity.ts loadEntity today; the forward driver
  * later) and consumed read-only by the scan core.
+ *
+ * Deliberately NOT here: the bootstrap files cache
+ * (accounts.drive_bootstrap_files). It grows with the drive, so only the
+ * bootstrap path loads it, lazily, via loadBootstrapFilesCache (days.ts).
  */
 export interface EntityCtx {
   type: 'account' | 'campaign';
@@ -49,12 +50,6 @@ export interface EntityCtx {
    * checks fingerprint; on match, skips the ~1m 45s LLM classify step.
    */
   driveStructureClassification: unknown;
-  /**
-   * Cached file list + active_dates from bootstrap chunk #1. NULL after
-   * bootstrap completes (or before first chunk). When present, chunks
-   * 2..N skip the ~3 min file discovery + grouping step.
-   */
-  driveBootstrapFiles: unknown;
   reviewerEmail: string | null;
   reviewerStaffId: string | null;
 }
@@ -156,6 +151,18 @@ export interface BatchOutcome {
   filesExtracted: number;
   filesSkipped: number;
   filesErrored: number;
+  /**
+   * Of filesErrored (plus stage-2 asset-folder calls), the failures of a
+   * transient class — rate limit, 408/5xx, timeout, dropped connection —
+   * after the call's own retries were spent. Their observations are lost
+   * from THIS batch but a re-run would very likely recover them, so the
+   * forward driver holds the cursor on them. Permanent failures (corrupt
+   * file, permission, malformed model output) stay counted-and-dropped:
+   * every re-run would repeat them. Idea-tier extraction failures are not
+   * counted: ideas are a separate ratchet with their own error count
+   * (ideaStats.ideaErrors), not part of the window's observations.
+   */
+  transientFileErrors: number;
   filesZeroObs: number;
   accountObsTotal: number;
   campaignObsTotal: number;
@@ -171,10 +178,31 @@ export interface BatchOutcome {
    * Stage-3 synthesis/apply/propose failures. Non-zero means at least
    * one entity's day did NOT land (in the DB or the review queue) —
    * run.ts throws before the cursor persists so the queue retry re-runs
-   * the day instead of silently losing it. Distill failures are
-   * deliberately excluded (degraded, not lost).
+   * the day instead of silently losing it. A failed distill counts too:
+   * on the propose path it is the only route from observations to review,
+   * so it is a loss, not a degradation; the target is then neither
+   * proposed nor applied, so the re-run lands it exactly once.
    */
   stage3Failures: number;
   /** Ideas tier: deck-gated extraction stats (null when account folder unknown). */
   ideaStats: IdeaScanStats | null;
+  /**
+   * drive_file_snapshots rows (the Drive name index) that failed to write.
+   * Each is already reported with a `[drive.snapshot] write failed` WARN.
+   * The drivers fail the run when this exceeds SNAPSHOT_WRITE_FAILURE_LIMIT
+   * before the cursor or day is committed — append-only history, so every
+   * retry re-writes the whole window: one more row per file per failed attempt.
+   */
+  snapshotWriteFailures: number;
+  /**
+   * Unchanged-content gate (SKIP_UNCHANGED_CONTENT=on, forward runs): files
+   * whose content hash matched their last interpret, so interpret and idea
+   * extraction did not run. Their snapshot rows carry skip_reason
+   * 'content_unchanged'. Not counted in filesExtracted or filesSkipped.
+   */
+  filesUnchanged: number;
+  /** Of filesUnchanged, matched on Drive's md5 before any download. */
+  filesUnchangedBeforeDownload: number;
+  /** Files in the Drive trash, skipped unread (also in filesSkipped). */
+  filesTrashed: number;
 }

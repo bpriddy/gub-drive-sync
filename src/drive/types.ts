@@ -41,6 +41,18 @@ export interface TraversedFile {
    * greedy coverage of content that's only reachable via shortcut.
    */
   shortcutTarget?: { id: string; mimeType: string };
+  /**
+   * Drive's content markers (drive/client.ts fileFields, drive/file-markers.ts).
+   * `version` grows on every change to the file, metadata included.
+   * `md5Checksum` and `headRevisionId` exist only for blob files (PDF,
+   * Office, text), never for Google-native ones. `trashed` is true for a file
+   * in the trash, also when only its parent folder was trashed. Each is absent
+   * when Drive did not return it.
+   */
+  version?: string;
+  md5Checksum?: string;
+  headRevisionId?: string;
+  trashed?: boolean;
 }
 
 export interface ExtractionResult {
@@ -61,6 +73,10 @@ export interface ExtractionSkip {
      *  size, and downloading a multi-hundred-MB binary just to discover
      *  it exceeds the cap is the OOM vector we're guarding. */
     | 'shortcut_unverified_size'
+    /** A Google-native Doc/Sheet/Slides whose walked text is longer than
+     *  NATIVE_MAX_CHARS. Native reads have no byte size to check before the
+     *  fetch, so this is decided after the walk, from the text itself. */
+    | 'too_many_chars'
     | 'empty'
     | 'delta_unchanged';
   detail?: string;

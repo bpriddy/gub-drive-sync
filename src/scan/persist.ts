@@ -2,6 +2,7 @@
 // by every driver (day-walk backfill today; the Activity forward driver next).
 import { z } from 'zod';
 import { prisma } from '../prisma';
+import { config } from '../config';
 import {
   ACCOUNT_WRITABLE_FIELDS,
   CAMPAIGN_WRITABLE_FIELDS,
@@ -15,7 +16,6 @@ import { DRIVE_SYNC_SYSTEM_STAFF_ID, castToEntity, projectChangeValue } from '..
 import type { AccountObservation, CampaignObservation } from '../drive/interpret';
 import { log } from './output';
 import type { EntityCtx } from './batch-types';
-
 
 // ── Distillation (the engine's structured-field step) ───────────────────────
 //
@@ -89,6 +89,7 @@ export async function runDistillation(
   const completion = await runPreset({
     key: 'drive.distillation.v1',
     responseSchema: distillationResponseSchema(entityType),
+    timeoutMs: config.GEMINI_TIMEOUT_DISTILL_MS,
     variables: {
       entity_type: entityType,
       writable_fields_json: JSON.stringify(
@@ -250,7 +251,9 @@ export async function persistTarget(args: {
     });
     return;
   }
-  throw new Error(`persistTarget: unsupported target shape (${target.entityType}/${target.entityStatus})`);
+  throw new Error(
+    `persistTarget: unsupported target shape (${target.entityType}/${target.entityStatus})`,
+  );
 }
 
 /**
@@ -293,6 +296,8 @@ async function persistAccountTarget(
     await tx.account.update({
       where: { id: accountId },
       data: columnUpdates,
+      // RETURNING only the id, not drive_bootstrap_files.
+      select: { id: true },
     });
     for (const vc of validatedChanges) {
       const previousCols = projectChangeValue(vc.spec.changeKind, vc.previousValue, 'previous');
@@ -421,10 +426,7 @@ async function persistNewCampaignTarget(args: {
   } = args;
   const initialFields: Record<string, unknown> = {};
   for (const vc of validatedChanges) {
-    initialFields[vc.spec.entityColumn] = castToEntity(
-      vc.spec.changeKind,
-      vc.validatedValue,
-    );
+    initialFields[vc.spec.entityColumn] = castToEntity(vc.spec.changeKind, vc.validatedValue);
   }
 
   await prisma.$transaction(async (tx) => {

@@ -18,7 +18,7 @@
  * DELETES (all scoped to the account + its campaigns):
  *   drive_change_proposals, drive_scan_logs, drive_file_snapshots,
  *   drive_sync_runs, campaign_changes, campaigns, account_changes,
- *   access_grants (account- AND campaign-scoped), audit_log (Chevy entries).
+ *   access_grants (account- AND campaign-scoped), audit_log (the account's entries).
  * RESETS account cols → NULL:
  *   status_markdown, status_sensitive_markdown, drive_bootstrap_cursor,
  *   drive_bootstrap_completed_at, drive_last_synced_at, drive_activity_page_token,
@@ -62,9 +62,7 @@ export interface ClearAccountResult {
   };
 }
 
-async function resolveAccount(
-  opts: ClearAccountOptions,
-): Promise<{ id: string; name: string }> {
+async function resolveAccount(opts: ClearAccountOptions): Promise<{ id: string; name: string }> {
   if (!opts.accountId && !opts.accountName) {
     throw new Error('clearAccount requires accountId or accountName');
   }
@@ -78,16 +76,12 @@ async function resolveAccount(
         select: { id: true, name: true },
       });
   if (!account) {
-    throw new Error(
-      `account not found (${opts.accountId ?? `name~"${opts.accountName}"`})`,
-    );
+    throw new Error(`account not found (${opts.accountId ?? `name~"${opts.accountName}"`})`);
   }
   return account;
 }
 
-export async function clearAccountComplete(
-  opts: ClearAccountOptions,
-): Promise<ClearAccountResult> {
+export async function clearAccountComplete(opts: ClearAccountOptions): Promise<ClearAccountResult> {
   const account = await resolveAccount(opts);
 
   // ── Collect the id sets we need for scoping + audit purge. ──────────────
@@ -97,7 +91,7 @@ export async function clearAccountComplete(
   });
   const campaignIds = campaigns.map((c) => c.id);
 
-  // All Chevy grants: account-scoped + campaign-scoped (polymorphic soft FK).
+  // All the account's grants: account-scoped + campaign-scoped (polymorphic soft FK).
   const grants = await prisma.accessGrant.findMany({
     where: {
       OR: [

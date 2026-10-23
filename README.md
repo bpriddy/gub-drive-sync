@@ -121,12 +121,15 @@ the mode; subsequent flags are mode-specific (`--sync-run-id=<uuid>` for
 
 ## CI / CD
 
-Same convention as the other GUB repos. Single Cloud Build trigger on
-`main` → `cloudbuild/dev.yaml`, deploying the Cloud Run Job
-`gub-drive-sync-dev`. `staging.yaml` / `prod.yaml` are committed for
-when prod exists; their triggers are added then. Unlike a Service, a
-Job has **no traffic/promotion step** — `jobs deploy` updates the
-definition and the next `jobs:run` uses the new image.
+GitHub Actions deploys: `.github/workflows/deploy.yml` builds the image
+and updates the Cloud Run Job `gub-drive-sync-dev` on every push to `main`
+(or a manual dispatch). That workflow is the single source of runtime
+config. Deployment identifiers are not in it: they come from repository
+secrets (listed in its header, masked in run logs), and a deploy with one
+unset fails before it touches anything. `cloudbuild/staging.yaml` / `prod.yaml` remain as
+provisioning references until those environments are ported. Unlike a
+Service, a Job has **no traffic/promotion step** — `jobs deploy` updates
+the definition and the next `jobs:run` uses the new image.
 
 ### First-time GCP bootstrap
 
@@ -200,11 +203,11 @@ rollback table.
 # DRY-RUN — detect + log the clusters that WOULD merge. No writes, no LLM
 # synthesis. Read the logged `outcome.clusters` to review before applying.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=merge-campaign-dupes,--account-name,chevy
+  --args=merge-campaign-dupes,--account-name,acme
 
 # APPLY — same detection, then merge every cluster ≥ 0.8 confidence.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=merge-campaign-dupes,--account-name,chevy,--confirm
+  --args=merge-campaign-dupes,--account-name,acme,--confirm
 
 # Optional: raise the floor (only merge ≥ 0.9), or target by id.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
@@ -224,7 +227,7 @@ redeploy:
 
 ```bash
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=merge-campaign-dupes,--account-name,chevy,--window,40,--vote-threshold,2
+  --args=merge-campaign-dupes,--account-name,acme,--window,40,--vote-threshold,2
 ```
 
 Review the result (the `outcome` object is logged as structured JSON):
@@ -232,14 +235,14 @@ Review the result (the `outcome` object is logged as structured JSON):
 ```bash
 gcloud logging read \
   'resource.labels.service_name="gub-drive-sync-dev" AND jsonPayload.msg="gub-drive-sync complete"' \
-  --project=os-test-491819 --limit=1 --format='value(jsonPayload.outcome)'
+  --project=<project-id> --limit=1 --format='value(jsonPayload.outcome)'
 ```
 
 Local equivalent (hits whatever `DATABASE_URL` points at):
 
 ```bash
-npm run merge-campaign-dupes -- --account-name chevy            # dry-run
-npm run merge-campaign-dupes -- --account-name chevy --confirm  # apply
+npm run merge-campaign-dupes -- --account-name acme             # dry-run
+npm run merge-campaign-dupes -- --account-name acme --confirm   # apply
 ```
 
 ### Complete per-account nuke (`clear-account`)
@@ -248,7 +251,7 @@ Clean-slate an account so a re-bootstrap starts blank. The account row
 survives (its `drive_folder_id` + business fields are kept); **everything
 else Drive-sync is wiped** in one transaction — child campaigns, all their
 changes/proposals/scan-logs/snapshots, the `drive_sync_runs` queue,
-`access_grants` (account + campaign), Chevy `audit_log` entries, and every
+`access_grants` (account + campaign), the account's `audit_log` entries, and every
 account sync/cache column (`drive_bootstrap_cursor`,
 `drive_structure_classification`, `drive_bootstrap_files`, …). This exists
 because the old per-account `clear` left bootstrap-cache + snapshot residue
@@ -259,11 +262,11 @@ that silently skipped re-classification/re-extraction.
 ```bash
 # DRY-RUN — counts what would be deleted/reset. No writes.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=clear-account,--account-name,chevy
+  --args=clear-account,--account-name,acme
 
 # APPLY — the full nuke.
 gcloud run jobs execute gub-drive-sync-dev --region=us-central1 \
-  --args=clear-account,--account-name,chevy,--confirm
+  --args=clear-account,--account-name,acme,--confirm
 ```
 
 **audit_log — dev vs prod:** the whole nuke is one transaction. In dev the
@@ -272,6 +275,144 @@ succeeds. When prod re-enables those triggers, that delete raises and the
 entire transaction rolls back — production stays strict, enforced by the DB
 (not by `NODE_ENV`, which is `production` on the deployed dev job). Local
 equivalent: `npm run clear -- --account-id <uuid>` (same shared code path).
+
+## Ideas eval (`eval-ideas`)
+
+`scripts/eval-ideas.ts` measures the ideas pipeline against a hand-labelled
+gold set. It runs the production code with no Drive access and no database:
+the extractor (`extractIdeasFromFile`) on each deck's text, then the matcher
+(`matchAndMergeIdea`) over the extracted ideas, account by account in deck
+order, the same loop the scan runs in `mergeIdeaCandidates`. In the scan,
+the extractor sees only the decks that the per-file interpret call already
+typed as idea decks. Here every deck reaches the extractor, as in
+`extract-ideas`, so the deck-type numbers measure the extractor's own gate.
+
+```bash
+# $0: build every prompt with the model stubbed out, print calls and cost
+npm run eval-ideas -- extract --fixtures ~/ideas-gold --plan
+
+# PAID: one Gemini call per deck plus one per extracted idea (after the first
+# of each account). Needs an explicit go, and always --max-usd.
+npm run eval-ideas -- extract --fixtures ~/ideas-gold --out ~/ideas-eval --max-usd 3
+
+# $0: re-score a saved run, e.g. after fixing the gold set or the threshold
+npm run eval-ideas -- score --fixtures ~/ideas-gold --run ~/ideas-eval/eval-ideas-<time>.json --out ~/ideas-eval
+```
+
+`EVAL_IDEAS_FIXTURES` / `EVAL_IDEAS_OUT` stand in for `--fixtures` / `--out`.
+`--limit N` runs the first N decks; `--no-merge` skips the matcher;
+`--threshold` changes the hit threshold. Unknown flags are refused, so a
+typo never starts a paid run on defaults.
+
+**Customer content stays out of this repo.** Deck text, gold ideas, runs and
+scores are all customer data. The script refuses a fixture or output
+directory inside the repository; the only fixtures committed here are the
+synthetic ones in `scripts/eval-ideas-example/` (with a hand-written
+`sample-run.json` to try `score` on).
+
+**The spend guard.** Before each call the script checks that the money spent
+so far plus the call's worst case stays under `--max-usd`. The worst case is
+the prompt at one token per 3 bytes, plus the whole output allowance. If the
+call does not fit, the script stops and scores what it has.
+
+- A finished call is charged its reported usage. Thoughts bill as output, and the output side is the larger of output + thoughts and total − prompt.
+- A failed call is charged the worst case of every attempt the driver makes (3).
+- A call the driver retried and then completed is charged for its last attempt only. The earlier attempts are not visible to the script.
+
+The run file is rewritten after every deck and every merge decision (write,
+then rename), so a stop or a crash keeps a valid partial run.
+
+### Fixture format
+
+One pair of files per deck, in one directory:
+
+- `<id>.txt`: the deck's text.
+- `<id>.gold.json`: the labels.
+
+```json
+{
+  "name": "Spring Pitch R1.pptx",
+  "path": "Account / Campaign / Pitch",
+  "account": "Account name",
+  "order": 1,
+  "deckType": "pitch",
+  "ideas": [
+    {
+      "key": "night-owl",
+      "name": "Night Owl Route",
+      "aliases": ["The Night Owl"],
+      "facets": ["late-night radio takeover", "owl mascot host", "tongue in cheek"]
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name`, `path` | What the model sees as the file name and folder path (the extractor weighs both). Default: the id, and empty. |
+| `account` | The matcher runs per account, as in the scan. Default: one group. |
+| `order` | Chronological position within the account. Merges depend on order. |
+| `deckType` | `pitch`, `creative_review` or `other`. An `other` deck lists no ideas. |
+| `ideas[].key` | The idea's identity across decks. The same concept in two decks gets the same key. |
+| `ideas[].name`, `aliases` | The deck's name for the idea, plus any other names it goes by. |
+| `ideas[].facets` | Optional short rows. A renamed idea can still match through them. |
+
+### Building a gold set
+
+1. **Pick 20–30 decks from two or three accounts.**
+   - About two thirds should be idea decks: pitches and creative reviews.
+   - About a third should be look-alikes that must yield nothing: briefs, strategy decks, media plans, status or wrap decks, final creative.
+   - Include at least one idea that recurs across decks under a new name. This tests the merge.
+   - Include two distinct ideas that share a campaign or a theme. This tests for false merges.
+2. **Get the text the scan would see.**
+   - Google Slides: *File → Download → Plain text*.
+   - Office or PDF files: the text you can copy out of them.
+   - The extractor gets the whole text, uncapped. Small layout differences from the scan's own extraction do not matter here.
+3. **Label each deck from the deck itself, before you look at any run.**
+   - Use the extractor's rules. An idea is what the deck presents as one: a named concept, territory or route.
+   - One concept shown in several executions is one idea.
+   - The campaign's overall platform is not an idea.
+4. **Give a concept one key across all decks.** Put a later round's new name in `aliases`.
+5. **Write two to five facet rows per idea.** Each row is a short phrase that keeps its meaning.
+6. **Keep the set outside the repo**, for example in `~/ideas-gold/`. Point `EVAL_IDEAS_FIXTURES` at it.
+7. **Start small.** Run `extract --plan`, then a short paid run with `--limit 5`, then `score`. Read the near misses and the spurious ideas before changing anything.
+
+### Matching and metrics
+
+An extracted idea is compared with each gold idea of the same deck using
+pg_trgm's whole-string `similarity()`. GUB's discovery search ranks by
+`word_similarity()` instead, a different scale, so the two scores are not
+comparable. The pair's score is the better of two comparisons:
+
+- the names (the gold name or any alias);
+- the facet rows, each side joined into one text.
+
+A pair is a **hit** at score ≥ **0.4**. Hits are assigned one to one, best score first.
+
+The threshold is set a little above pg_trgm's default similarity threshold
+of 0.3, because a false hit flatters both precision and recall. It has not
+yet been calibrated on real decks. For each extracted idea left without a
+hit, the score file lists every pair that falls within 0.15 below the
+threshold. Read those first, and prefer adding an alias to lowering the
+threshold.
+
+| Metric | Definition |
+|---|---|
+| Precision / recall / F1 | Hits ÷ extracted ideas, and hits ÷ gold ideas, summed over all decks. A deck whose extraction failed counts as nothing extracted. |
+| Duplicates | Extracted ideas left without a hit that still score ≥ the threshold against a gold idea another extraction already took. |
+| Deck type | Failed extractions are left out. Accuracy is the exact label; gate accuracy counts only idea deck vs `other`, which is all the gate decides. "Turned away" means an idea deck labelled `other`, which loses all its ideas. "Let through" means the reverse. |
+| False-merge rate | Of the merges where both sides map to a gold idea, the share that join two different gold ideas. A memory row belongs to the gold idea of the extraction that created it. Merges involving a spurious idea are reported as unscored. |
+| Missed merges, duplicate rows | A create for a gold idea the account already holds a row for, and the extra rows per gold idea after the run. |
+| Impure rows | Memory rows that absorbed more than one gold idea. |
+| Near-duplicate facet pairs | Facet rows inside one final idea with similarity ≥ 0.8, which should have collapsed. |
+
+Missed merges and duplicate rows know a memory row by the gold idea of the
+extraction that created it. Two cases therefore do not show up there:
+
+- a row a spurious idea created, which later absorbed a gold idea;
+- a gold idea false-merged into another idea's row.
+
+The false merge itself is still counted.
 
 ## Prod implementation checklist
 

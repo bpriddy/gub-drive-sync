@@ -3,9 +3,9 @@
  *
  * An idea is a LIVING entity, not a per-deck snapshot. The same creative
  * concept shows up across many decks (a pitch, then refinement rounds, then a
- * creative review) under drifting names and reworded facets — BHAC's "LMA
- * Character Generator" appeared ~9 times as "Character Creator Portal",
- * "American Favorites Dealer Kit", "AI Character Web Experience"… all ONE idea.
+ * creative review) under drifting names and reworded facets — one account's
+ * "Character Generator" appeared ~9 times as "Character Creator Portal",
+ * "Dealer Kit", "AI Character Web Experience"… all ONE idea.
  *
  * So before persisting a freshly-extracted idea we ask: is this the SAME idea
  * as one we already know for this account? If yes, we MERGE its facets into the
@@ -73,10 +73,16 @@ const RESPONSE_SCHEMA: ResponseSchema = {
   required: ['match_index', 'merged_facets'],
 };
 
-function buildPrompt(args: { accountName: string | null; newIdea: NewIdea; candidates: KnownIdea[] }): string {
+function buildPrompt(args: {
+  accountName: string | null;
+  newIdea: NewIdea;
+  candidates: KnownIdea[];
+}): string {
   const candidateBlock = args.candidates
     .map((c, i) => {
-      const facets = c.facets.length ? c.facets.map((f) => `      - ${f}`).join('\n') : '      (no facets yet)';
+      const facets = c.facets.length
+        ? c.facets.map((f) => `      - ${f}`).join('\n')
+        : '      (no facets yet)';
       return `[${i + 1}] ${c.name}\n${facets}`;
     })
     .join('\n\n');
@@ -94,13 +100,13 @@ ${candidateBlock || '  (none yet)'}
 
 STEP 1 — SAME IDEA?
 Return the INDEX (the [n]) of the on-file idea that is the SAME underlying creative concept as the new one — the same core device / territory / mechanic — even if the name differs, the wording differs, or it is a later refinement round. If none is the same idea, return 0.
-  - SAME: "LMA Character Generator" vs "AI Character Web Experience" vs "American Favorites Dealer Kit" when all describe one AI tool that generates local dealer characters. Renames and reworded rounds of one concept are the same idea.
+  - SAME: "Character Generator" vs "AI Character Web Experience" vs "Dealer Character Kit" when all describe one AI tool that generates local dealer characters. Renames and reworded rounds of one concept are the same idea.
   - NOT SAME: two genuinely distinct concepts that merely share a campaign, a theme, or a season. When unsure, prefer 0 (a wrong merge silently destroys a real idea; a missed merge only leaves a duplicate we can catch later).
   - NOT SAME: a discrete concept vs a platform/umbrella-level description (an overall creative approach, a campaign's storytelling platform). Never merge a specific concept into an umbrella idea or an umbrella into a concept — an idea that keeps absorbing everything has stopped being an idea.
 
 STEP 2 — MERGE (only if match_index > 0)
 Compose merged_facets FRESH — the on-file rows and the new rows are raw material, not a base to append to. State the idea in the FEWEST right-sized rows that carry all of its distinct, current meaning; the result REPLACES the matched idea's facets:
-  - SUPERSEDE FIRST, keep second. Where a new facet REFINES, EXPANDS, or OUTDATES an on-file one (more outputs, a sharper mechanic, an added platform, a proposal that has since happened), keep ONE row — the fuller or newer — and DROP the one it supersedes. An outcome row replaces its proposal row ("launched on MLB Opening Day" replaces "planned TV spot for MLB Opening Day").
+  - SUPERSEDE FIRST, keep second. Where a new facet REFINES, EXPANDS, or OUTDATES an on-file one (more outputs, a sharper mechanic, an added platform, a proposal that has since happened), keep ONE row — the fuller or newer — and DROP the one it supersedes. An outcome row replaces its proposal row ("launched on the season opener" replaces "planned TV spot for the season opener").
   - Keep a facet from either side only when it is genuinely distinct AND still current after the rule above.
   - Apply these rules across the ENTIRE combined set, including rows that were already on file against each other — the merged set is a cleanup, not an append. Rows that say the same thing (including near-rephrasings) collapse to one.
   - Keep each row right-sized (the words that carry its meaning) — do not pad to prose, do not compress to a bare keyword.
@@ -155,7 +161,8 @@ export async function matchAndMergeIdea(args: {
   const mergedFacets = parsed.merged_facets.map((f) => f.trim()).filter(Boolean);
   // Defensive: an empty merge would blank the idea. Never let a merge delete
   // everything — fall back to the union if the model returned nothing usable.
-  const safeFacets = mergedFacets.length > 0 ? mergedFacets : dedupeUnion(matched.facets, args.newIdea.facets);
+  const safeFacets =
+    mergedFacets.length > 0 ? mergedFacets : dedupeUnion(matched.facets, args.newIdea.facets);
 
   return { matchId: matched.id, mergedFacets: safeFacets };
 }

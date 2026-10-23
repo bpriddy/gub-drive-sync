@@ -16,7 +16,7 @@
  *   1. Provision the Drive bot OAuth client + bot user out-of-band
  *      (per docs/proposals/bot-oauth-design.md setup runbook).
  *   2. Share each Drive folder the sync needs to read with
- *      bot.clientdrives@<domain> (or whatever the bot user is named).
+ *      <drive-bot>@<domain> (whatever the bot user is named).
  *   3. Authorize via gub-admin Settings → Sync Credentials → click
  *      Authorize on the 'drive' row.
  *
@@ -27,9 +27,16 @@
 
 import { google, type drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
+import { config } from '../config';
 import { logger } from '../logger';
-import { withTransientRetry } from './retry';
+import { jitteredDelayMs } from '../backoff';
+import { isRateLimitError, RequestTimeoutError, withTransientRetry } from './retry';
 import { buildBotOAuthClient } from '../workspace';
+import { contentMarkers } from './file-markers';
+
+// Re-exported: the classifier lives in the config-free ./retry so the scan
+// core can classify a failure without the client's auth imports.
+export { isRateLimitError };
 
 const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 
@@ -50,35 +57,11 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 // minimum interval between consecutive calls. Sequential by design —
 // concurrent callers queue up behind whoever's currently waiting.
 //
-// Cost: ~125ms added per call (8 calls/sec). For Chevy's ~159 startup
-// calls = ~20s of upfront throttled wall-clock vs ~5-10s of unconstrained
-// burst. Acceptable, and we never get a 403 in steady state.
+// Cost: ~125ms added per call (8 calls/sec). For the largest account's
+// ~159 startup calls = ~20s of upfront throttled wall-clock vs ~5-10s of
+// unconstrained burst. Acceptable, and we never get a 403 in steady state.
 
-export function isRateLimitError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as {
-    code?: number;
-    status?: number;
-    errors?: Array<{ reason?: string }>;
-    response?: { status?: number; data?: { error?: { errors?: Array<{ reason?: string }> } } };
-  };
-  const status = e.code ?? e.status ?? e.response?.status;
-  if (status !== 403 && status !== 429) return false;
-  const reasons: string[] = [
-    ...(e.errors ?? []).map((x) => x.reason ?? ''),
-    ...(e.response?.data?.error?.errors ?? []).map((x) => x.reason ?? ''),
-  ];
-  // Reasons that mean "rate-limited, try again." Other 403s (auth, perms)
-  // are NOT retryable and should propagate immediately.
-  return reasons.some(
-    (r) =>
-      r === 'userRateLimitExceeded' ||
-      r === 'rateLimitExceeded' ||
-      r === 'quotaExceeded',
-  );
-}
-
-class DriveRateLimiter {
+export class DriveRateLimiter {
   private chainTail: Promise<void> = Promise.resolve();
   private lastCallEndAt = 0;
   private readonly minIntervalMs: number;
@@ -109,8 +92,9 @@ class DriveRateLimiter {
     // Defense in depth: even with pacing, transient quota throttles can
     // slip through (bot user has tighter-than-documented quota,
     // cumulative effects, concurrent processes sharing the bot user).
-    // Retry rate-limit errors with exponential backoff: 2s → 4s → 8s →
-    // 16s → 30s. Non-rate-limit errors propagate immediately.
+    // Retry rate-limit errors with exponential backoff: nominal 2s → 4s →
+    // 8s → 16s (cap 30s), jittered ×[0.5, 1.5). Non-rate-limit errors
+    // propagate immediately.
     const MAX_ATTEMPTS = 5;
     let lastErr: unknown;
     try {
@@ -120,7 +104,7 @@ class DriveRateLimiter {
         } catch (err) {
           lastErr = err;
           if (!isRateLimitError(err) || attempt === MAX_ATTEMPTS) throw err;
-          const backoffMs = Math.min(2000 * Math.pow(2, attempt - 1), 30_000);
+          const backoffMs = jitteredDelayMs(Math.min(2000 * Math.pow(2, attempt - 1), 30_000));
           logger.warn(
             { attempt, MAX_ATTEMPTS, backoffMs },
             '[drive.client] rate-limited despite pacing — backing off and retrying',
@@ -142,14 +126,24 @@ class DriveRateLimiter {
  * 4 calls/sec gives 250ms spacing. Conservative vs Drive's documented
  * 10/sec per-user limit, but real-world enforcement is often tighter
  * (bot user quotas, sliding-window edges, concurrent process effects).
- * The cost is ~40s of upfront throttled wall-clock for Chevy's ~159
- * startup calls — acceptable.
+ * The cost is ~40s of upfront throttled wall-clock for the largest
+ * account's ~159 startup calls — acceptable.
  *
  * If 4/sec STILL hits the limit, the retry-with-backoff inside .run()
  * absorbs it: we wait up to 30s and try again, up to 5 attempts. The
  * chunk continues seamlessly instead of failing with HTTP 403.
  */
 const driveLimiter = new DriveRateLimiter(4);
+
+/**
+ * Run a call through the shared limiter (pacing + rate-limit retry) — for
+ * Drive-family calls made outside this module, e.g. the Activity query.
+ * Compose a transient retry OUTSIDE it, never inside (see ./retry):
+ *   withTransientRetry(() => runThroughDriveLimiter(() => call()))
+ */
+export function runThroughDriveLimiter<T>(fn: () => Promise<T>): Promise<T> {
+  return driveLimiter.run(fn);
+}
 
 // ── Drive API client (lazy singleton, OAuth-backed) ──────────────────────────
 
@@ -169,7 +163,9 @@ export async function driveClient(): Promise<drive_v3.Drive> {
   const auth = await buildBotOAuthClient('drive', [DRIVE_READONLY_SCOPE]);
   logger.info('[drive.client] initialized Drive client (bot-user OAuth)');
 
-  cachedClient = google.drive({ version: 'v3', auth });
+  // Service-level gaxios timeout: every metadata/list call aborts after
+  // DRIVE_READ_TIMEOUT_MS (gaxios then retries a timed-out GET twice).
+  cachedClient = google.drive({ version: 'v3', auth, timeout: config.DRIVE_READ_TIMEOUT_MS });
   return cachedClient;
 }
 
@@ -178,6 +174,28 @@ export async function driveClient(): Promise<drive_v3.Drive> {
 /** Fields we always request on a file. */
 export const FILE_FIELDS =
   'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType)';
+
+/** Drive's content markers, read by the unchanged-content gate (src/scan/content-gate.ts). */
+export const CONTENT_MARKER_FIELDS = 'version,md5Checksum,headRevisionId,trashed';
+
+/**
+ * The per-file fields every listing and files.get asks for: FILE_FIELDS, plus
+ * the content markers when SKIP_UNCHANGED_CONTENT is on. Off, the request is
+ * exactly the one before the gate (and the bootstrap files cache, which
+ * stores TraversedFiles, does not grow).
+ */
+export function fileFields(): string {
+  return config.SKIP_UNCHANGED_CONTENT === 'on'
+    ? `${FILE_FIELDS},${CONTENT_MARKER_FIELDS}`
+    : FILE_FIELDS;
+}
+
+/**
+ * Items per `files.list` page: the documented maximum. Drive may still
+ * return a short or empty page before the end, so every caller follows
+ * nextPageToken until it is absent.
+ */
+export const LIST_PAGE_SIZE = 1000;
 
 /**
  * List immediate children of a folder, following pagination.
@@ -191,8 +209,8 @@ export async function listFolderChildren(folderId: string): Promise<drive_v3.Sch
     const res = await driveLimiter.run(() =>
       client.files.list({
         q: `'${folderId}' in parents and trashed = false`,
-        fields: `nextPageToken, files(${FILE_FIELDS})`,
-        pageSize: 200,
+        fields: `nextPageToken, files(${fileFields()})`,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -224,7 +242,7 @@ export async function listSubfolders(folderId: string): Promise<SubfolderNode[]>
       client.files.list({
         q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
         fields: 'nextPageToken, files(id,name)',
-        pageSize: 200,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -239,19 +257,88 @@ export async function listSubfolders(folderId: string): Promise<SubfolderNode[]>
 }
 
 /**
+ * HTTP status of a googleapis error, however it is shaped: `code` (the API
+ * body's error code), `status` (gaxios) or `response.status`. Undefined for
+ * a transport fault, whose `code` is a string such as ECONNRESET.
+ */
+export function httpStatusOf(err: unknown): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const e = err as { code?: unknown; status?: unknown; response?: { status?: unknown } };
+  if (typeof e.code === 'number') return e.code;
+  if (typeof e.status === 'number') return e.status;
+  if (typeof e.response?.status === 'number') return e.response.status;
+  return undefined;
+}
+
+/** Every `reason` a googleapis error carries, from either body shape. */
+function errorReasons(err: unknown): string[] {
+  if (!err || typeof err !== 'object') return [];
+  const e = err as {
+    errors?: Array<{ reason?: string }>;
+    response?: { data?: { error?: { errors?: Array<{ reason?: string }> } } };
+  };
+  return [...(e.errors ?? []), ...(e.response?.data?.error?.errors ?? [])]
+    .map((x) => x.reason ?? '')
+    .filter((r) => r !== '');
+}
+
+/**
+ * A flat drive listing that came back without the root folder in it: the bot
+ * sees part of the drive, not this root's subtree. Handled as a refusal.
+ */
+export class FlatListingUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FlatListingUnavailableError';
+  }
+}
+
+/**
+ * The bot was refused a flat drive listing: 404 (no such drive for this
+ * user), a 403 that names no limit (for example, not a member of the drive),
+ * or a listing without the root in it. The root folder itself may still be
+ * shared with the bot, so a root inside the drive falls back to walking it.
+ *
+ * A 403 whose reason names a limit or a quota (userRateLimitExceeded,
+ * dailyLimitExceeded, sharingRateLimitExceeded, quotaExceeded, …) is NOT a
+ * refusal: the limiter has already backed off where it could, and a walk
+ * would only hit the same limit harder.
+ */
+export function isListingUnavailableError(err: unknown): boolean {
+  if (err instanceof FlatListingUnavailableError) return true;
+  const status = httpStatusOf(err);
+  if (status === 404) return true;
+  if (status !== 403) return false;
+  return !errorReasons(err).some((r) => /limit|quota/i.test(r));
+}
+
+/** Why a flat listing was unavailable, for a log line: status and reasons only. */
+export function listingFailureCause(err: unknown): string {
+  if (err instanceof FlatListingUnavailableError) return 'root not in the drive listing';
+  return [`HTTP ${httpStatusOf(err) ?? '?'}`, ...errorReasons(err)].join(' ');
+}
+
+/**
  * Flat-list EVERY folder in a shared drive in one paginated sweep
  * (`corpora=drive`, mimeType=folder). ONLY valid for shared-drive ids.
  *
  * The recursive folders-only walk (listSubfolders per folder) is O(folders)
- * sequential round-trips — minutes on a big drive. This is O(folders/200)
+ * sequential round-trips — minutes on a big drive. This is O(folders/1000)
  * paginated calls. The caller reconstructs the tree in memory from the
- * `parentId` pointers. Mirrors listSharedDriveFiles for the folder skeleton.
+ * `parentId` pointers and cuts out the subtree of any root in the drive
+ * (drive/folder-tree.ts). Mirrors listSharedDriveFiles for the folder
+ * skeleton.
+ *
+ * Each page retries transient faults (5xx, dropped sockets): one failed page
+ * fails the whole sweep, where a walk would have skipped one subfolder.
  */
 export interface DriveFolderRec {
   id: string;
   name: string;
   /** Immediate parent id (shared-drive folders have at most one parent). */
   parentId: string | null;
+  /** How many parents Drive listed; parentId is the first. Above 1 is a legacy multi-parent item. */
+  parentCount: number;
 }
 
 export async function listAllFoldersInDrive(
@@ -262,21 +349,28 @@ export async function listAllFoldersInDrive(
   const out: DriveFolderRec[] = [];
   let pageToken: string | undefined;
   do {
-    const res = await driveLimiter.run(() =>
-      client.files.list({
-        corpora: 'drive',
-        driveId,
-        q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
-        fields: 'nextPageToken, files(id,name,parents)',
-        pageSize: 200,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-        ...(pageToken ? { pageToken } : {}),
-      }),
+    const res = await withTransientRetry(() =>
+      driveLimiter.run(() =>
+        client.files.list({
+          corpora: 'drive',
+          driveId,
+          q: 'trashed = false and mimeType = "application/vnd.google-apps.folder"',
+          fields: 'nextPageToken, files(id,name,parents)',
+          pageSize: LIST_PAGE_SIZE,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          ...(pageToken ? { pageToken } : {}),
+        }),
+      ),
     );
     for (const f of res.data.files ?? []) {
       if (!f.id || !f.name) continue;
-      out.push({ id: f.id, name: f.name, parentId: f.parents?.[0] ?? null });
+      out.push({
+        id: f.id,
+        name: f.name,
+        parentId: f.parents?.[0] ?? null,
+        parentCount: f.parents?.length ?? 0,
+      });
     }
     if (opts.onPage) opts.onPage(out.length);
     pageToken = res.data.nextPageToken ?? undefined;
@@ -294,11 +388,12 @@ export async function listAllFoldersInDrive(
  *   - folder in shared drive → driveId !== id (and is present)
  *   - folder in My Drive → driveId is absent
  *
- * Knowing this matters for performance: a shared-drive root supports
- * `files.list(corpora='drive', driveId=X, orderBy=...)` returning the
- * entire drive's contents in one paginated query. Folders (in either
- * kind of drive) only support `'X' in parents` — direct children only —
- * forcing recursive traversal.
+ * Knowing this matters for performance: any folder with a driveId can use
+ * `files.list(corpora='drive', driveId=X, orderBy=...)`, which returns the
+ * entire drive's contents in one paginated query; a folder inside the drive
+ * then cuts its own subtree out in memory (drive/folder-tree.ts). Only a My
+ * Drive folder (no driveId) is limited to `'X' in parents` — direct
+ * children only — forcing recursive traversal.
  */
 export interface SharedDriveProbe {
   isSharedDriveRoot: boolean;
@@ -329,13 +424,13 @@ export async function probeFolder(folderId: string): Promise<SharedDriveProbe> {
 
 /**
  * Flat-list every non-folder file in a shared drive, paginated and
- * (optionally) ordered. ONLY valid for shared-drive-root ids — for
- * folders inside drives, you must walk recursively (`traverseFolder`).
+ * (optionally) ordered. ONLY valid for shared-drive ids. A folder inside a
+ * drive uses listSubtreeFiles (drive/subtree.ts) instead, which lists the
+ * drive flat and cuts the folder's subtree out with breadcrumb paths.
  *
- * Used by backfill to skip the recursive walk for shared-drive entities.
- * Returns TraversedFile shape with `path = name` (no breadcrumb; the flat
- * query gives parent ids, not paths, and reconstructing paths costs
- * more API calls than it's usually worth at this layer).
+ * Used by backfill to skip the recursive walk for shared-drive-root entities.
+ * Returns TraversedFile shape with `path = name` (no breadcrumb). The
+ * per-file interpret prompt reads that path, so it stays as it is.
  */
 export interface FlatListOptions {
   /** Stop after this many files. Use for capped iteration. */
@@ -360,8 +455,8 @@ export async function listSharedDriveFiles(
         driveId,
         q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
         orderBy,
-        fields: `nextPageToken, files(${FILE_FIELDS})`,
-        pageSize: 200,
+        fields: `nextPageToken, files(${fileFields()})`,
+        pageSize: LIST_PAGE_SIZE,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         ...(pageToken ? { pageToken } : {}),
@@ -388,6 +483,7 @@ export async function listSharedDriveFiles(
               },
             }
           : {}),
+        ...contentMarkers(f),
       });
       if (maxFiles !== null && out.length >= maxFiles) return out;
     }
@@ -397,7 +493,63 @@ export async function listSharedDriveFiles(
 }
 
 /**
- * Fetch one file's metadata (FILE_FIELDS) by id. Returns null on 404 /
+ * Fields for the flat file listing: as before the gate, FILE_FIELDS plus
+ * `version` and `md5Checksum` (for a later check of which files really
+ * changed); with SKIP_UNCHANGED_CONTENT on, fileFields(), which holds them.
+ */
+export function flatFileFields(): string {
+  return config.SKIP_UNCHANGED_CONTENT === 'on'
+    ? fileFields()
+    : `${FILE_FIELDS},version,md5Checksum`;
+}
+
+/**
+ * Flat-list every non-folder file in a shared drive, keeping only the files
+ * `keep` accepts. ONLY valid for shared-drive ids. The filter runs page by
+ * page, so a small root inside a big drive holds its own files, not the
+ * drive's. Each page retries transient faults, as listAllFoldersInDrive does.
+ *
+ * Ordered by createdTime, which an edit does not change, so a file edited
+ * while the sweep pages cannot shift to another page and be listed twice or
+ * skipped; an id seen twice is kept once all the same. The caller still
+ * sorts (direction, ties).
+ */
+export async function listDriveFilesFlat(
+  driveId: string,
+  keep: (file: drive_v3.Schema$File) => boolean,
+): Promise<drive_v3.Schema$File[]> {
+  const client = await driveClient();
+  const out: drive_v3.Schema$File[] = [];
+  const seen = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const res = await withTransientRetry(() =>
+      driveLimiter.run(() =>
+        client.files.list({
+          corpora: 'drive',
+          driveId,
+          q: 'trashed = false and mimeType != "application/vnd.google-apps.folder"',
+          orderBy: 'createdTime',
+          fields: `nextPageToken, files(${flatFileFields()})`,
+          pageSize: LIST_PAGE_SIZE,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          ...(pageToken ? { pageToken } : {}),
+        }),
+      ),
+    );
+    for (const f of res.data.files ?? []) {
+      if (f.id && seen.has(f.id)) continue;
+      if (f.id) seen.add(f.id);
+      if (keep(f)) out.push(f);
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+/**
+ * Fetch one file's metadata (fileFields()) by id. Returns null on 404 /
  * gone — the forward driver treats vanished files as skips (the
  * Activity window may reference items deleted moments later).
  *
@@ -406,14 +558,12 @@ export async function listSharedDriveFiles(
  * that has had sufficient effort spent on it and propagates — callers
  * decide whether to lose the file or fail the run.
  */
-export async function getFileMetadata(
-  fileId: string,
-): Promise<drive_v3.Schema$File | null> {
+export async function getFileMetadata(fileId: string): Promise<drive_v3.Schema$File | null> {
   const client = await driveClient();
   try {
     const res = await withTransientRetry(() =>
       driveLimiter.run(() =>
-        client.files.get({ fileId, fields: FILE_FIELDS, supportsAllDrives: true }),
+        client.files.get({ fileId, fields: fileFields(), supportsAllDrives: true }),
       ),
     );
     return res.data;
@@ -432,13 +582,35 @@ export async function getFileMetadata(
  */
 export async function downloadFileBuffer(fileId: string): Promise<Buffer> {
   const client = await driveClient();
-  const res = await driveLimiter.run(() =>
-    client.files.get(
-      { fileId, alt: 'media', supportsAllDrives: true },
-      { responseType: 'stream' },
-    ),
-  );
-  return streamToBuffer(res.data as Readable);
+  // One deadline for the whole download. gaxios' `timeout` stops at the
+  // response headers; the abort signal also covers a body that stalls
+  // mid-stream. The per-request `timeout` overrides the service-level read
+  // timeout, which is far too short for a large binary. The deadline is
+  // armed when the request starts, inside the limiter, so time spent
+  // queued behind other Drive calls never counts against it.
+  const timeoutMs = config.DRIVE_MEDIA_TIMEOUT_MS;
+  const abort = new AbortController();
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    const res = await driveLimiter.run(() => {
+      if (timer) clearTimeout(timer); // a rate-limit retry re-arms
+      if (timeoutMs > 0) timer = setTimeout(() => abort.abort(), timeoutMs);
+      return client.files.get(
+        { fileId, alt: 'media', supportsAllDrives: true },
+        { responseType: 'stream', timeout: timeoutMs, signal: abort.signal },
+      );
+    });
+    return await streamToBuffer(res.data as Readable);
+  } catch (err) {
+    if (abort.signal.aborted) {
+      throw new RequestTimeoutError(`media download timed out after ${timeoutMs} ms`, {
+        cause: err,
+      });
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function streamToBuffer(stream: Readable): Promise<Buffer> {
@@ -573,10 +745,7 @@ function isPageTokenExpired(err: unknown): boolean {
  * folder shape (3–5 levels deep). If trees get truly deep, add a parent-id
  * cache.
  */
-export async function isInsideFolder(
-  fileId: string,
-  rootFolderId: string,
-): Promise<boolean> {
+export async function isInsideFolder(fileId: string, rootFolderId: string): Promise<boolean> {
   if (fileId === rootFolderId) return true;
   const client = await driveClient();
   const visited = new Set<string>();

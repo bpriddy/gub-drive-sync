@@ -7,7 +7,7 @@
  * idea extraction (which re-verifies the gate itself — the two calls agree by
  * design), then the account-scoped match+merge (add new facets, supersede
  * refined ones), then persistence (idea + idea_changes) — the same
- * add-and-overwrite semantics the extract-ideas harness validated on BHAC.
+ * add-and-overwrite semantics the extract-ideas harness validated on a test campaign.
  *
  * A context object carries the per-scan known-ideas cache: loaded lazily on
  * the first deck, then advanced in memory as ideas are created/merged, so
@@ -141,7 +141,10 @@ export async function mergeIdeaCandidates(
         }));
       } catch (err) {
         // Matcher failure must not lose the idea — fall back to a plain create.
-        logger.warn({ err, ideaName: idea.name }, '[drive.idea-scan] match failed — creating as new');
+        logger.warn(
+          { err, ideaName: idea.name },
+          '[drive.idea-scan] match failed — creating as new',
+        );
         matchId = null;
         mergedFacets = idea.facets;
       }

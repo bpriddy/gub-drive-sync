@@ -28,7 +28,7 @@ The first time an account starts collecting Drive knowledge.
 
 - Account exists in DB with a non-NULL `drive_folder_id` (set via
   gub-admin's Data Sources page).
-- Bot user (`bot.clientdrives@anomaly.com`) has been shared on the
+- Bot user (`<drive-bot>@<workspace-domain>`) has been shared on the
   account's Drive folder with at least Viewer/Commenter access.
 - Bot's OAuth scopes include:
   - `drive.readonly`
@@ -260,10 +260,20 @@ Then re-trigger.
 
 ### "OOM — Container terminated on signal 9"
 
-Memory limit reached. Default is 2Gi (cloudbuild yaml). Check:
+Memory limit reached. Dev runs at 2Gi (`--memory` in `.github/workflows/deploy.yml`;
+the staging and prod references in `cloudbuild/` still say 1Gi). Check:
 - Was the day-bucket extra heavy? (Many edited files with large PDFs.)
 - Is the `[mem]` watcher showing rss climbing? Identify which phase.
-- Bump `--memory` in `cloudbuild/dev.yaml` if necessary, redeploy.
+- Which file was in memory? Each download of at least `DOWNLOAD_HEAVY_BYTES`
+  (50 MiB) logs `[drive.memory] large file in memory` (`fileId`, `bytes`,
+  `metadataBytes`, `rssBytes`, `heapUsedBytes`, ...) right after the transfer;
+  the last one before the kill names it. `bytes` far above `metadataBytes`
+  means the listing was stale and the file was reserved as a small one.
+- The end of every run summary shows `Peak memory: RSS ...` (the process
+  high-water mark, so it also covers earlier queue rows of the same execution;
+  also logged as `[drive.memory] run peak`).
+- Lower `DOWNLOAD_INFLIGHT_BYTES` / `DOWNLOAD_HEAVY_BYTES`, or bump `--memory`
+  in `.github/workflows/deploy.yml`, and redeploy.
 
 ### "Same file processed twice across chunks"
 
@@ -433,7 +443,7 @@ applied before pushing the others.
 
 ### Cloud Run Job config
 
-`cloudbuild/dev.yaml`:
+`.github/workflows/deploy.yml` (the dev `FLAGS`):
 
 ```yaml
 - --tasks=1
@@ -485,7 +495,7 @@ then re-deploy (Cloud Run picks up `:latest`).
 
 ## Bot OAuth
 
-The bot user (`bot.clientdrives@anomaly.com`) holds an OAuth refresh
+The bot user (`<drive-bot>@<workspace-domain>`) holds an OAuth refresh
 token in the `bot_credentials` table. Operations:
 
 - **Initial grant / re-grant**: gub-admin Settings → Bot Credentials.
@@ -494,7 +504,7 @@ token in the `bot_credentials` table. Operations:
   `BOT_SCOPES.drive` array AND the GCP OAuth consent screen (Data
   Access). Then re-grant the bot through gub-admin UI.
 - **Share the bot on a new Drive folder**: from the Drive UI, add
-  `bot.clientdrives@anomaly.com` as Viewer (Commenter for stricter
+  `<drive-bot>@<workspace-domain>` as Viewer (Commenter for stricter
   visibility).
 
 ---

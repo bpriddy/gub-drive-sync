@@ -75,10 +75,7 @@ export interface DistillAndEmitInput {
   campaignId: string | null;
   syncRunId: string | null;
   /** Each observation tagged with the file it came from. */
-  observations: Array<
-    | SourcedAccountObservation
-    | SourcedCampaignObservation
-  >;
+  observations: Array<SourcedAccountObservation | SourcedCampaignObservation>;
   currentState: Record<string, unknown>;
   reviewerEmail?: string | null;
   reviewerStaffId?: string | null;
@@ -116,6 +113,7 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
   const completion = await runPreset({
     key: 'drive.distillation.v1',
     responseSchema: distillationResponseSchema(input.entityType),
+    timeoutMs: config.GEMINI_TIMEOUT_DISTILL_MS,
     variables: {
       entity_type: input.entityType,
       writable_fields_json: JSON.stringify(
@@ -168,7 +166,11 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
 
   for (const change of distilled.field_changes) {
     // Validate proposed_value against the field's Zod validator.
-    const validation = validateProposedValue(input.entityType, change.field, change.proposed_value ?? null);
+    const validation = validateProposedValue(
+      input.entityType,
+      change.field,
+      change.proposed_value ?? null,
+    );
     if (!validation.ok) {
       proposalsDroppedInvalid++;
       // Rescue the LLM's text into the additional_update bucket so the
@@ -203,12 +205,12 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
       continue;
     }
 
-    const currentJson = (currentValue as Prisma.InputJsonValue | null) === null
-      ? Prisma.JsonNull
-      : (currentValue as Prisma.InputJsonValue);
-    const proposedJson = validation.value === null
-      ? Prisma.JsonNull
-      : (validation.value as Prisma.InputJsonValue);
+    const currentJson =
+      (currentValue as Prisma.InputJsonValue | null) === null
+        ? Prisma.JsonNull
+        : (currentValue as Prisma.InputJsonValue);
+    const proposedJson =
+      validation.value === null ? Prisma.JsonNull : (validation.value as Prisma.InputJsonValue);
 
     await prisma.driveChangeProposal.create({
       data: {
@@ -254,9 +256,7 @@ export async function distillAndEmit(input: DistillAndEmitInput): Promise<Distil
   let notesWritten = 0;
   if (allNoteItems.length > 0) {
     const items = allNoteItems;
-    const unionSources = Array.from(
-      new Set(items.flatMap((n) => n.source_file_ids)),
-    );
+    const unionSources = Array.from(new Set(items.flatMap((n) => n.source_file_ids)));
 
     await prisma.driveChangeProposal.create({
       data: {

@@ -21,6 +21,10 @@
  *                                                    PROPOSE for review)
  *   seed-edit-stats          → seedEditStats (one-shot ~1y historical
  *     [--account-id X]         drive_edit_stats seed; stats only)
+ *   refresh-snapshots        → refreshFileSnapshots (operator gcloud; one-
+ *     [--account-id X]         shot catch-up of the drive_file_snapshots
+ *     [--confirm]              name index — Drive listing only, no LLM.
+ *                              No --confirm = dry-run counts.)
  *   merge-campaign-dupes     → runCampaignMerge  (operator gcloud; one-shot
  *     --account-name X [--confirm]                 detect + merge duplicate
  *     [--min-confidence 0..1]                      campaigns. No --confirm =
@@ -31,9 +35,11 @@
  *                                                    --confirm = dry-run counts.)
  *
  * Every work mode runs the reaper first — same self-heal as the original
- * router. Exit code: 0 success / 1 fatal. Cloud Run Jobs marks the
- * execution failed on non-zero, surfacing in the job history without any
- * extra monitoring surface.
+ * router. Exit code: 0 success / 1 fatal, or a queue drain
+ * (backfill-pending, forward-all) that left a row failed or still
+ * re-queued — see exit-code.ts. Cloud Run Jobs marks the execution failed
+ * on non-zero, surfacing in the job history without any extra monitoring
+ * surface.
  */
 
 import { config } from './config';
@@ -51,10 +57,12 @@ import {
 import { processBackfillQueue } from './drive/backfill-queue';
 import { DRIVE_SYNC_SYSTEM_STAFF_ID } from './drive/heal';
 import { seedEditStats } from './forward/seed';
+import { parseRefreshSnapshotsArgs, refreshFileSnapshots } from './drive/snapshot-refresh';
 import { runCampaignMerge } from './drive/campaign-merge';
 import { clearAccountComplete } from './drive/clear-account';
 import { resolveIdeaTarget, runIdeaExtraction } from './drive/idea-runner';
 import { derivePiecesForAccount } from './drive/piece-derive';
+import { drainCountsFor, exitCodeFor } from './exit-code';
 
 type Mode =
   | 'poll'
@@ -69,7 +77,8 @@ type Mode =
   | 'clear-account'
   | 'extract-ideas'
   | 'derive-pieces'
-  | 'seed-edit-stats';
+  | 'seed-edit-stats'
+  | 'refresh-snapshots';
 
 const ALL_MODES: readonly Mode[] = [
   'poll',
@@ -85,6 +94,7 @@ const ALL_MODES: readonly Mode[] = [
   'extract-ideas',
   'derive-pieces',
   'seed-edit-stats',
+  'refresh-snapshots',
 ];
 
 interface ParsedArgs {
@@ -92,7 +102,10 @@ interface ParsedArgs {
   syncRunId?: string;
   accountId?: string;
   accountName?: string;
-  /** merge-campaign-dupes: actually apply (delete rows). Absent = dry-run. */
+  /**
+   * merge-campaign-dupes: actually apply (delete rows). refresh-snapshots:
+   * write the index rows. Absent = dry-run.
+   */
   confirm?: boolean;
   /** merge-campaign-dupes: raise the merge confidence floor above 0.8. */
   minConfidence?: number;
@@ -188,7 +201,9 @@ function parseArgs(argv: string[]): ParsedArgs {
       if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
-      throw new Error('mode=merge-campaign-dupes requires --account-id <uuid> or --account-name <fragment>');
+      throw new Error(
+        'mode=merge-campaign-dupes requires --account-id <uuid> or --account-name <fragment>',
+      );
     }
   }
 
@@ -198,13 +213,20 @@ function parseArgs(argv: string[]): ParsedArgs {
     for (let i = 1; i < positional.length; i++) {
       const arg = positional[i]!;
       if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
-      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
-      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
-      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
-      else if (arg === '--confirm') out.confirm = true;
+      else if (arg === '--account-id') {
+        out.accountId = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--account-name='))
+        out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') {
+        out.accountName = positional[i + 1];
+        i++;
+      } else if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
-      throw new Error('mode=clear-account requires --account-id <uuid> or --account-name <fragment>');
+      throw new Error(
+        'mode=clear-account requires --account-id <uuid> or --account-name <fragment>',
+      );
     }
   }
 
@@ -214,20 +236,32 @@ function parseArgs(argv: string[]): ParsedArgs {
     for (let i = 1; i < positional.length; i++) {
       const arg = positional[i]!;
       if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
-      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
-      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
-      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
-      else if (arg.startsWith('--campaign-name=')) out.campaignName = arg.slice('--campaign-name='.length);
-      else if (arg === '--campaign-name') { out.campaignName = positional[i + 1]; i++; }
-      else if (arg.startsWith('--folder-id=')) out.folderId = arg.slice('--folder-id='.length);
-      else if (arg === '--folder-id') { out.folderId = positional[i + 1]; i++; }
-      else if (arg === '--confirm') out.confirm = true;
+      else if (arg === '--account-id') {
+        out.accountId = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--account-name='))
+        out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') {
+        out.accountName = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--campaign-name='))
+        out.campaignName = arg.slice('--campaign-name='.length);
+      else if (arg === '--campaign-name') {
+        out.campaignName = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--folder-id=')) out.folderId = arg.slice('--folder-id='.length);
+      else if (arg === '--folder-id') {
+        out.folderId = positional[i + 1];
+        i++;
+      } else if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
       throw new Error('mode=extract-ideas requires --account-name <fragment> (or --account-id)');
     }
     if (!out.campaignName && !out.folderId) {
-      throw new Error('mode=extract-ideas requires --campaign-name <name> or --folder-id <drive folder id>');
+      throw new Error(
+        'mode=extract-ideas requires --campaign-name <name> or --folder-id <drive folder id>',
+      );
     }
   }
 
@@ -237,14 +271,28 @@ function parseArgs(argv: string[]): ParsedArgs {
     for (let i = 1; i < positional.length; i++) {
       const arg = positional[i]!;
       if (arg.startsWith('--account-id=')) out.accountId = arg.slice('--account-id='.length);
-      else if (arg === '--account-id') { out.accountId = positional[i + 1]; i++; }
-      else if (arg.startsWith('--account-name=')) out.accountName = arg.slice('--account-name='.length);
-      else if (arg === '--account-name') { out.accountName = positional[i + 1]; i++; }
-      else if (arg === '--confirm') out.confirm = true;
+      else if (arg === '--account-id') {
+        out.accountId = positional[i + 1];
+        i++;
+      } else if (arg.startsWith('--account-name='))
+        out.accountName = arg.slice('--account-name='.length);
+      else if (arg === '--account-name') {
+        out.accountName = positional[i + 1];
+        i++;
+      } else if (arg === '--confirm') out.confirm = true;
     }
     if (!out.accountId && !out.accountName) {
       throw new Error('mode=derive-pieces requires --account-name <fragment> (or --account-id)');
     }
+  }
+
+  if (mode === 'refresh-snapshots') {
+    // [--account-id X]  (absent = every account with a drive_folder_id)
+    // --confirm         (write rows; absent = dry-run counts)
+    // Strict parsing, tested in drive/__tests__/snapshot-refresh.test.ts.
+    const parsed = parseRefreshSnapshotsArgs(positional.slice(1));
+    if (parsed.accountId) out.accountId = parsed.accountId;
+    if (parsed.confirm) out.confirm = true;
   }
 
   return out;
@@ -326,6 +374,16 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
     case 'seed-edit-stats': {
       const result = await seedEditStats({
         ...(args.accountId ? { accountId: args.accountId } : {}),
+      });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case 'refresh-snapshots': {
+      // Orthogonal to sync state — no reapStaleSyncs(). Writes only
+      // drive_file_snapshots rows, and only with --confirm.
+      const result = await refreshFileSnapshots({
+        ...(args.accountId ? { accountId: args.accountId } : {}),
+        confirm: args.confirm === true,
       });
       return result as unknown as Record<string, unknown>;
     }
@@ -429,14 +487,24 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
       // dossier (content-born), reconciled against folder-born pieces.
       // No --confirm = dry-run report; --confirm creates folder-less rows.
       const account = args.accountId
-        ? await prisma.account.findUnique({ where: { id: args.accountId }, select: { id: true, name: true } })
+        ? await prisma.account.findUnique({
+            where: { id: args.accountId },
+            select: { id: true, name: true },
+          })
         : await prisma.account.findFirst({
             where: { name: { contains: args.accountName!, mode: 'insensitive' } },
             select: { id: true, name: true },
           });
       if (!account) throw new Error('account not found');
-      const results = await derivePiecesForAccount({ accountId: account.id, apply: args.confirm ?? false });
-      return { accountName: account.name, apply: args.confirm ?? false, campaigns: results } as unknown as Record<string, unknown>;
+      const results = await derivePiecesForAccount({
+        accountId: account.id,
+        apply: args.confirm ?? false,
+      });
+      return {
+        accountName: account.name,
+        apply: args.confirm ?? false,
+        campaigns: results,
+      } as unknown as Record<string, unknown>;
     }
 
     case 'extract-ideas': {
@@ -454,7 +522,7 @@ async function runMode(args: ParsedArgs): Promise<Record<string, unknown>> {
   }
 }
 
-async function main(): Promise<void> {
+async function main(): Promise<number> {
   const startedAt = Date.now();
   const args = parseArgs(process.argv);
 
@@ -468,6 +536,7 @@ async function main(): Promise<void> {
   );
 
   const outcome = await runMode(args);
+  const exitCode = exitCodeFor(args.mode, outcome);
 
   console.log(
     JSON.stringify({
@@ -475,14 +544,26 @@ async function main(): Promise<void> {
       mode: args.mode,
       outcome,
       durationMs: Date.now() - startedAt,
+      exitCode,
     }),
   );
+  if (exitCode !== 0) {
+    console.error(
+      JSON.stringify({
+        msg: 'gub-drive-sync finished with failed rows',
+        mode: args.mode,
+        ...drainCountsFor(args.mode, outcome),
+        exitCode,
+      }),
+    );
+  }
+  return exitCode;
 }
 
 main()
-  .then(async () => {
+  .then(async (exitCode) => {
     await prisma.$disconnect();
-    process.exit(0);
+    process.exit(exitCode);
   })
   .catch(async (err) => {
     console.error(

@@ -54,16 +54,12 @@ export interface ProposeTargetResult {
 }
 
 function toJson(value: unknown): Prisma.InputJsonValue | typeof Prisma.JsonNull {
-  return value === null || value === undefined
-    ? Prisma.JsonNull
-    : (value as Prisma.InputJsonValue);
+  return value === null || value === undefined ? Prisma.JsonNull : (value as Prisma.InputJsonValue);
 }
 
 export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeTargetResult> {
   const { ctx, validatedChanges, notes } = input;
-  const expiresAt = new Date(
-    Date.now() + config.DRIVE_PROPOSAL_TTL_DAYS * 24 * 60 * 60 * 1000,
-  );
+  const expiresAt = new Date(Date.now() + config.DRIVE_PROPOSAL_TTL_DAYS * 24 * 60 * 60 * 1000);
   const reviewer = {
     reviewerEmail: ctx.reviewerEmail ?? null,
     reviewerStaffId: ctx.reviewerStaffId ?? null,
@@ -105,8 +101,12 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
     // another would stack duplicates on every scan until they decide.
     // A pending proposal with a DIFFERENT value still gets a new row (the
     // newer evidence deserves its own card; sweep-expired trims stale ones).
+    // Only a live card counts: one past its expiry but not yet swept can no
+    // longer be decided, so it must not block a fresh one. Several cards can
+    // be pending for one property (each different value got its own); the
+    // value is a duplicate if ANY of them carries it, not only the newest.
     const proposedJson = toJson(vc.validatedValue);
-    const pending = await prisma.driveChangeProposal.findFirst({
+    const pending = await prisma.driveChangeProposal.findMany({
       where: {
         kind: 'field_change',
         entityType: input.entityType,
@@ -114,14 +114,13 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
         campaignId,
         property: vc.field,
         state: 'pending',
+        expiresAt: { gt: new Date() },
       },
       select: { id: true, proposedValue: true },
     });
-    if (
-      pending &&
-      JSON.stringify(pending.proposedValue ?? null) ===
-        JSON.stringify(vc.validatedValue ?? null)
-    ) {
+    // Field values are scalars (text, uuid, date), so JSON text compares them.
+    const proposed = JSON.stringify(vc.validatedValue ?? null);
+    if (pending.some((p) => JSON.stringify(p.proposedValue ?? null) === proposed)) {
       duplicatesSkipped++;
       continue;
     }
@@ -219,9 +218,7 @@ async function writeNoteBatch(args: {
   reviewer: { reviewerEmail: string | null; reviewerStaffId: string | null };
   expiresAt: Date;
 }): Promise<void> {
-  const unionSources = Array.from(
-    new Set(args.items.flatMap((n) => n.source_file_ids)),
-  );
+  const unionSources = Array.from(new Set(args.items.flatMap((n) => n.source_file_ids)));
   await prisma.driveChangeProposal.create({
     data: {
       kind: 'additional_update',

@@ -23,7 +23,7 @@
  *   # Seed a new campaign under an existing account, with two observations:
  *   npm run seed:new-entity -- \
  *     --entity-type campaign \
- *     --name "Diageo Spring Pitch" \
+ *     --name "Acme Spring Pitch" \
  *     --parent-account-id <uuid> \
  *     --source-drive-folder-id <drive-folder-id> \
  *     --reviewer-staff-id <uuid> \
@@ -114,7 +114,7 @@ function parseArgs(argv: string[]): Args {
 
   // --fields '<json>' → Record<string, string>. Optional.
   const fieldsRaw = get('--fields');
-  let fields: Record<string, string> = {};
+  const fields: Record<string, string> = {};
   if (fieldsRaw) {
     const parsed = JSON.parse(fieldsRaw) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -215,9 +215,7 @@ async function main(): Promise<void> {
   }
 
   // Optional attached additional_update row carrying the observations.
-  const unionSources = Array.from(
-    new Set(args.observations.flatMap((it) => it.source_file_ids)),
-  );
+  const unionSources = Array.from(new Set(args.observations.flatMap((it) => it.source_file_ids)));
 
   // Write all rows under one proposal_group_id, atomically.
   const result = await prisma.$transaction([
@@ -283,18 +281,17 @@ async function main(): Promise<void> {
 
   console.log('');
   console.log(`Group id:  ${groupId}`);
-  console.log(`Wrote ${newEntityRows.length} new_entity row(s)` +
-    (args.observations.length > 0
-      ? ` + 1 attached additional_update (${args.observations.length} items).`
-      : ' (no attached observations).'),
+  console.log(
+    `Wrote ${newEntityRows.length} new_entity row(s)` +
+      (args.observations.length > 0
+        ? ` + 1 attached additional_update (${args.observations.length} items).`
+        : ' (no attached observations).'),
   );
   console.log('');
   console.log('Magic link (entry token = first new_entity row):');
   console.log(`  ${link}`);
   console.log('');
-  console.log(
-    `Open this URL to enter the reviewer flow. The session will surface ALL`,
-  );
+  console.log(`Open this URL to enter the reviewer flow. The session will surface ALL`);
   console.log(`pending proposals for ${reviewer.fullName}, including this group.`);
 }
 

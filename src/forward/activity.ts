@@ -17,19 +17,15 @@
  */
 
 import { google, type driveactivity_v2 } from 'googleapis';
+import { config } from '../config';
 import { logger } from '../logger';
 import { buildBotOAuthClient } from '../workspace';
+import { runThroughDriveLimiter } from '../drive/client';
+import { withTransientRetry } from '../drive/retry';
 
 const ACTIVITY_SCOPE = 'https://www.googleapis.com/auth/drive.activity.readonly';
 
-export type ActivityAction =
-  | 'edit'
-  | 'create'
-  | 'delete'
-  | 'move'
-  | 'rename'
-  | 'restore'
-  | 'other';
+export type ActivityAction = 'edit' | 'create' | 'delete' | 'move' | 'rename' | 'restore' | 'other';
 
 export interface ActivityEvent {
   fileId: string;
@@ -48,7 +44,11 @@ async function activityClient(): Promise<driveactivity_v2.Driveactivity> {
   if (cachedClient) return cachedClient;
   const auth = await buildBotOAuthClient('drive', [ACTIVITY_SCOPE]);
   logger.info('[forward.activity] initialized Drive Activity client (drive bot OAuth)');
-  cachedClient = google.driveactivity({ version: 'v2', auth });
+  cachedClient = google.driveactivity({
+    version: 'v2',
+    auth,
+    timeout: config.DRIVE_READ_TIMEOUT_MS,
+  });
   return cachedClient;
 }
 
@@ -92,29 +92,33 @@ export async function queryActivityWindow(
   const events: ActivityEvent[] = [];
   let pageToken: string | undefined;
   do {
-    const res = await client.activity.query({
-      requestBody: {
-        ancestorName: `items/${rootFolderId}`,
-        filter: `time > "${fromIso}" AND time <= "${toIso}"`,
-        pageSize: 500,
-        ...(pageToken ? { pageToken } : {}),
-      },
-    });
+    // A query is a POST, which gaxios never retries, so one 429/5xx or
+    // timeout used to fail the whole run (and the row waited a day). It is
+    // an idempotent read: the limiter paces it and retries rate limits,
+    // withTransientRetry retries 5xx, dropped sockets and timeouts. Each
+    // page retries on its own; pageToken makes a repeated page harmless.
+    const requestBody = {
+      ancestorName: `items/${rootFolderId}`,
+      filter: `time > "${fromIso}" AND time <= "${toIso}"`,
+      pageSize: 500,
+      ...(pageToken ? { pageToken } : {}),
+    };
+    const res = await withTransientRetry(() =>
+      runThroughDriveLimiter(() => client.activity.query({ requestBody })),
+    );
     for (const activity of res.data.activities ?? []) {
-      const ts =
-        activity.timestamp ?? activity.timeRange?.endTime ?? null;
+      const ts = activity.timestamp ?? activity.timeRange?.endTime ?? null;
       if (!ts) continue;
       // One actor per normalized event: the first user actor. Multi-actor
       // consolidated activities are rare; per-actor fidelity comes from
       // the fact that co-editing sessions produce per-actor activities.
       const actorResource =
-        activity.actors?.find((a) => a.user?.knownUser?.personName)?.user
-          ?.knownUser?.personName ?? null;
+        activity.actors?.find((a) => a.user?.knownUser?.personName)?.user?.knownUser?.personName ??
+        null;
       for (const action of activity.actions ?? []) {
         const kind = classifyAction(action.detail);
         // Action-level target wins; fall back to the activity's targets.
-        const targets =
-          action.target ? [action.target] : (activity.targets ?? []);
+        const targets = action.target ? [action.target] : (activity.targets ?? []);
         for (const t of targets) {
           const { id, title } = targetFileId(t);
           if (!id) continue;

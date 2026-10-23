@@ -1,0 +1,24 @@
+{
+  "name": "Example Co Creative Review R2",
+  "path": "Example Co / Spring Launch / Creative Review",
+  "account": "Example Co",
+  "order": 2,
+  "deckType": "creative_review",
+  "ideas": [
+    {
+      "key": "night-owl",
+      "name": "The Night Owl",
+      "aliases": ["Night Owl Route"],
+      "facets": [
+        "radio takeover grows into a weekly podcast",
+        "owl mascot host",
+        "best shift stories become posters"
+      ]
+    },
+    {
+      "key": "pocket-postcards",
+      "name": "Pocket Postcards",
+      "facets": ["illustrated postcards in every cup sleeve", "thank-you note to a night worker"]
+    }
+  ]
+}

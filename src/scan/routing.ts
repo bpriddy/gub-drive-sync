@@ -17,10 +17,10 @@ import type { CampaignCurrentState } from '../drive/schema';
  *
  * Foreignness is judged against the campaign's IDENTITY FAMILY — the
  * scanned campaign's name AND its pieces' names (a merge collapses identity,
- * so "13. Chevy | BHAC AI + LMA Tool" is THIS campaign, not a foreign one).
+ * so "13. Acme | Program B AI Tool" is THIS campaign, not a foreign one).
  * No tag = not foreign (folder-scope default); a tag the fuzzy matcher
  * accepts OR that is contained in / contains any family name (normalized)
- * = ours ("BHAC" must match "02. Chevy | BHAC [GMCHV…]"); anything else is
+ * = ours ("Program B" must match "02. Acme | Program B [ACME…]"); anything else is
  * foreign.
  */
 export function isForeignCampaignTag(tagRaw: string, ownNames: string[]): boolean {
@@ -37,7 +37,6 @@ export function isForeignCampaignTag(tagRaw: string, ownNames: string[]): boolea
   return true;
 }
 
-
 /**
  * Synthesized status_markdown for a NEW campaign candidate uses this
  * empty state for the at-a-glance bullets (no DB row exists yet).
@@ -49,7 +48,6 @@ export const EMPTY_CAMPAIGN_STATE: CampaignCurrentState = {
   live_at: null,
   ends_at: null,
 };
-
 
 type RouteCampaignObsResult =
   | { kind: 'discard' }

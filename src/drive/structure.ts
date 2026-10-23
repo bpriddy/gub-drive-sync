@@ -28,21 +28,27 @@
  */
 
 import { z } from 'zod';
+import { config } from '../config';
 import { logger } from '../logger';
 import { defaultLlm, parseLlmJson, DEFAULT_GEMINI_MODEL } from '../ai';
-import { listAllFoldersInDrive, listSubfolders, probeFolder, type DriveFolderRec } from './client';
+import {
+  FlatListingUnavailableError,
+  isListingUnavailableError,
+  listAllFoldersInDrive,
+  listingFailureCause,
+  listSubfolders,
+  probeFolder,
+  type DriveFolderRec,
+} from './client';
+import { buildTreeFromFlat, folderMapStats, MAX_DEPTH } from './folder-tree';
 import { structureResolutionResponseSchema } from './structured-output';
-
-// Folders are shallow in practice; this is a defense-in-depth rail against
-// an infinite-recursion bug, matching traversal.ts's cap.
-const MAX_DEPTH = 100;
 
 const STRUCTURE_MODEL = DEFAULT_GEMINI_MODEL;
 const STRUCTURE_TEMPERATURE = 0.2;
 // gemini-3.5-flash thinking tokens count against maxOutputTokens; too low a cap
 // truncates the structured-output JSON before it closes. 16384 (the floor used
 // at other call sites) proved insufficient HERE: on a 6,543-folder classify
-// (Chevy, 2026-07-22) thinking consumed nearly the whole budget and the JSON
+// (test account, 2026-07-22) thinking consumed nearly the whole budget and the JSON
 // was cut at ~400 tokens. Classification input is the largest prompt in the
 // pipeline, so it gets the model's maximum output allowance.
 const MAX_OUTPUT_TOKENS = 65535;
@@ -53,7 +59,7 @@ export const STRUCTURE_RESOLUTION_VERSION = 'drive.structure_resolution.v1-inlin
 export interface FolderNode {
   id: string;
   name: string;
-  /** Breadcrumb path from the account root, e.g. "Chevy / Master / Silverado". */
+  /** Breadcrumb path from the account root, e.g. "Acme / Master / Model X". */
   path: string;
   depth: number;
   /**
@@ -115,10 +121,17 @@ const StructureResponseSchema = z.object({
 /**
  * Gather the account's folder skeleton, choosing the cheap path when
  * possible:
- *   - Shared-drive root  → ONE flat paginated sweep of all folders, then
- *     reconstruct the tree in memory. O(folders/200) API calls.
- *   - Folder inside a drive / My Drive → recursive per-folder walk.
- *     O(folders) sequential calls (slow, but the only option there).
+ *   - Any root inside a shared drive (the drive itself or a folder in it)
+ *     → ONE flat paginated sweep of the drive's folders, then cut the
+ *     root's subtree out in memory (buildTreeFromFlat). O(drive folders /
+ *     1000) API calls, whatever the subtree's size.
+ *   - My Drive root → recursive per-folder walk. O(folders) sequential
+ *     calls: `corpora=drive` needs a shared drive, and My Drive has no
+ *     listing scoped to one folder's descendants.
+ *
+ * A folder inside a shared drive falls back to the walk when the drive
+ * listing is refused (isListingUnavailableError): the bot can hold access to
+ * a folder without being a member of its drive.
  *
  * Returns folder nodes with breadcrumb paths + depth, depth-first ordered.
  */
@@ -133,58 +146,49 @@ export async function gatherFolders(
   opts: GatherFoldersOptions = {},
 ): Promise<FolderNode[]> {
   const probe = await probeFolder(rootFolderId);
-  if (probe.isSharedDriveRoot && probe.driveId) {
-    const flat = await listAllFoldersInDrive(probe.driveId, {
-      ...(opts.onProgress ? { onPage: opts.onProgress } : {}),
-    });
-    return buildTreeFromFlat(rootFolderId, rootLabel, flat);
+  if (probe.driveId) {
+    let flat: DriveFolderRec[] | null = null;
+    try {
+      const listed = await listAllFoldersInDrive(probe.driveId, {
+        ...(opts.onProgress ? { onPage: opts.onProgress } : {}),
+      });
+      // A listing without the root folder cannot be cut to its subtree, and
+      // an empty cut would read as "no subfolders". Same as a refusal.
+      if (!probe.isSharedDriveRoot && !listed.some((f) => f.id === rootFolderId)) {
+        throw new FlatListingUnavailableError('root folder is not in the drive listing');
+      }
+      flat = listed;
+    } catch (err) {
+      // The drive root has no other path. Anything but a refusal (a 5xx
+      // after retries, a rate limit after backoff) would fail the walk too.
+      if (probe.isSharedDriveRoot || !isListingUnavailableError(err)) throw err;
+      logger.warn(
+        { fallback: 'recursive', cause: listingFailureCause(err) },
+        '[drive.structure] flat listing unavailable — walking recursively',
+      );
+    }
+    if (flat) {
+      const folders = buildTreeFromFlat(rootFolderId, rootLabel, flat);
+      logger.info(
+        {
+          kind: 'folders',
+          root_kind: probe.isSharedDriveRoot ? 'drive_root' : 'in_drive',
+          folders_listed: flat.length,
+          ...folderMapStats(rootFolderId, probe.driveId, flat, folders),
+        },
+        '[drive.structure] parent map',
+      );
+      return folders;
+    }
   }
   return walkFoldersRecursive(rootFolderId, rootLabel, opts.onProgress);
 }
 
 /**
- * Reconstruct a depth-first folder tree from a flat folder list (each with
- * an immediate parentId). Cycle-safe (visited set) and depth-capped.
- */
-function buildTreeFromFlat(
-  rootId: string,
-  rootLabel: string,
-  flat: DriveFolderRec[],
-): FolderNode[] {
-  const childrenByParent = new Map<string, DriveFolderRec[]>();
-  for (const f of flat) {
-    const p = f.parentId ?? '';
-    const bucket = childrenByParent.get(p);
-    if (bucket) bucket.push(f);
-    else childrenByParent.set(p, [f]);
-  }
-
-  const out: FolderNode[] = [];
-  const visited = new Set<string>();
-
-  const descend = (parentFolderId: string, parentPath: string, depth: number): void => {
-    if (depth > MAX_DEPTH) return;
-    const kids = childrenByParent.get(parentFolderId) ?? [];
-    for (const k of kids) {
-      if (visited.has(k.id)) continue; // defensive against multi-parent / cycles
-      visited.add(k.id);
-      const path = `${parentPath} / ${k.name}`;
-      // parentId is the FolderNode parent — null when the parent is the
-      // account root itself (we don't model the root as a FolderNode).
-      const parentIdField = parentFolderId === rootId ? null : parentFolderId;
-      out.push({ id: k.id, name: k.name, path, depth: depth + 1, parentId: parentIdField });
-      descend(k.id, path, depth + 1);
-    }
-  };
-
-  descend(rootId, rootLabel, 0);
-  return out;
-}
-
-/**
- * Recursive folders-only walk — fallback for non-shared-drive roots, where
- * the flat `corpora=drive` sweep isn't available. Subfolder errors are
- * swallowed (one unreadable subfolder shouldn't tank the whole read).
+ * Recursive folders-only walk — for My Drive roots, where the flat
+ * `corpora=drive` sweep isn't available, and for a folder inside a shared
+ * drive whose drive listing is refused. Subfolder errors are swallowed (one
+ * unreadable subfolder shouldn't tank the whole read).
  */
 async function walkFoldersRecursive(
   rootFolderId: string,
@@ -203,14 +207,23 @@ async function walkFoldersRecursive(
       subs = await listSubfolders(folderId);
     } catch (err) {
       if (depth === 0) throw err;
-      logger.debug({ err, folderId, folderPath }, '[drive.structure] subfolder list failed — skipping');
+      logger.debug(
+        { err, folderId, folderPath },
+        '[drive.structure] subfolder list failed — skipping',
+      );
       return;
     }
     for (const sub of subs) {
       const subPath = `${folderPath} / ${sub.name}`;
       // parentId is null when the immediate parent IS the account root.
       const parentIdField = folderId === rootFolderId ? null : folderId;
-      out.push({ id: sub.id, name: sub.name, path: subPath, depth: depth + 1, parentId: parentIdField });
+      out.push({
+        id: sub.id,
+        name: sub.name,
+        path: subPath,
+        depth: depth + 1,
+        parentId: parentIdField,
+      });
       if (onProgress) onProgress(out.length);
       await recurse(sub.id, subPath, depth + 1);
     }
@@ -324,6 +337,7 @@ export async function classifyFolders(args: {
     tag: STRUCTURE_RESOLUTION_VERSION,
     responseSchema: structureResolutionResponseSchema(),
     maxOutputTokens: MAX_OUTPUT_TOKENS,
+    timeoutMs: config.GEMINI_TIMEOUT_CLASSIFY_MS,
   });
 
   let parsed: z.infer<typeof StructureResponseSchema>;
@@ -417,9 +431,7 @@ export interface EntityAttribution {
   pieceFolderId: string | null;
 }
 
-export type Attributor = (
-  parentFolderId: string | null | undefined,
-) => EntityAttribution;
+export type Attributor = (parentFolderId: string | null | undefined) => EntityAttribution;
 
 /**
  * Build a function that maps a file's immediate parent folder id to its
@@ -534,4 +546,3 @@ export function buildAttributor(map: EntityMap, pieces: PieceAnchor[] = []): Att
     return accountAttribution;
   };
 }
-
