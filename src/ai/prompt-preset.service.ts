@@ -10,9 +10,12 @@
  */
 
 import type { Schema } from '@google/genai';
+import { config } from '../config';
 import { prisma } from '../prisma';
 import { logger } from '../logger';
 import { defaultLlm } from './gemini.client';
+import { thinkingLevelFor, type ThinkingLevelName } from './thinking';
+import { captureCall } from './capture';
 import type { LlmCompletionResult } from './ai.types';
 
 export interface RunPresetOptions {
@@ -22,6 +25,13 @@ export interface RunPresetOptions {
   responseSchema?: Schema;
   /** Per-attempt deadline for this call type (see LlmCompletionRequest.timeoutMs). */
   timeoutMs?: number;
+  /**
+   * Thinking level for this call. Omitted: GEMINI_THINKING_BY_TAG decides by
+   * preset key (or its call-type name); no entry means no thinking
+   * parameter. Lives in code and env, not on the preset row: no schema
+   * change.
+   */
+  thinkingLevel?: ThinkingLevelName;
 }
 
 const PLACEHOLDER = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
@@ -50,6 +60,8 @@ export async function runPreset(
   }
 
   const prompt = renderTemplate(preset.template, opts.variables);
+  const thinkingLevel =
+    opts.thinkingLevel ?? thinkingLevelFor(opts.key, config.GEMINI_THINKING_BY_TAG ?? {});
   const result = await defaultLlm.complete({
     model: preset.model,
     temperature: Number(preset.temperature),
@@ -57,7 +69,26 @@ export async function runPreset(
     tag: opts.key,
     ...(opts.responseSchema ? { responseSchema: opts.responseSchema } : {}),
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(thinkingLevel ? { thinkingLevel } : {}),
   });
+
+  if (config.GEMINI_CAPTURE_DIR) {
+    captureCall(config.GEMINI_CAPTURE_DIR, {
+      capturedAt: new Date().toISOString(),
+      key: opts.key,
+      model: preset.model,
+      temperature: Number(preset.temperature),
+      prompt,
+      responseSchema: opts.responseSchema ?? null,
+      timeoutMs: opts.timeoutMs ?? null,
+      thinkingLevel: thinkingLevel ?? null,
+      result: {
+        text: result.text,
+        finishReason: result.finishReason ?? null,
+        usage: result.usage ?? null,
+      },
+    });
+  }
 
   return { ...result, prompt };
 }

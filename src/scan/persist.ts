@@ -27,7 +27,7 @@ import type { EntityCtx } from './batch-types';
 // auto-apply shipped. (The v1 pipeline's distillAndEmit writes review
 // proposals instead — that is its difference, not this one's.)
 
-const DistillationSchema = z.object({
+export const DistillationSchema = z.object({
   field_changes: z
     .array(
       z.object({

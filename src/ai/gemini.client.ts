@@ -26,8 +26,10 @@ import { ApiError, GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google
 import { config } from '../config';
 import { logger } from '../logger';
 import { jitteredDelayMs } from '../backoff';
-import { isRetryableLlmError, LlmTimeoutError } from './retryable';
+import { isRetryableLlmError, LlmTimeoutError, LlmTruncatedError } from './retryable';
 import { raiseFetchTimeouts, requiredFetchTimeoutMs } from './fetch-timeouts';
+import { recordLlmUsage } from './usage-tally';
+import { thinkingLevelFor } from './thinking';
 import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } from './ai.types';
 
 /**
@@ -40,6 +42,11 @@ import type { LlmCompletionRequest, LlmCompletionResult, LlmDriver, LlmUsage } f
  * time. Classification lives in ./retryable (isRetryableLlmError).
  */
 const MAX_ATTEMPTS = 3;
+/**
+ * A cut-off answer gets one more try, not two: the same prompt at the same
+ * level usually thinks just as long, and each try bills the whole think.
+ */
+const MAX_TRUNCATED_ATTEMPTS = 2;
 const BASE_BACKOFF_MS = 1000; // nominal 1s → 3s (3^attempt), jittered ×[0.5, 1.5)
 
 /** Longest error text carried on the WARN line — enough for status + reason. */
@@ -93,6 +100,13 @@ export class GeminiLlmDriver implements LlmDriver {
     // Per-attempt deadline. httpOptions.timeout makes the SDK abort the
     // fetch and send X-Server-Timeout so the server gives up too.
     const timeoutMs = req.timeoutMs ?? config.GEMINI_TIMEOUT_DEFAULT_MS;
+    // A caller's own thinking setting wins. Otherwise GEMINI_THINKING_BY_TAG
+    // decides, and a tag it does not map sends no thinking parameter (#69).
+    const thinkingLevel =
+      req.thinkingLevel ??
+      (req.thinkingBudget === undefined
+        ? thinkingLevelFor(req.tag, config.GEMINI_THINKING_BY_TAG ?? {})
+        : undefined);
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const attemptStartedAt = Date.now();
@@ -109,12 +123,13 @@ export class GeminiLlmDriver implements LlmDriver {
             ...(req.maxOutputTokens ? { maxOutputTokens: req.maxOutputTokens } : {}),
             ...(req.thinkingBudget !== undefined
               ? { thinkingConfig: { thinkingBudget: req.thinkingBudget } }
-              : req.thinkingLevel !== undefined
-                ? { thinkingConfig: { thinkingLevel: req.thinkingLevel as ThinkingLevel } }
+              : thinkingLevel !== undefined
+                ? { thinkingConfig: { thinkingLevel: thinkingLevel as ThinkingLevel } }
                 : {}),
           },
         });
         const text = res.text ?? '';
+        const finishReason = res.candidates?.[0]?.finishReason ?? null;
         const u = res.usageMetadata;
         const usage: LlmUsage | undefined = u
           ? {
@@ -122,10 +137,29 @@ export class GeminiLlmDriver implements LlmDriver {
               thoughtsTokens: u.thoughtsTokenCount ?? null,
               outputTokens: u.candidatesTokenCount ?? null,
               totalTokens: u.totalTokenCount ?? null,
+              cachedContentTokens: u.cachedContentTokenCount ?? null,
             }
           : undefined;
-        if (usage) {
-          logger.debug({ model: req.model, tag: req.tag, ...usage }, '[gemini] usage');
+        // Every attempt is billed, so every attempt counts toward the
+        // run's per-tag totals (printed in the run summary).
+        recordLlmUsage(req.tag, usage, finishReason);
+        if (u && usage) {
+          // INFO since bpriddy/gub-drive-sync#69: tokens per call type,
+          // thoughts included, are the input to the thinking-level choice.
+          // The provider's own field names ride alongside the older keys.
+          logger.info(
+            {
+              model: req.model,
+              tag: req.tag,
+              ...usage,
+              promptTokenCount: u.promptTokenCount ?? null,
+              candidatesTokenCount: u.candidatesTokenCount ?? null,
+              thoughtsTokenCount: u.thoughtsTokenCount ?? null,
+              cachedContentTokenCount: u.cachedContentTokenCount ?? null,
+              finishReason,
+            },
+            '[gemini] usage',
+          );
         }
         // One INFO line per completed call. finishReason tells a clean STOP
         // from a MAX_TOKENS truncation or a SAFETY block — the cases that
@@ -135,8 +169,9 @@ export class GeminiLlmDriver implements LlmDriver {
             model: req.model,
             tag: req.tag,
             attempt,
-            finishReason: res.candidates?.[0]?.finishReason ?? null,
+            finishReason,
             blockReason: res.promptFeedback?.blockReason ?? null,
+            thinkingLevel: thinkingLevel ?? null,
             durationMs: Date.now() - attemptStartedAt,
             promptTokens: usage?.promptTokens ?? null,
             thoughtsTokens: usage?.thoughtsTokens ?? null,
@@ -144,6 +179,29 @@ export class GeminiLlmDriver implements LlmDriver {
           },
           '[gemini] generateContent finished',
         );
+        if (finishReason === 'MAX_TOKENS') {
+          // A cut-off answer is a failed attempt, never a result: the catch
+          // below retries it like a 5xx. Raising maxOutputTokens alone is
+          // not the fix, since thinking counts against the same limit.
+          logger.warn(
+            {
+              model: req.model,
+              tag: req.tag,
+              attempt,
+              maxAttempts: MAX_TRUNCATED_ATTEMPTS,
+              maxOutputTokens: req.maxOutputTokens ?? null,
+              thinkingLevel: thinkingLevel ?? null,
+              promptTokens: usage?.promptTokens ?? null,
+              thoughtsTokens: usage?.thoughtsTokens ?? null,
+              outputTokens: usage?.outputTokens ?? null,
+            },
+            '[gemini] answer cut off at the output token limit',
+          );
+          throw new LlmTruncatedError({
+            thoughtsTokens: usage?.thoughtsTokens ?? null,
+            outputTokens: usage?.outputTokens ?? null,
+          });
+        }
         if (attempt > 1) {
           logger.info(
             { model: req.model, tag: req.tag, attempt },
@@ -156,6 +214,7 @@ export class GeminiLlmDriver implements LlmDriver {
           model: req.model,
           raw: res,
           ...(usage ? { usage } : {}),
+          finishReason,
         };
       } catch (caught) {
         // The SDK's deadline surfaces as fetch's bare AbortError ("This
@@ -166,7 +225,9 @@ export class GeminiLlmDriver implements LlmDriver {
             : caught;
         lastErr = err;
         const retryable = isRetryableLlmError(err);
-        const willRetry = retryable && attempt < MAX_ATTEMPTS;
+        const maxAttempts =
+          err instanceof LlmTruncatedError ? MAX_TRUNCATED_ATTEMPTS : MAX_ATTEMPTS;
+        const willRetry = retryable && attempt < maxAttempts;
         // Full error object stays at debug: callers (distill, interpret,
         // etc.) handle the user-facing error display via progress.* +
         // drive_scan_logs. Successful retries log at info above so we know
@@ -185,7 +246,7 @@ export class GeminiLlmDriver implements LlmDriver {
             model: req.model,
             tag: req.tag,
             attempt,
-            maxAttempts: MAX_ATTEMPTS,
+            maxAttempts,
             status: err instanceof ApiError ? err.status : null,
             retryable,
             willRetry,
@@ -260,9 +321,17 @@ function allowConfiguredDeadlines(): void {
   );
 }
 
+function logThinkingLevels(): void {
+  const levels = config.GEMINI_THINKING_BY_TAG;
+  if (Object.keys(levels).length > 0) {
+    logger.info({ levels }, '[llm] thinking levels by call tag');
+  }
+}
+
 function createDriver(): LlmDriver {
   if (config.GEMINI_USE_ENTERPRISE && config.GCP_PROJECT_ID) {
     allowConfiguredDeadlines();
+    logThinkingLevels();
     logger.info(
       { project: config.GCP_PROJECT_ID, location: config.GEMINI_LOCATION },
       '[llm] Gemini Enterprise Agent Platform (ADC auth)',
@@ -274,6 +343,7 @@ function createDriver(): LlmDriver {
   }
   if (config.GEMINI_API_KEY) {
     allowConfiguredDeadlines();
+    logThinkingLevels();
     return new GeminiLlmDriver({ apiKey: config.GEMINI_API_KEY });
   }
   logger.warn(

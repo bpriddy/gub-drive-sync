@@ -26,7 +26,9 @@ vi.mock('../../config', () => ({
 vi.mock('../../logger', () => ({ logger: loggerMock }));
 
 import { GeminiLlmDriver } from '../gemini.client';
-import { isRetryableLlmError, LlmTimeoutError } from '../retryable';
+import { isRetryableLlmError, LlmTimeoutError, LlmTruncatedError } from '../retryable';
+import { llmUsageByTag, resetLlmUsage } from '../usage-tally';
+import { config } from '../../config';
 
 function okResponse(text = '{"ok":true}', finishReason = 'STOP'): Response {
   return new Response(
@@ -221,8 +223,10 @@ describe('GeminiLlmDriver per-attempt deadline', () => {
 
 describe('GeminiLlmDriver finish logging', () => {
   it('logs finishReason for every completed call at INFO', async () => {
-    fetchMock.mockResolvedValue(okResponse('{"truncat', 'MAX_TOKENS'));
-    await driver().complete(REQ);
+    // A cut-off answer is still a completed call: its INFO line comes first,
+    // then the truncation guard fails the attempt.
+    fetchMock.mockImplementation(async () => okResponse('{"truncat', 'MAX_TOKENS'));
+    await expect(driver().complete(REQ)).rejects.toBeInstanceOf(LlmTruncatedError);
     expect(loggerMock.info).toHaveBeenCalledWith(
       expect.objectContaining({
         model: 'gemini-test',
@@ -246,6 +250,174 @@ describe('GeminiLlmDriver finish logging', () => {
     expect(loggerMock.info).toHaveBeenCalledWith(
       expect.objectContaining({ attempt: 2, finishReason: 'STOP' }),
       '[gemini] generateContent finished',
+    );
+  });
+});
+
+describe('GeminiLlmDriver usage line', () => {
+  function usageResponse(finishReason = 'STOP'): Response {
+    return new Response(
+      JSON.stringify({
+        candidates: [{ content: { role: 'model', parts: [{ text: '{}' }] }, finishReason }],
+        usageMetadata: {
+          promptTokenCount: 1200,
+          candidatesTokenCount: 300,
+          thoughtsTokenCount: 4100,
+          cachedContentTokenCount: 800,
+          totalTokenCount: 5600,
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }
+
+  it('logs tokens per call at INFO, with the old keys and the provider field names', async () => {
+    fetchMock.mockResolvedValue(usageResponse());
+    const res = await driver().complete(REQ);
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      {
+        model: 'gemini-test',
+        tag: 'unit.test',
+        promptTokens: 1200,
+        thoughtsTokens: 4100,
+        outputTokens: 300,
+        totalTokens: 5600,
+        cachedContentTokens: 800,
+        promptTokenCount: 1200,
+        candidatesTokenCount: 300,
+        thoughtsTokenCount: 4100,
+        cachedContentTokenCount: 800,
+        finishReason: 'STOP',
+      },
+      '[gemini] usage',
+    );
+    expect(loggerMock.debug).not.toHaveBeenCalledWith(expect.anything(), '[gemini] usage');
+    expect(res.finishReason).toBe('STOP');
+    expect(res.usage).toMatchObject({ thoughtsTokens: 4100, cachedContentTokens: 800 });
+  });
+
+  it('adds every attempt to the per-tag totals', async () => {
+    resetLlmUsage();
+    fetchMock.mockImplementation(async () => usageResponse());
+    await driver().complete(REQ);
+    await driver().complete({ ...REQ, tag: 'other.tag' });
+    await driver().complete(REQ);
+    expect(llmUsageByTag()).toEqual([
+      {
+        tag: 'unit.test',
+        calls: 2,
+        promptTokens: 2400,
+        cachedContentTokens: 1600,
+        outputTokens: 600,
+        thoughtsTokens: 8200,
+        maxTokensFinishes: 0,
+      },
+      {
+        tag: 'other.tag',
+        calls: 1,
+        promptTokens: 1200,
+        cachedContentTokens: 800,
+        outputTokens: 300,
+        thoughtsTokens: 4100,
+        maxTokensFinishes: 0,
+      },
+    ]);
+  });
+});
+
+describe('GeminiLlmDriver thinking level from GEMINI_THINKING_BY_TAG', () => {
+  const sentConfig = (): Record<string, unknown> => {
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body)) as {
+      generationConfig?: Record<string, unknown>;
+    };
+    return body.generationConfig ?? {};
+  };
+
+  beforeEach(() => {
+    fetchMock.mockImplementation(async () => okResponse());
+  });
+
+  afterEach(() => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = undefined;
+  });
+
+  it('sends no thinking parameter when the map is empty or absent', async () => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = {};
+    await driver().complete(REQ);
+    expect(sentConfig()).not.toHaveProperty('thinkingConfig');
+  });
+
+  it('sends the mapped level for a tag, by exact tag or call-type name', async () => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = {
+      'unit.test': 'LOW',
+      distill: 'MINIMAL',
+    };
+    await driver().complete(REQ);
+    expect(sentConfig()).toMatchObject({ thinkingConfig: { thinkingLevel: 'LOW' } });
+    fetchMock.mockClear();
+    await driver().complete({ ...REQ, tag: 'drive.distillation.v1' });
+    expect(sentConfig()).toMatchObject({ thinkingConfig: { thinkingLevel: 'MINIMAL' } });
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      expect.objectContaining({ tag: 'drive.distillation.v1', thinkingLevel: 'MINIMAL' }),
+      '[gemini] generateContent finished',
+    );
+  });
+
+  it("never adds a level to a caller's own thinking budget (the two together are a 400)", async () => {
+    (config as { GEMINI_THINKING_BY_TAG?: unknown }).GEMINI_THINKING_BY_TAG = {
+      'unit.test': 'LOW',
+    };
+    await driver().complete({ ...REQ, thinkingBudget: 0 });
+    expect(sentConfig()).toMatchObject({ thinkingConfig: { thinkingBudget: 0 } });
+    expect(sentConfig()['thinkingConfig']).not.toHaveProperty('thinkingLevel');
+  });
+});
+
+describe('GeminiLlmDriver truncation guard', () => {
+  it('treats a MAX_TOKENS answer as a failed attempt and retries it', async () => {
+    fetchMock
+      .mockResolvedValueOnce(okResponse('{"cut', 'MAX_TOKENS'))
+      .mockResolvedValueOnce(okResponse('{"ok":true}', 'STOP'));
+    const res = await driver().complete({ ...REQ, maxOutputTokens: 16384 });
+    expect(res.text).toBe('{"ok":true}');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tag: 'unit.test',
+        attempt: 1,
+        maxAttempts: 2,
+        maxOutputTokens: 16384,
+        outputTokens: 3,
+      }),
+      '[gemini] answer cut off at the output token limit',
+    );
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ attempt: 1, retryable: true, willRetry: true }),
+      '[gemini] generateContent attempt failed',
+    );
+  });
+
+  it('fails the call after two cut-off attempts, instead of returning a fragment', async () => {
+    fetchMock.mockImplementation(async () => okResponse('{"cut', 'MAX_TOKENS'));
+    await expect(driver().complete(REQ)).rejects.toBeInstanceOf(LlmTruncatedError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sleeps).toHaveLength(1);
+  });
+
+  it('counts the cut-off attempts in the per-tag totals', async () => {
+    resetLlmUsage();
+    fetchMock
+      .mockResolvedValueOnce(okResponse('{"cut', 'MAX_TOKENS'))
+      .mockResolvedValueOnce(okResponse());
+    await driver().complete(REQ);
+    expect(llmUsageByTag()).toEqual([
+      expect.objectContaining({ tag: 'unit.test', calls: 2, maxTokensFinishes: 1 }),
+    ]);
+  });
+
+  it('is classified as retryable', () => {
+    expect(isRetryableLlmError(new LlmTruncatedError({ thoughtsTokens: 1, outputTokens: 2 }))).toBe(
+      true,
     );
   });
 });

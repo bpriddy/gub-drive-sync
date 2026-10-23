@@ -48,6 +48,8 @@ export interface LlmUsage {
   thoughtsTokens: number | null;
   outputTokens: number | null;
   totalTokens: number | null;
+  /** Prompt tokens served from the context cache (billed at a lower rate). */
+  cachedContentTokens: number | null;
 }
 
 export interface LlmCompletionResult {
@@ -59,6 +61,8 @@ export interface LlmCompletionResult {
   raw?: unknown;
   /** Token accounting from the provider (prompt / thoughts / output). */
   usage?: LlmUsage;
+  /** The first candidate's finishReason (STOP, MAX_TOKENS, SAFETY, ...). */
+  finishReason?: string | null;
 }
 
 export interface LlmDriver {

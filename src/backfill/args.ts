@@ -35,6 +35,13 @@ export interface Args {
    */
   captureLog?: string[];
   /**
+   * The drive_sync_runs queue row driving this run, stamped as
+   * drive_sync_run_id on the snapshot and proposal rows the scan writes. Set
+   * by the queue; not from argv (a CLI backfill has no run row and stamps
+   * null).
+   */
+  driveSyncRunId?: string;
+  /**
    * --concurrency N: per-file worker count WITHIN one day's batch (extract
    * → interpret → idea extraction run in parallel; all routing, counters,
    * and the idea match/merge ratchet stay serial in file-index order).

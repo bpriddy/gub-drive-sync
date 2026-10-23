@@ -300,6 +300,7 @@ async function runBackfillInner(args: Args): Promise<BackfillRunResult> {
       application: args.dryrun ? 'dryrun' : 'apply',
       editedAt: nextDay.date,
       concurrency: args.concurrency ?? DEFAULT_CONCURRENCY,
+      driveSyncRunId: args.driveSyncRunId ?? null,
     });
     const scanMs = Date.now() - scanStart;
 

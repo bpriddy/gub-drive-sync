@@ -64,6 +64,7 @@ function makeInput(overrides: Partial<ProposeTargetInput> = {}): ProposeTargetIn
     entityName: 'Spring Launch',
     validatedChanges: [],
     notes: [],
+    driveSyncRunId: null,
     ...overrides,
   };
 }
@@ -457,5 +458,53 @@ describe('loadPendingNoteTexts', () => {
     await expect(
       loadPendingNoteTexts({ entityType: 'account', accountId: 'acct-1', campaignId: null }),
     ).resolves.toEqual([]);
+  });
+});
+
+describe('proposeTarget: drive_sync_run_id', () => {
+  // The queue row goes in drive_sync_run_id, never in sync_run_id: that column
+  // references the v1 sync_runs table, so a queue id there fails the foreign
+  // key. The real-schema check is in forward/__tests__/snapshot-index.pg.test.ts.
+  const RUN = '8d0c4a52-3f6e-4b7a-9c1d-2e5f60718293';
+  const NOTE = { text: 'Launch moved to October', source_file_ids: ['file-1'] };
+  const rows = () => mocks.create.mock.calls.map((c) => c[0].data);
+
+  it('stamps the queue run on the field_change row and on the note batch', async () => {
+    await proposeTarget(
+      makeInput({ validatedChanges: [makeChange()], notes: [NOTE], driveSyncRunId: RUN }),
+    );
+
+    expect(rows().map((r) => r.kind)).toEqual(['field_change', 'additional_update']);
+    for (const row of rows()) {
+      expect(row.driveSyncRunId).toBe(RUN);
+      expect(row).not.toHaveProperty('syncRunId');
+    }
+  });
+
+  it('stamps the account-card fallback written for a new campaign candidate', async () => {
+    await proposeTarget(
+      makeInput({
+        entityStatus: 'new',
+        entityId: null,
+        entityName: 'Fall Promo',
+        notes: [NOTE],
+        driveSyncRunId: RUN,
+      }),
+    );
+
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0]).toMatchObject({
+      kind: 'additional_update',
+      entityType: 'account',
+      accountId: 'acct-1',
+      driveSyncRunId: RUN,
+    });
+  });
+
+  it('writes null when the caller has no run row', async () => {
+    await proposeTarget(makeInput({ validatedChanges: [makeChange()], notes: [NOTE] }));
+
+    expect(rows()).toHaveLength(2);
+    expect(rows().map((r) => r.driveSyncRunId)).toEqual([null, null]);
   });
 });

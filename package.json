@@ -23,6 +23,8 @@
     "probe-permission-test": "tsx -r dotenv/config scripts/probe-permission-test.ts",
     "probe-revision-content": "tsx -r dotenv/config scripts/probe-revision-content.ts",
     "probe-drive-listing": "tsx -r dotenv/config scripts/probe-drive-listing.ts",
+    "ab-thinking": "tsx -r dotenv/config scripts/ab-thinking.ts",
+    "classify-prompt-size": "tsx scripts/classify-prompt-size.ts",
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -43,7 +45,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@anomaly-technology/gub-schemas": "^1.0.0",
+    "@anomaly-technology/gub-schemas": "^1.8.0",
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.5",
     "eslint": "^10.8.1",

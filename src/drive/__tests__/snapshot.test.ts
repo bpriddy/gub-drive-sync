@@ -25,11 +25,13 @@ const file: TraversedFile = {
   isFolder: false,
 };
 const scope = { accountId: 'acct-1', campaignId: null };
+const RUN = '8d0c4a52-3f6e-4b7a-9c1d-2e5f60718293';
 
 describe('snapshotForScanOutcome', () => {
   it('marks an ok outcome extracted and carries its content hash', () => {
-    expect(snapshotForScanOutcome({ file, kind: 'ok', contentHash: 'h' }, scope)).toEqual({
+    expect(snapshotForScanOutcome({ file, kind: 'ok', contentHash: 'h' }, scope, RUN)).toEqual({
       syncRunId: null,
+      driveSyncRunId: RUN,
       scope,
       file,
       wasExtracted: true,
@@ -39,25 +41,34 @@ describe('snapshotForScanOutcome', () => {
 
   it('names why a file was not extracted', () => {
     const reason = (o: Parameters<typeof snapshotForScanOutcome>[0]) =>
-      snapshotForScanOutcome(o, scope).skipReason;
+      snapshotForScanOutcome(o, scope, RUN).skipReason;
     expect(reason({ file, kind: 'skip', skipReason: 'too_large' })).toBe('too_large');
     expect(reason({ file, kind: 'skip' })).toBe('skipped');
     expect(reason({ file, kind: 'restricted' })).toBe('restricted');
     expect(reason({ file, kind: 'error' })).toBe('extract_error');
   });
 
-  it('never stamps a run id: sync_run_id references the v1 sync_runs table', () => {
+  it('stamps the queue run id in drive_sync_run_id, never in sync_run_id', () => {
+    // sync_run_id references the v1 sync_runs table: a queue id there fails 23503.
     for (const kind of ['ok', 'skip', 'restricted', 'error'] as const) {
-      expect(snapshotForScanOutcome({ file, kind }, scope).syncRunId).toBeNull();
+      const row = snapshotForScanOutcome({ file, kind }, scope, RUN);
+      expect(row.driveSyncRunId).toBe(RUN);
+      expect(row.syncRunId).toBeNull();
     }
   });
 
+  it('carries no run id when the caller has none (a CLI backfill)', () => {
+    const row = snapshotForScanOutcome({ file, kind: 'ok' }, scope, null);
+    expect(row.driveSyncRunId).toBeNull();
+    expect(row.syncRunId).toBeNull();
+  });
+
   it('sets content_hash on extracted rows only', () => {
-    expect(snapshotForScanOutcome({ file, kind: 'ok', contentHash: 'h' }, scope).contentHash).toBe(
-      'h',
-    );
+    expect(
+      snapshotForScanOutcome({ file, kind: 'ok', contentHash: 'h' }, scope, RUN).contentHash,
+    ).toBe('h');
     for (const kind of ['skip', 'restricted', 'error'] as const) {
-      const row = snapshotForScanOutcome({ file, kind, contentHash: 'stale' }, scope);
+      const row = snapshotForScanOutcome({ file, kind, contentHash: 'stale' }, scope, RUN);
       expect(row.contentHash ?? null).toBeNull();
     }
   });

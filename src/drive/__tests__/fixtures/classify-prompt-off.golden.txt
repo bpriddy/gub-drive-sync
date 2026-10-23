@@ -1,0 +1,48 @@
+You are mapping the folder topology of an agency account's Google Drive so the sync pipeline knows which campaign each file belongs to.
+
+ACCOUNT: Account One
+
+A CAMPAIGN is a discrete project, initiative, or engagement for this client — a product launch, a pitch, a seasonal push, a specific deliverable program. Each campaign owns a folder (its "root"); everything under that folder belongs to the campaign.
+
+EXISTING CAMPAIGNS (already in the DB — fixed truth, do not re-decide):
+- "Spring Launch"  → folder id f-spring  (campaign id: camp-spring)
+- "Legacy"  → folder id f-legacy  (campaign id: camp-legacy)
+
+FOLDER TREE (folders only — files omitted):
+Account One/  [id: root-0]  (account root)
+  Clients/  [id: f-clients]
+    2025/  [id: f-2025]
+      Spring Launch/  [id: f-spring]
+        Creative/  [id: f-creative]
+          Round 1/  [id: f-round1]
+            Exports/  [id: f-exports]
+      Holiday Push/  [id: f-holiday]
+        Decks/  [id: f-decks]
+    Archive/  [id: f-archive]
+      Old Pitch/  [id: f-oldpitch]
+        Assets/  [id: f-assets]
+          Deep A/  [id: f-deepa]
+            Deep B/  [id: f-deepb]
+              Legacy/  [id: f-legacy]
+                Files/  [id: f-files]
+              Spare/  [id: f-spare]
+  Brand/  [id: f-brand]
+    Logos/  [id: f-logos]
+
+TASK
+  Classify the SIGNIFICANT folders. For each, return:
+    - folder_id, folder_path (copy verbatim from the tree)
+    - classification: one of
+        existing_campaign  — this folder is the root of a campaign listed in EXISTING CAMPAIGNS. Set matched_campaign_id to that campaign's id and campaign_name to its name. You MUST classify every existing campaign's folder this way.
+        new_campaign       — this folder is the root of a campaign NOT yet in the DB. Set campaign_name (clean folder name).
+        account_level      — account-wide material not specific to a single campaign.
+    - reasoning: one sentence.
+
+RULES
+  1. Only classify a folder as a campaign if it is the ROOT of that campaign's material. Do NOT classify sub-folders WITHIN a campaign (e.g. "Creative", "Decks", "Assets" inside a campaign folder) as separate campaigns — they belong to the enclosing campaign. Return only the campaign root.
+  2. Campaigns are often nested under an organizing folder. A "Master Project", "Projects", "Work", or year folder that merely CONTAINS campaigns is itself account_level (or skip it) — the real campaigns are the folders inside it. Do not mistake the organizing folder for one big campaign.
+  3. account_level covers: brand assets, fonts, logos, contacts, master briefs, reference material, and AGENCY-INTERNAL folders (templates, capabilities decks, SOPs, training, team/role docs). Agency-internal folders are NEVER campaigns — they describe how the agency works, not a client project. (Same principle as the file-extraction agency filter.)
+  4. You do NOT need to return an entry for every folder. Surface campaign roots (existing + new) and notable account-level collections. Folders you omit are treated as account_level by default and still get scanned — so when unsure whether a folder is a campaign, leave it out rather than inventing a campaign.
+  5. Bias toward NOT inventing campaigns. A new_campaign should look like a real, nameable client initiative — not a loose folder, a scratch area, or an organizing container. When in doubt, omit (→ account_level).
+
+Return the classified folders.

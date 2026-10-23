@@ -38,21 +38,20 @@ forward sync (mode dispatch in the queue). Locked.
 
 ### Forward sync
 
-Daily (scheduled). Polls the Drive Activity API for changes since the
-last `pageToken`, re-processes the changed files, stamps observations
-with the actual edit timestamps from the activity events.
+Activity-driven (`src/forward/run.ts`, design in
+[forward-sync-v2-design.md](forward-sync-v2-design.md)). Each run reads the
+Drive Activity API for the account's Drive root in
+`(drive_forward_cursor_at, now]`, scans each changed file once in one batch
+dated by the run, tallies per-editor edit events into `drive_edit_stats`
+([edit-stats-decision.md](edit-stats-decision.md)), and moves the cursor once
+the window has committed. It proposes; review applies.
 
-- Triggered by Cloud Scheduler (terraform); operator can also click
-  **Sync** in gub-admin to fire one immediately.
-- Same chunking + continuation pattern; the changeset window is bounded
-  by `pageToken` rather than calendar day.
-- Status: **stub today.** Forward mode runs through the same engine but
-  doesn't yet poll Activity API — it walks `modifiedTime` buckets like
-  bootstrap. Real Activity-driven forward sync is the next milestone.
-- **When building it, start from [edit-stats-decision.md](edit-stats-decision.md)**
-  — the per-editor edit-event stats (decided 2026-07-20) ride this build:
-  the same Activity event stream feeds both file re-processing and the
-  `drive_edit_stats` tally. Scope is already granted and probe-verified.
+- Triggered by Cloud Scheduler `drive-poll-<env>` in mode `forward-all`, on
+  the cadence set in gub-admin (daily on dev); **Run now** on the same
+  gub-admin panel fires one immediately.
+- A run drains its whole window: no chunking, no continuation chain.
+- How a run works, the cadence per environment, and what changes under a
+  weekly cadence: [drive-sync-operations.md](drive-sync-operations.md#forward-sync-after-bootstrap).
 
 ---
 
@@ -146,7 +145,7 @@ migration (`20260610100000_drive_bootstrap_cache`).
 | `drive_bootstrap_cursor` | DATE | Latest completed modifiedTime day in the bootstrap walk. NULL = bootstrap hasn't started. |
 | `drive_bootstrap_completed_at` | TIMESTAMPTZ | Set ONCE when bootstrap catches the cursor up to today. After this, forward sync owns the account. |
 | `drive_last_synced_at` | TIMESTAMPTZ | Latest completed forward sync. NULL until first forward chunk. |
-| `drive_activity_page_token` | TEXT | Activity API pageToken for the next forward run. NULL before first forward chunk. |
+| `drive_activity_page_token` | TEXT | Legacy, unused by the Activity-driven forward driver: its cursor is `drive_forward_cursor_at` (TIMESTAMPTZ, the end of the last committed window). |
 | `drive_structure_classification` | JSONB | Cached `{ fingerprint, entityMap, folders, ... }`. Built by bootstrap chunk #1; reused by chunks 2..N. SURVIVES bootstrap completion; forward sync re-uses with hash invalidation. |
 | `drive_bootstrap_files` | JSONB | Cached `{ version: 2, files, activeDates }` (each file stored once; days list file ids). Built by bootstrap chunk #1; reused by chunks 2..N; parsed only by the bootstrap path; `loadEntity` never selects it (v1 paths that load whole account rows still read it). NULLed on completion (~10MB payload for a 25k-file drive, no value after). |
 | `status_markdown` | TEXT | Synthesized human-readable summary (general bullets) |
@@ -181,8 +180,8 @@ Queue of bootstrap + forward runs.
 | `next_attempt_at` | TIMESTAMPTZ | Earliest re-claim after transient failure (exponential backoff) |
 | `all_remaining` | BOOL | True → after this chunk, queue another in the same mode if work remains |
 | `files_processed` | INT | Files processed in this chunk |
-| `activity_page_token_in` | TEXT | Forward only: token handed to this chunk |
-| `activity_page_token_out` | TEXT | Forward only: token at chunk end |
+| `activity_page_token_in` | TEXT | Legacy, unused by the Activity-driven forward driver |
+| `activity_page_token_out` | TEXT | Legacy, unused by the Activity-driven forward driver |
 | `error_message` | TEXT | Last failure detail — written on transient retries and stale reclaims as well as terminal failure, and not cleared on later success, so a completed row can still show an old failure (known quirk) |
 | `log_summary` | TEXT | Last ~40 lines / 2KB of engine stdout |
 

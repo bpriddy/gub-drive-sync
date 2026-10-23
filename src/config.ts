@@ -7,6 +7,7 @@
  * needed: this Job has no HTTP surface, no auth issuance, no CORS.
  */
 import { z } from 'zod';
+import { parseThinkingMap } from './ai/thinking';
 
 /** A per-request timeout in ms; `0` disables it (the pre-timeout behaviour). */
 const timeoutMs = (fallback: string) =>
@@ -79,6 +80,26 @@ const EnvSchema = z.object({
     .default('0')
     .transform(Number)
     .pipe(z.number().int().min(0)),
+  /**
+   * Folder classify prompt size (#69). `off` (the default) sends the whole
+   * folder tree. `auto` sends folders down to one level below the deepest
+   * campaign root of the previous classification or campaign anchor, plus
+   * every anchor and its ancestors; deeper folders appear as a count on their
+   * shown ancestor.
+   *
+   * Owner: the Drive scan hardening track (#71). Cutover: measure the prompt
+   * size offline first (`npm run classify-prompt-size`, $0), then set `auto` on
+   * dev in deploy.yml. After two weeks of forward runs whose classification
+   * matches the weekly uncapped pass, `auto` becomes the only behaviour and the
+   * flag is deleted. A mismatch means back to `off`.
+   */
+  CLASSIFY_DEPTH_CAP_MODE: z.enum(['off', 'auto']).default('off'),
+  /** The `auto` cap for an account with no previous campaign root. */
+  CLASSIFY_DEFAULT_DEPTH_CAP: z
+    .string()
+    .default('5')
+    .transform(Number)
+    .pipe(z.number().int().min(1)),
 
   // ── AI / Gemini ──────────────────────────────────────────────────────────
   GEMINI_API_KEY: z.string().optional(),
@@ -132,6 +153,39 @@ const EnvSchema = z.object({
   GEMINI_TIMEOUT_CLASSIFY_MS: timeoutMs('420000'),
   /** Every other Gemini call (synthesis, ideas, asset folders, merges…). */
   GEMINI_TIMEOUT_DEFAULT_MS: timeoutMs('300000'),
+
+  /**
+   * Thinking level per Gemini call (#69): a JSON object from a call tag, or
+   * a short call-type name such as "interpret" or "distill" (src/ai/
+   * thinking.ts), to MINIMAL | LOW | MEDIUM | HIGH. Empty, the default,
+   * sends no thinking parameter: every call runs at the model's default
+   * level, as before. That is the rollback.
+   *
+   * Owner: the Drive scan hardening track (#71). It is a tuning setting, not a
+   * rollout flag: the October A/B kept the default for interpret, so nothing
+   * sets it today. If it is still empty six months after this lands, delete it
+   * and the per-tag plumbing; set a tag only with an A/B that shows the same
+   * answers at the lower level.
+   */
+  GEMINI_THINKING_BY_TAG: z
+    .string()
+    .default('{}')
+    .transform((raw, ctx) => {
+      try {
+        return parseThinkingMap(raw);
+      } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: (err as Error).message });
+        return z.NEVER;
+      }
+    }),
+  /**
+   * LOCAL A/B runs only (scripts/ab-thinking.ts, #69): when set, every
+   * preset call appends its rendered prompt and answer to
+   * `<dir>/<preset key>.jsonl` (src/ai/capture.ts). Records hold customer
+   * content, so a directory inside this repository is refused. Never set it
+   * in a deployed environment. Unset, the default, captures nothing.
+   */
+  GEMINI_CAPTURE_DIR: z.string().optional(),
   /** Drive / Docs / Slides / Sheets / Activity / People reads. */
   DRIVE_READ_TIMEOUT_MS: timeoutMs('60000'),
   /** Binary downloads (files.get alt=media), headers + body. */

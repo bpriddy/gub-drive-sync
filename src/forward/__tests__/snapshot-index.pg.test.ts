@@ -13,23 +13,28 @@
  * Skipped unless H4_PG_URL points at a disposable database. Set it up with
  * GUB's migration chain, NOT `prisma db push` from the gub-schemas schema:
  * that schema declares no relation on drive_file_snapshots.sync_run_id, so a
- * push would drop exactly the foreign key this file is about.
+ * push would drop exactly the foreign key this file is about. The chain must
+ * include migration 20261021100000_drive_sync_run_id (the drive_sync_run_id
+ * columns), and the Prisma client must come from gub-schemas >= 1.8.0, the
+ * release that models them.
  *
  *   docker run --rm -d --name h4-pg -p 55452:5432 -e POSTGRES_PASSWORD=password pgvector/pgvector:pg16
- *   mkdir -p /tmp/gub-prisma && git -C <gcp-universal-backend checkout> archive origin/main prisma | tar -x -C /tmp/gub-prisma
+ *   mkdir -p /tmp/gub-prisma && git -C <gcp-universal-backend checkout> archive <ref with that migration> prisma | tar -x -C /tmp/gub-prisma
  *   DATABASE_URL=postgresql://postgres:password@localhost:55452/postgres \
  *     npx prisma migrate deploy --schema /tmp/gub-prisma/prisma/schema.prisma
  *   H4_PG_URL=postgresql://postgres:password@localhost:55452/postgres npx vitest run snapshot-index.pg
  *
  * NEVER point it at a shared database: it deletes its test account's
- * drive_sync_runs, drive_edit_stats and drive_file_snapshots rows and briefly
- * adds a CHECK constraint to drive_file_snapshots (the guard in beforeAll only
- * lets a database on this machine, named like a scratch one, through). The
- * cleanup is scoped to that account, so other H4_PG_URL files can share the
- * database and run in parallel. Model
- * calls cannot leave this file: the Gemini settings are removed from the
- * environment, so the LLM driver is the mock one.
+ * drive_sync_runs, drive_edit_stats, drive_change_proposals and
+ * drive_file_snapshots rows and briefly adds a CHECK constraint to
+ * drive_file_snapshots (the guard in beforeAll only lets a database on this
+ * machine, named like a scratch one, through). The cleanup is scoped to that
+ * account, so other H4_PG_URL files can share the database and run in
+ * parallel. Model calls cannot leave this file: the Gemini settings are
+ * removed from the environment and the distillation call is a stub, so
+ * nothing reaches a model.
  */
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Prisma } from '@prisma/client';
 
@@ -48,6 +53,7 @@ const m = vi.hoisted(() => ({
   resolveAccountStructure: vi.fn(),
   extractText: vi.fn(),
   interpretFile: vi.fn(),
+  runPreset: vi.fn(),
   warn: vi.fn(),
   scanLog: [] as string[],
 }));
@@ -82,6 +88,12 @@ vi.mock('../../backfill/structure-stage', () => ({
 }));
 vi.mock('../../drive/extract', () => ({ extractText: m.extractText }));
 vi.mock('../../drive/interpret', () => ({ interpretFile: m.interpretFile }));
+// The distillation call (stage 3) is the one model call a scan with
+// observations makes; it is a stub here.
+vi.mock('../../ai', async (importActual) => ({
+  ...(await importActual<typeof import('../../ai')>()),
+  runPreset: m.runPreset,
+}));
 vi.mock('../../drive/asset-folder', () => ({
   interpretAssetFolder: vi.fn(async () => ({ observations: [], driver: 'mock' })),
 }));
@@ -134,6 +146,14 @@ const CAMPAIGN_ZONE: EntityAttribution = {
   pieceFolderId: null,
 };
 
+const NO_OBSERVATIONS = {
+  account: [],
+  campaign: [],
+  deckType: 'other',
+  truncated: false,
+  driver: 'mock',
+};
+
 /** The Activity window: one edit event per file. */
 function activityFor(ids: string[]) {
   m.queryActivityWindow.mockResolvedValue(
@@ -153,6 +173,11 @@ const snapshots = () =>
   prisma.driveFileSnapshot.findMany({
     where: { accountId: ACCOUNT_ID },
     orderBy: { fileId: 'asc' },
+  });
+const proposals = () =>
+  prisma.driveChangeProposal.findMany({
+    where: { accountId: ACCOUNT_ID },
+    orderBy: { kind: 'asc' },
   });
 const cursor = async () =>
   (await prisma.account.findUniqueOrThrow({ where: { id: ACCOUNT_ID } })).driveForwardCursorAt;
@@ -237,11 +262,17 @@ describe.skipIf(!PG_URL)('Drive name index against Postgres (real schema)', () =
     config.SNAPSHOT_WRITE_FAILURE_LIMIT = 0;
 
     await prisma.driveFileSnapshot.deleteMany({ where: { accountId: ACCOUNT_ID } });
+    await prisma.driveChangeProposal.deleteMany({ where: { accountId: ACCOUNT_ID } });
     await prisma.driveEditStat.deleteMany({ where: { accountId: ACCOUNT_ID } });
     await prisma.driveSyncRun.deleteMany({ where: { accountId: ACCOUNT_ID } });
     await prisma.account.update({
       where: { id: ACCOUNT_ID },
-      data: { driveForwardCursorAt: CURSOR },
+      data: {
+        driveForwardCursorAt: CURSOR,
+        driveBootstrapCompletedAt: new Date('2026-10-01T00:00:00Z'),
+        driveBootstrapCursor: null,
+        driveBootstrapFiles: Prisma.JsonNull,
+      },
     });
 
     activityFor(WINDOW);
@@ -274,13 +305,9 @@ describe.skipIf(!PG_URL)('Drive name index against Postgres (real schema)', () =
     });
     // Zero observations: stage 3 has nothing to distill, so no model call is
     // even attempted.
-    m.interpretFile.mockResolvedValue({
-      account: [],
-      campaign: [],
-      deckType: 'other',
-      truncated: false,
-      driver: 'mock',
-    });
+    m.interpretFile.mockResolvedValue(NO_OBSERVATIONS);
+    m.runPreset.mockReset();
+    m.runPreset.mockRejectedValue(new Error('unexpected distillation call'));
   });
 
   afterAll(async () => {
@@ -301,8 +328,10 @@ describe.skipIf(!PG_URL)('Drive name index against Postgres (real schema)', () =
     const rows = await snapshots();
     expect(rows.map((r) => r.fileId)).toEqual(['f-brief', 'f-broken', 'f-empty', 'f-locked']);
     const by = Object.fromEntries(rows.map((r) => [r.fileId, r]));
-    // The v2 run id lives in drive_sync_runs; sync_run_id references sync_runs.
+    // The queue run lives in drive_sync_runs, so it goes in drive_sync_run_id;
+    // sync_run_id references sync_runs (the v1 table) and stays NULL.
     expect(rows.map((r) => r.syncRunId)).toEqual([null, null, null, null]);
+    expect(rows.map((r) => r.driveSyncRunId)).toEqual([run.id, run.id, run.id, run.id]);
     expect(rows.every((r) => r.accountId === ACCOUNT_ID && r.scannedAt instanceof Date)).toBe(true);
     expect(by['f-brief']).toMatchObject({
       campaignId: CAMPAIGN_ID,
@@ -348,6 +377,126 @@ describe.skipIf(!PG_URL)('Drive name index against Postgres (real schema)', () =
     expect(all).toHaveLength(8);
     const byId = new Map(all.map((r) => [r.id, r]));
     for (const row of first) expect(byId.get(row.id)).toEqual(row);
+  });
+
+  it('a queue-driven bootstrap run stamps its run id on its snapshot rows too', async () => {
+    // Chunks of a bootstrap chain read their file list from the account row,
+    // so no Drive discovery is involved.
+    const day = '2026-09-01';
+    const files = WINDOW.map((id) => ({
+      id,
+      name: FILES[id]!.name,
+      mimeType: 'application/pdf',
+      parents: [FILES[id]!.parent],
+      path:
+        FILES[id]!.parent === CAMPAIGN_FOLDER
+          ? `Acme / Q3 Launch / ${FILES[id]!.name}`
+          : `Acme / ${FILES[id]!.name}`,
+      modifiedTime: `${day}T10:00:00.000Z`,
+      modifiedByEmail: 'editor@example.com',
+      createdTime: null,
+      size: 2048,
+      isFolder: false,
+    }));
+    await prisma.account.update({
+      where: { id: ACCOUNT_ID },
+      data: {
+        driveBootstrapCompletedAt: null,
+        driveBootstrapFiles: { files, activeDates: [{ date: day, files }] },
+      },
+    });
+    const run = await newRun('bootstrap');
+
+    const summary = await processBackfillQueue();
+
+    expect(summary).toMatchObject({ processed: 1, completed: 1, failed: 0, retriedLater: 0 });
+    const done = await prisma.driveSyncRun.findUniqueOrThrow({ where: { id: run.id } });
+    expect(done).toMatchObject({ status: 'completed', errorMessage: null });
+    const rows = await snapshots();
+    expect(rows.map((r) => r.fileId)).toEqual(['f-brief', 'f-broken', 'f-empty', 'f-locked']);
+    expect(rows.map((r) => r.syncRunId)).toEqual([null, null, null, null]);
+    expect(rows.map((r) => r.driveSyncRunId)).toEqual([run.id, run.id, run.id, run.id]);
+    expect(writeFailures()).toHaveLength(0);
+  });
+
+  describe('review proposals', () => {
+    /**
+     * A forward run whose brief yields one campaign observation. The (stubbed)
+     * distillation turns it into a budget change and a note, which the propose
+     * path writes as two drive_change_proposals rows.
+     */
+    async function proposingRun() {
+      m.interpretFile.mockImplementation(async (input: { file: { id: string } }) =>
+        input.file.id === 'f-brief'
+          ? {
+              ...NO_OBSERVATIONS,
+              campaign: [
+                {
+                  text: 'Launch moved to October; budget is 250000',
+                  reasoning: 'Stated in the brief',
+                  confidence: 0.9,
+                },
+              ],
+            }
+          : NO_OBSERVATIONS,
+      );
+      m.runPreset.mockResolvedValue({
+        text: JSON.stringify({
+          field_changes: [
+            {
+              field: 'budget',
+              proposed_value: '250000',
+              reasoning: 'The brief states the budget',
+              source_file_ids: ['f-brief'],
+              confidence: 0.9,
+            },
+          ],
+          notes: [{ text: 'Launch moved to October', source_file_ids: ['f-brief'] }],
+          ambiguous: [],
+        }),
+        driver: 'mock',
+        model: 'mock',
+        prompt: '',
+      });
+      const run = await newRun();
+      await processBackfillQueue();
+      const done = await prisma.driveSyncRun.findUniqueOrThrow({ where: { id: run.id } });
+      expect(done).toMatchObject({ status: 'completed', errorMessage: null });
+      return run;
+    }
+
+    it('a forward run stamps the run id on the proposals it writes', async () => {
+      const run = await proposingRun();
+
+      const rows = await proposals();
+      expect(rows.map((r) => [r.kind, r.property])).toEqual([
+        ['additional_update', '__note__'],
+        ['field_change', 'budget'],
+      ]);
+      expect(rows.every((r) => r.campaignId === CAMPAIGN_ID && r.state === 'pending')).toBe(true);
+      // sync_run_id references the v1 sync_runs table; the queue run is in drive_sync_run_id.
+      expect(rows.map((r) => r.syncRunId)).toEqual([null, null]);
+      expect(rows.map((r) => r.driveSyncRunId)).toEqual([run.id, run.id]);
+    });
+
+    it('deleting a run keeps its snapshots and proposals and nulls their drive_sync_run_id', async () => {
+      const run = await proposingRun();
+      const [snapshotsBefore, proposalsBefore] = [await snapshots(), await proposals()];
+      expect(snapshotsBefore).toHaveLength(4);
+      expect(proposalsBefore).toHaveLength(2);
+      expect(snapshotsBefore.every((r) => r.driveSyncRunId === run.id)).toBe(true);
+      expect(proposalsBefore.every((r) => r.driveSyncRunId === run.id)).toBe(true);
+
+      await prisma.driveSyncRun.delete({ where: { id: run.id } });
+
+      // ON DELETE SET NULL: the rows outlive the queue row they came from.
+      const snapshotsAfter = await snapshots();
+      const proposalsAfter = await proposals();
+      expect(snapshotsAfter.map((r) => r.id)).toEqual(snapshotsBefore.map((r) => r.id));
+      expect(proposalsAfter.map((r) => r.id)).toEqual(proposalsBefore.map((r) => r.id));
+      expect(snapshotsAfter.every((r) => r.driveSyncRunId === null)).toBe(true);
+      expect(proposalsAfter.every((r) => r.driveSyncRunId === null)).toBe(true);
+    });
   });
 
   // A schema guard more than a code test: its foreign-key assertions hold for
@@ -411,6 +560,44 @@ describe.skipIf(!PG_URL)('Drive name index against Postgres (real schema)', () =
     );
     expect(why).toBe('P2003 drive_file_snapshots_sync_run_id_fkey (index)');
     expect(await snapshots()).toHaveLength(0);
+  });
+
+  it('the queue id belongs in drive_sync_run_id; an id that is no queue row is refused by its own foreign key', async () => {
+    const run = await newRun();
+    const input = {
+      syncRunId: null,
+      scope: { accountId: ACCOUNT_ID, campaignId: null },
+      file: {
+        id: 'f-fk',
+        name: 'Fk.pdf',
+        mimeType: 'application/pdf',
+        path: 'Acme / Fk.pdf',
+        modifiedTime: null,
+        modifiedByEmail: null,
+        createdTime: null,
+        size: null,
+        isFolder: false,
+      },
+      wasExtracted: false,
+    };
+
+    // The id that failed in sync_run_id is accepted here.
+    await writeSnapshot({ ...input, driveSyncRunId: run.id });
+    expect((await snapshots()).map((r) => r.driveSyncRunId)).toEqual([run.id]);
+
+    // The column is no free-for-all: a made-up id fails its own foreign key.
+    const ghost = await writeSnapshot({ ...input, driveSyncRunId: randomUUID() }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(ghost).toMatchObject({
+      code: 'P2003',
+      meta: { field_name: 'drive_file_snapshots_drive_sync_run_id_fkey (index)' },
+    });
+    expect(
+      reportSnapshotWriteFailure({ fileId: 'f-fk', accountId: ACCOUNT_ID, source: 'scan' }, ghost),
+    ).toBe('P2003 drive_file_snapshots_drive_sync_run_id_fkey (index)');
+    expect(await snapshots()).toHaveLength(1);
   });
 
   it('a snapshot that fails to write fails the run and holds the cursor', async () => {

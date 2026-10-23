@@ -21,8 +21,8 @@
  * content_hash is set exactly on the extracted rows: an md5 of the text, or,
  * with SKIP_UNCHANGED_CONTENT on, the versioned "v2:"/"bin:" hash of
  * src/scan/content-gate.ts. A consumer that needs
- * "interpreted" must read v2 rows only (they leave sync_run_id NULL — necessary,
- * not sufficient, see the doc) or accept v1's weaker meaning.
+ * "interpreted" must read v2 rows only (drive_sync_run_id set; a row with both
+ * run ids NULL is unknown, see the doc) or accept v1's weaker meaning.
  *
  * A third, listing-only writer is the index catch-up (snapshot-refresh.ts): it
  * records what a Drive listing shows, never an extraction, so its rows are
@@ -157,9 +157,16 @@ export interface WriteSnapshotInput {
   /**
    * The `sync_runs` row of a v1 full sync. The column references that v1
    * table, so v2 writers leave it null: stamping a `drive_sync_runs` queue id
-   * here fails the foreign key (23503).
+   * here fails the foreign key (23503). Their run id goes in `driveSyncRunId`.
    */
   syncRunId: string | null;
+  /**
+   * The `drive_sync_runs` queue row (a forward or bootstrap run) that wrote
+   * the row. Null for a row written outside a queue run — a CLI backfill, the
+   * index catch-up — and set to null by the database if the run row is later
+   * deleted.
+   */
+  driveSyncRunId?: string | null;
   scope: TraversalScope;
   file: TraversedFile;
   /**
@@ -196,15 +203,17 @@ export interface ScanOutcomeForSnapshot {
  * the last interpret. docs/drive-file-index.md has the full vocabulary.
  *
  * `sync_run_id` is always null here. The v2 run id is a `drive_sync_runs`
- * row, but the column references `sync_runs` (the v1 table), so stamping the
- * queue's id fails the foreign key (23503) — that is how the scan core's
- * first writer ended up writing nothing.
+ * row, but that column references `sync_runs` (the v1 table), so stamping the
+ * queue's id there fails the foreign key (23503) — that is how the scan core's
+ * first writer ended up writing nothing. The queue id goes in
+ * `drive_sync_run_id`, which references `drive_sync_runs`.
  */
 export function snapshotForScanOutcome(
   o: ScanOutcomeForSnapshot,
   scope: TraversalScope,
+  driveSyncRunId: string | null,
 ): WriteSnapshotInput {
-  const base = { syncRunId: null, scope, file: o.file };
+  const base = { syncRunId: null, driveSyncRunId, scope, file: o.file };
   switch (o.kind) {
     case 'ok':
       return { ...base, wasExtracted: true, contentHash: o.contentHash ?? null };
@@ -222,6 +231,7 @@ export async function writeSnapshot(input: WriteSnapshotInput): Promise<void> {
   await prisma.driveFileSnapshot.create({
     data: {
       syncRunId: input.syncRunId ?? null,
+      driveSyncRunId: input.driveSyncRunId ?? null,
       fileId: file.id,
       accountId: scope.accountId,
       campaignId: scope.campaignId,

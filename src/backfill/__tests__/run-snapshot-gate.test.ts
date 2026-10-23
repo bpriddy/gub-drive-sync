@@ -2,8 +2,8 @@
  * runBackfill's day-commit gate for the Drive name index: a day whose
  * snapshot rows failed to write must not be committed — the day-walk never
  * revisits a committed day, so its files would stay stale in the index for
- * good. I/O is mocked at the module boundary; the driver's control flow is
- * real.
+ * good. Also checked here: the queue's run id reaches the scan core. I/O is
+ * mocked at the module boundary; the driver's control flow is real.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -75,7 +75,7 @@ const outcome = (snapshotWriteFailures: number) => ({
   synthesized: [],
 });
 
-const run = (over: { dryrun?: boolean } = {}) =>
+const run = (over: { dryrun?: boolean; driveSyncRunId?: string } = {}) =>
   runBackfill({
     accountId: 'acc-1',
     newestFirst: false,
@@ -132,5 +132,19 @@ describe('runBackfill snapshot gate', () => {
     m.processBatch.mockResolvedValue(outcome(1));
     await expect(run({ dryrun: true })).resolves.toMatchObject({ scansProcessed: 1 });
     expect(m.persistCursor).not.toHaveBeenCalled();
+  });
+});
+
+describe('runBackfill run id', () => {
+  const batchOptions = () => m.processBatch.mock.calls[0]![1];
+
+  it('hands the queue row id to the scan core for its rows to carry', async () => {
+    await run({ driveSyncRunId: 'run-9' });
+    expect(batchOptions()).toMatchObject({ application: 'apply', driveSyncRunId: 'run-9' });
+  });
+
+  it('passes null when there is no run row (a CLI backfill)', async () => {
+    await run();
+    expect(batchOptions().driveSyncRunId).toBeNull();
   });
 });

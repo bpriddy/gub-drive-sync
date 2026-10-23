@@ -100,6 +100,8 @@ function ctx(over: Partial<EntityCtx> = {}): EntityCtx {
   } as EntityCtx;
 }
 
+const RUN = '8d0c4a52-3f6e-4b7a-9c1d-2e5f60718293';
+
 function opts(over: Partial<ProcessBatchOptions> = {}): ProcessBatchOptions {
   return {
     ctx: ctx(),
@@ -111,6 +113,7 @@ function opts(over: Partial<ProcessBatchOptions> = {}): ProcessBatchOptions {
     application: 'propose',
     editedAt: '2026-09-24',
     concurrency: 1,
+    driveSyncRunId: RUN,
     ...over,
   };
 }
@@ -183,9 +186,17 @@ describe('processBatch writes the Drive name index', () => {
     });
   });
 
-  it('leaves sync_run_id NULL: it references the v1 sync_runs table, not the queue', async () => {
+  it('records the queue run in drive_sync_run_id and leaves sync_run_id NULL', async () => {
     await processBatch(BATCH, opts());
+
+    // sync_run_id references the v1 sync_runs table, not the drive_sync_runs queue.
     expect(rows().map((r) => r.syncRunId)).toEqual([null, null, null, null]);
+    expect(rows().map((r) => r.driveSyncRunId)).toEqual([RUN, RUN, RUN, RUN]);
+  });
+
+  it('records no run when the caller has none (a CLI backfill)', async () => {
+    await processBatch(BATCH, opts({ driveSyncRunId: null }));
+    expect(rows().map((r) => r.driveSyncRunId)).toEqual([null, null, null, null]);
   });
 
   it('writes them in apply mode too — the bootstrap day-walk had the same gap', async () => {
@@ -212,7 +223,11 @@ describe('processBatch writes the Drive name index', () => {
         attributor: null,
       }),
     );
-    expect(rows()[0]).toMatchObject({ campaignId: 'camp-scanned', syncRunId: null });
+    expect(rows()[0]).toMatchObject({
+      campaignId: 'camp-scanned',
+      syncRunId: null,
+      driveSyncRunId: RUN,
+    });
   });
 });
 

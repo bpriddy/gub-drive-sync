@@ -39,7 +39,8 @@ const OVERLAP_MS = 2 * 60 * 1000;
 export interface ForwardArgs {
   accountId: string;
   /** The drive_sync_runs row driving this run — stats key their
-   *  contribution to it (run framing; retries replace themselves). */
+   *  contribution to it (run framing; retries replace themselves), and the
+   *  snapshot and proposal rows the scan writes carry it as drive_sync_run_id. */
   syncRunId: string;
   captureLog?: string[];
 }
@@ -47,8 +48,15 @@ export interface ForwardArgs {
 export async function runForward(fargs: ForwardArgs): Promise<BackfillRunResult> {
   const prevCapture = getLogCapture();
   if (fargs.captureLog) setLogCapture(fargs.captureLog);
+  const startedAt = Date.now();
   try {
     return await runForwardInner(fargs);
+  } catch (err) {
+    // The success path prints the run summary itself. A failed run, whose
+    // window repeats because the cursor is held, needs its token totals
+    // (and its MAX_TOKENS count) most.
+    printPhaseSummary(Date.now() - startedAt);
+    throw err;
   } finally {
     setLogCapture(prevCapture);
   }
@@ -281,6 +289,7 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
       editedAt: scanDate,
       concurrency: DEFAULT_CONCURRENCY,
       unchangedGate,
+      driveSyncRunId: fargs.syncRunId,
     });
     filesUnchanged = outcome.filesUnchanged;
     // Window-commit gate: don't advance the cursor unless every entity's

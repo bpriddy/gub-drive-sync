@@ -2,7 +2,8 @@
  * runForward's snapshot gate: a drive_file_snapshots row that failed to write
  * leaves its file stale in the Drive name index, so the run must fail and hold
  * the account cursor — the queue retry re-runs the window — unless
- * SNAPSHOT_WRITE_FAILURE_LIMIT allows the loss. I/O is mocked at the module
+ * SNAPSHOT_WRITE_FAILURE_LIMIT allows the loss. Also checked here: the driver
+ * hands its queue row id to the scan core. I/O is mocked at the module
  * boundary; the driver's control flow is real.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -148,5 +149,17 @@ describe('runForward snapshot gate', () => {
       /2 snapshot write failure\(s\) \(SNAPSHOT_WRITE_FAILURE_LIMIT=1\) — cursor NOT advanced/,
     );
     expect(cursorAdvanced()).toBe(false);
+  });
+});
+
+describe('runForward run id', () => {
+  it('hands the drive_sync_runs row id to the scan core for its rows to carry', async () => {
+    await run();
+
+    expect(m.processBatch).toHaveBeenCalledTimes(1);
+    expect(m.processBatch).toHaveBeenCalledWith(
+      expect.any(Array),
+      expect.objectContaining({ application: 'propose', driveSyncRunId: 'run-1' }),
+    );
   });
 });
