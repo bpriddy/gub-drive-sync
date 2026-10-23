@@ -194,4 +194,15 @@ export interface BatchOutcome {
    * retry re-writes the whole window: one more row per file per failed attempt.
    */
   snapshotWriteFailures: number;
+  /**
+   * Unchanged-content gate (SKIP_UNCHANGED_CONTENT=on, forward runs): files
+   * whose content hash matched their last interpret, so interpret and idea
+   * extraction did not run. Their snapshot rows carry skip_reason
+   * 'content_unchanged'. Not counted in filesExtracted or filesSkipped.
+   */
+  filesUnchanged: number;
+  /** Of filesUnchanged, matched on Drive's md5 before any download. */
+  filesUnchangedBeforeDownload: number;
+  /** Files in the Drive trash, skipped unread (also in filesSkipped). */
+  filesTrashed: number;
 }

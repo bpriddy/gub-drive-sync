@@ -75,6 +75,19 @@ failures there are the runs' own gates (the forward cursor does not advance,
 the bootstrap day is not committed).
 
 `content_hash` is set exactly on the extracted rows (`was_extracted = true`).
+Its form depends on `SKIP_UNCHANGED_CONTENT`:
+
+- `off` (the default), and every v1 row: an md5 of the full extracted text.
+- `on` (v2 rows): a versioned hash from `src/scan/content-gate.ts`, of what
+  the interpret prompt depends on.
+  - `v2:` + sha256 of the prompt-visible text (the first
+    `GEMINI_MAX_INPUT_CHARS` characters and whether the text was cut), the
+    name, the path and the zone.
+  - `bin:` + sha256 of Drive's `md5Checksum` (or `version`), the name, the
+    path and the zone, for downloaded files. Known before the download.
+
+  An md5 never equals either form, so turning the flag on re-interprets
+  each file once.
 
 A consumer that needs "interpreted" must read **v2 rows only** (they leave
 `sync_run_id` NULL — see the caveat above) or accept v1's weaker meaning.
@@ -91,6 +104,8 @@ NULL on an extracted row. Otherwise:
 | `delta_unchanged` | Unchanged since the last v1 scan; extraction was skipped. | v1 |
 | `skipped` | A v2 skip outcome that carried no reason (defensive; not expected). | v2 |
 | `index_refresh` | A listing-only row: the file was seen in a Drive listing and nothing was extracted. | the catch-up |
+| `trashed` | The file is in the Drive trash (forward runs fetch files by id, which also returns trashed ones); nothing was read. | v2, `SKIP_UNCHANGED_CONTENT=on` |
+| `content_unchanged` | The content hash matched the file's last extracted row written by the account's last completed run, so interpret and idea extraction did not run. That older extracted row stays the file's source. | v2 forward runs, `SKIP_UNCHANGED_CONTENT=on` |
 
 ## A write that fails
 
@@ -219,3 +234,11 @@ So a file that has never had an extracted row (every run skipped it or
 failed on it) is searchable by name but appears in no `_sources` list, and a
 file whose newest row is a skip still shows up there through its older
 extracted row.
+
+None of them filters on `skip_reason`, so `trashed` and `content_unchanged`
+rows need no reader change. A `content_unchanged` file keeps its older
+extracted row in `_sources` and cited-file resolution (same content), and
+file-name search reads the new row's current name and path. In this repo,
+v1's delta rule (`checkDelta`) and the catch-up (`snapshot-refresh.ts`) read
+the latest row's modified time, name and path, which a `content_unchanged`
+row records as current.

@@ -35,6 +35,9 @@ import type { TraversedFile } from '../drive/types';
 import { isDownloadedMime } from '../drive/extract';
 import { promptFileText } from '../drive/prompt-text';
 
+/** skip_reason of a file the gate skipped: content as at its last interpret. */
+export const CONTENT_UNCHANGED_SKIP_REASON = 'content_unchanged';
+
 /**
  * Where a file's observations go: account or campaign zone, and which
  * campaign and piece. A file that moves zone is re-interpreted even when its
