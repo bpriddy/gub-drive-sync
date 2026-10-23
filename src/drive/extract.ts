@@ -54,6 +54,20 @@ const MIME = {
   PPTX: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 } as const;
 
+/**
+ * True for the mimes extractText downloads (its PDF, DOCX, PPTX and text/*
+ * branches) rather than reading through a Google API. Only these files carry
+ * an md5Checksum, so only these can be compared before the download.
+ */
+export function isDownloadedMime(mimeType: string): boolean {
+  return (
+    mimeType === MIME.PDF ||
+    mimeType === MIME.DOCX ||
+    mimeType === MIME.PPTX ||
+    mimeType.startsWith('text/')
+  );
+}
+
 // All scopes the extractor needs. The 'drive' bot must have consented to
 // all of these at authorize time; runtime helper verifies via subset check.
 const EXTRACT_SCOPES = [

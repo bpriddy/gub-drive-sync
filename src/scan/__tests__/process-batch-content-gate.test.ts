@@ -149,3 +149,25 @@ describe('trashed files', () => {
     expect(rows()[0]).toMatchObject({ wasExtracted: true, skipReason: null });
   });
 });
+
+describe('the stored content hash', () => {
+  it('flag off: the extractor md5, as before', async () => {
+    await processBatch([doc('a')], opts());
+    expect(rows()[0]).toMatchObject({ wasExtracted: true, contentHash: 'md5-of-text' });
+  });
+
+  it('flag on: the versioned hash, v2 for a Google-native file', async () => {
+    setFlag('on');
+    await processBatch([doc('a')], opts());
+    expect(rows()[0].contentHash).toMatch(/^v2:[0-9a-f]{64}$/);
+  });
+
+  it('flag on: the bin hash for a downloaded file with an md5', async () => {
+    setFlag('on');
+    await processBatch(
+      [doc('p', { mimeType: 'application/pdf', name: 'p.pdf', md5Checksum: 'abc' })],
+      opts(),
+    );
+    expect(rows()[0].contentHash).toMatch(/^bin:[0-9a-f]{64}$/);
+  });
+});

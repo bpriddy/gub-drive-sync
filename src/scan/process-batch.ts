@@ -48,6 +48,7 @@ import {
 import type { ExtractedIdea } from '../drive/idea-extraction';
 import type { TraversedFile } from '../drive/types';
 import { config } from '../config';
+import { contentHashFor, contentZone } from './content-gate';
 import { log, fmtBytes, fmtMs } from './output';
 import { timed } from './timing';
 import { runWithConcurrency } from './util';
@@ -417,7 +418,12 @@ export async function processBatch(
         kind: 'ok',
         extractor: extraction.extractor,
         textLength: extraction.text.length,
-        contentHash: extraction.contentHash,
+        // Flag on: the versioned hash the unchanged-content gate compares
+        // (src/scan/content-gate.ts). Off: the extractor's md5, as before.
+        contentHash:
+          config.SKIP_UNCHANGED_CONTENT === 'on'
+            ? contentHashFor(file, extraction.text, contentZone(attribution))
+            : extraction.contentHash,
         res,
         ideaCandidates,
       };

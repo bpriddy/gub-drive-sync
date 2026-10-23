@@ -19,6 +19,7 @@
 
 import { z } from 'zod';
 import { config } from '../config';
+import { promptFileText } from './prompt-text';
 import { logger } from '../logger';
 import { parseLlmJson, runPreset } from '../ai';
 import type { AccountCurrentState, CampaignCurrentState } from './schema';
@@ -96,11 +97,8 @@ export interface InterpretFileOutput {
 }
 
 export async function interpretFile(input: InterpretFileInput): Promise<InterpretFileOutput> {
-  const max = config.GEMINI_MAX_INPUT_CHARS;
-  const truncated = input.text.length > max;
-  const fileText = truncated
-    ? `${input.text.slice(0, max)}\n…\n[TRUNCATED: ${input.text.length - max} chars omitted]`
-    : input.text;
+  const { visible, truncated, omitted } = promptFileText(input.text);
+  const fileText = truncated ? `${visible}\n…\n[TRUNCATED: ${omitted} chars omitted]` : visible;
 
   const result = await runPreset({
     key: 'drive.file_extraction.v1',
