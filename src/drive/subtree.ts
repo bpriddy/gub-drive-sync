@@ -24,6 +24,7 @@
 
 import type { drive_v3 } from 'googleapis';
 import { FlatListingUnavailableError, listAllFoldersInDrive, listDriveFilesFlat } from './client';
+import { contentMarkers } from './file-markers';
 import {
   buildTreeFromFlat,
   makeReach,
@@ -113,7 +114,6 @@ function toTraversedFile(f: drive_v3.Schema$File, path: string): TraversedFile {
           },
         }
       : {}),
-    ...(f.version ? { version: f.version } : {}),
-    ...(f.md5Checksum ? { md5Checksum: f.md5Checksum } : {}),
+    ...contentMarkers(f),
   };
 }

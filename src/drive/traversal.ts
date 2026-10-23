@@ -8,6 +8,7 @@
  */
 
 import { listFolderChildren } from './client';
+import { contentMarkers } from './file-markers';
 import { MAX_DEPTH } from './folder-tree';
 import type { TraversedFile } from './types';
 import { logger } from '../logger';
@@ -122,6 +123,7 @@ async function* walk(
             },
           }
         : {}),
+      ...contentMarkers(child),
     };
 
     yield base;

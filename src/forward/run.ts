@@ -16,6 +16,7 @@
 import { config } from '../config';
 import { prisma } from '../prisma';
 import { getFileMetadata } from '../drive/client';
+import { contentMarkers } from '../drive/file-markers';
 import { isOutsideFolderMap } from '../drive/folder-tree';
 import { notifyReviewers } from '../drive/notify';
 import type { TraversedFile } from '../drive/types';
@@ -228,6 +229,7 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
             },
           }
         : {}),
+      ...contentMarkers(meta),
     });
   }
   if (outsideFolderMap > 0) {

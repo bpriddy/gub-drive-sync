@@ -350,6 +350,11 @@ export async function processBatch(
 
   async function runFileWorker(file: TraversedFile): Promise<WorkerOutcome> {
     const attribution = resolveAttribution(file);
+    // Forward runs fetch each changed file by id, and files.get also returns
+    // a file in the trash; the listings exclude trashed files in their query.
+    if (config.SKIP_UNCHANGED_CONTENT === 'on' && file.trashed === true) {
+      return { file, attribution, kind: 'skip', skipReason: 'trashed' };
+    }
     try {
       const extraction = await timed('extract_text', () => extractText(file));
       if (extraction.kind !== 'ok') {

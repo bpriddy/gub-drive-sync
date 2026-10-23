@@ -42,12 +42,17 @@ export interface TraversedFile {
    */
   shortcutTarget?: { id: string; mimeType: string };
   /**
-   * Drive's content markers, set only by the flat drive listing
-   * (drive/subtree.ts): the file's version counter and, for binary files,
-   * the MD5 of its content. Absent on every other discovery path.
+   * Drive's content markers (FILE_FIELDS; drive/client.ts contentMarkers).
+   * `version` grows on every change to the file, metadata included.
+   * `md5Checksum` and `headRevisionId` exist only for blob files (PDF,
+   * Office, text), never for Google-native ones. `trashed` is true for a file
+   * in the trash, also when only its parent folder was trashed. Each is absent
+   * when Drive did not return it.
    */
   version?: string;
   md5Checksum?: string;
+  headRevisionId?: string;
+  trashed?: boolean;
 }
 
 export interface ExtractionResult {

@@ -101,6 +101,16 @@ const EnvSchema = z.object({
   GEMINI_LOCATION: z.string().default('global'),
   GEMINI_MAX_INPUT_CHARS: z.string().default('40000').transform(Number),
   /**
+   * Content-aware skips in the scan core. `off` (the default) is the behaviour
+   * before them. `on`:
+   *   - a trashed file is skipped (skip_reason 'trashed');
+   *   - snapshot rows carry the versioned content hash (src/scan/content-gate.ts);
+   *   - the forward run skips interpret and idea extraction for a file whose
+   *     content hash matches its last extracted row from before the account's
+   *     last completed run (skip_reason 'content_unchanged').
+   */
+  SKIP_UNCHANGED_CONTENT: z.enum(['off', 'on']).default('off'),
+  /**
    * Worker-pool concurrency for the per-entity distill+synth+write loop
    * inside processBatch. Each entity owns a discrete status_markdown blob
    * on its own row (one per account, one per campaign) — workers never

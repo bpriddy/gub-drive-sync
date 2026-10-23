@@ -402,7 +402,9 @@ describe('gatherFilesAuto', () => {
     const files = await gatherFilesAuto(DRIVE, 'Drive', false);
     const brief = files.find((f) => f.id === 'f-brief');
     expect(brief?.path).toBe('brief.pdf');
-    expect(brief).not.toHaveProperty('version');
+    // Every listing now carries Drive's content markers (FILE_FIELDS), not
+    // only the flat subtree listing: the unchanged-content gate reads them.
+    expect(brief).toHaveProperty('version', '11');
     expect(files.map((f) => f.id)).toContain('f-orphan'); // no subtree filter there
   });
 

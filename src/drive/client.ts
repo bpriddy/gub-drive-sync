@@ -32,6 +32,7 @@ import { logger } from '../logger';
 import { jitteredDelayMs } from '../backoff';
 import { isRateLimitError, RequestTimeoutError, withTransientRetry } from './retry';
 import { buildBotOAuthClient } from '../workspace';
+import { contentMarkers } from './file-markers';
 
 // Re-exported: the classifier lives in the config-free ./retry so the scan
 // core can classify a failure without the client's auth imports.
@@ -172,7 +173,7 @@ export async function driveClient(): Promise<drive_v3.Drive> {
 
 /** Fields we always request on a file. */
 export const FILE_FIELDS =
-  'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType)';
+  'id,name,mimeType,parents,modifiedTime,createdTime,size,lastModifyingUser(emailAddress,displayName),shortcutDetails(targetId,targetMimeType),version,md5Checksum,headRevisionId,trashed';
 
 /**
  * Items per `files.list` page: the documented maximum. Drive may still
@@ -467,6 +468,7 @@ export async function listSharedDriveFiles(
               },
             }
           : {}),
+        ...contentMarkers(f),
       });
       if (maxFiles !== null && out.length >= maxFiles) return out;
     }
@@ -476,11 +478,10 @@ export async function listSharedDriveFiles(
 }
 
 /**
- * Fields for the flat file listing: FILE_FIELDS plus Drive's content markers
- * (`version`, and `md5Checksum` for binary files) for a later check of
- * which files really changed.
+ * Fields for the flat file listing. FILE_FIELDS carries Drive's content
+ * markers itself now; the name stays for the flat listing's callers.
  */
-export const FLAT_FILE_FIELDS = `${FILE_FIELDS},version,md5Checksum`;
+export const FLAT_FILE_FIELDS = FILE_FIELDS;
 
 /**
  * Flat-list every non-folder file in a shared drive, keeping only the files
