@@ -86,6 +86,12 @@ const EnvSchema = z.object({
    * campaign root of the previous classification or campaign anchor, plus
    * every anchor and its ancestors; deeper folders appear as a count on their
    * shown ancestor.
+   *
+   * Owner: the Drive scan hardening track (#71). Cutover: measure the prompt
+   * size offline first (`npm run classify-prompt-size`, $0), then set `auto` on
+   * dev in deploy.yml. After two weeks of forward runs whose classification
+   * matches the weekly uncapped pass, `auto` becomes the only behaviour and the
+   * flag is deleted. A mismatch means back to `off`.
    */
   CLASSIFY_DEPTH_CAP_MODE: z.enum(['off', 'auto']).default('off'),
   /** The `auto` cap for an account with no previous campaign root. */
@@ -154,6 +160,12 @@ const EnvSchema = z.object({
    * thinking.ts), to MINIMAL | LOW | MEDIUM | HIGH. Empty, the default,
    * sends no thinking parameter: every call runs at the model's default
    * level, as before. That is the rollback.
+   *
+   * Owner: the Drive scan hardening track (#71). It is a tuning setting, not a
+   * rollout flag: the October A/B kept the default for interpret, so nothing
+   * sets it today. If it is still empty six months after this lands, delete it
+   * and the per-tag plumbing; set a tag only with an A/B that shows the same
+   * answers at the lower level.
    */
   GEMINI_THINKING_BY_TAG: z
     .string()
