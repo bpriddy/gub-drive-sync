@@ -18,7 +18,9 @@
  *     is false with skip_reason 'extract_error'. Later stages (routing, ideas,
  *     distill, synthesis) never change the row; their failures are the runs'
  *     own gates.
- * content_hash is set exactly on the extracted rows. A consumer that needs
+ * content_hash is set exactly on the extracted rows: an md5 of the text, or,
+ * with SKIP_UNCHANGED_CONTENT on, the versioned "v2:"/"bin:" hash of
+ * src/scan/content-gate.ts. A consumer that needs
  * "interpreted" must read v2 rows only (they leave sync_run_id NULL — necessary,
  * not sufficient, see the doc) or accept v1's weaker meaning.
  *
@@ -87,6 +89,70 @@ export async function checkDelta(file: TraversedFile): Promise<DeltaCheck> {
   };
 }
 
+const LOOKUP_CHUNK = 1000;
+
+/** skip_reason of a file the unchanged-content gate skipped (src/scan/content-gate.ts). */
+export const CONTENT_UNCHANGED_SKIP_REASON = 'content_unchanged';
+/** skip_reason of a file in the Drive trash (SKIP_UNCHANGED_CONTENT=on). */
+export const TRASHED_SKIP_REASON = 'trashed';
+
+/**
+ * Rows the gate looks through: they record no reading of the content, so
+ * they neither confirm nor contradict the last interpret.
+ */
+const GATE_TRANSPARENT_REASONS = [
+  CONTENT_UNCHANGED_SKIP_REASON,
+  TRASHED_SKIP_REASON,
+  INDEX_REFRESH_SKIP_REASON,
+];
+
+/**
+ * What the unchanged-content gate compares against, for a whole batch: per
+ * file, the content hash of its NEWEST row in this account, once the rows
+ * that record no reading are looked through (content_unchanged, trashed,
+ * index_refresh). One query per 1000 ids, never a lookup per file.
+ *
+ * A file is in the map only when that newest row
+ *   - is an extracted row with a hash: an extract_error, restricted or other
+ *     skip row newer than the last interpret vetoes the skip;
+ *   - was written at or before `notAfter` (the account's last completed run):
+ *     a forward window whose later stage failed is retried (H2's
+ *     window-commit gate), and its first attempt has already written
+ *     extracted rows with the new hashes before distill ran. Matching those
+ *     would skip exactly the files whose observations the failure lost.
+ * There is no fall-back to an older row: when the newest row does not
+ * qualify, the file is interpreted.
+ */
+export async function loadLastExtractedHashes(
+  accountId: string,
+  fileIds: string[],
+  notAfter: Date,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = [...new Set(fileIds)];
+  for (let i = 0; i < ids.length; i += LOOKUP_CHUNK) {
+    const chunk = ids.slice(i, i + LOOKUP_CHUNK);
+    const rows = await prisma.$queryRaw<Array<{ fileId: string; contentHash: string }>>`
+      SELECT latest."fileId", latest."contentHash"
+        FROM (
+          SELECT DISTINCT ON (file_id)
+                 file_id AS "fileId", content_hash AS "contentHash",
+                 was_extracted AS "wasExtracted", scanned_at AS "scannedAt"
+            FROM drive_file_snapshots
+           WHERE file_id = ANY(${chunk}::text[])
+             AND account_id = ${accountId}::uuid
+             AND (skip_reason IS NULL OR skip_reason <> ALL(${GATE_TRANSPARENT_REASONS}::text[]))
+           ORDER BY file_id, scanned_at DESC
+        ) latest
+       WHERE latest."wasExtracted"
+         AND latest."contentHash" IS NOT NULL
+         AND latest."scannedAt" <= ${notAfter}
+    `;
+    for (const r of rows) out.set(r.fileId, r.contentHash);
+  }
+  return out;
+}
+
 export interface WriteSnapshotInput {
   /**
    * The `sync_runs` row of a v1 full sync. The column references that v1
@@ -124,7 +190,10 @@ export interface ScanOutcomeForSnapshot {
  *
  * `skip_reason` reuses the v1 scanFolder vocabulary ('extract_error' for a
  * worker that threw, the extractor's own reason for a skip) plus
- * 'restricted' for a 403, which v1 had no branch for.
+ * 'restricted' for a 403, which v1 had no branch for, and, with
+ * SKIP_UNCHANGED_CONTENT on, 'trashed' and 'content_unchanged'. The last two
+ * are skips that are not failures: nothing was read, or the content matched
+ * the last interpret. docs/drive-file-index.md has the full vocabulary.
  *
  * `sync_run_id` is always null here. The v2 run id is a `drive_sync_runs`
  * row, but the column references `sync_runs` (the v1 table), so stamping the

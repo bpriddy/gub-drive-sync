@@ -16,6 +16,7 @@
 import { config } from '../config';
 import { prisma } from '../prisma';
 import { getFileMetadata } from '../drive/client';
+import { contentMarkers } from '../drive/file-markers';
 import { isOutsideFolderMap } from '../drive/folder-tree';
 import { notifyReviewers } from '../drive/notify';
 import type { TraversedFile } from '../drive/types';
@@ -24,6 +25,7 @@ import { loadEntity } from '../backfill/entity';
 import { DEFAULT_CONCURRENCY, type Args, type BackfillRunResult } from '../backfill/args';
 import { resolveAccountStructure } from '../backfill/structure-stage';
 import { processBatch } from '../scan/process-batch';
+import { gateCutoff } from '../scan/content-gate';
 import { isTransientFailure } from '../scan/failure-class';
 import { log, rule, fmtMs, getLogCapture, setLogCapture } from '../scan/output';
 import { resetPhaseTimer, printPhaseSummary, timed } from '../scan/timing';
@@ -228,6 +230,7 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
             },
           }
         : {}),
+      ...contentMarkers(meta),
     });
   }
   if (outsideFolderMap > 0) {
@@ -244,7 +247,29 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
 
   let filesProcessed = 0;
   let scansProcessed = 0;
+  let filesUnchanged = 0;
   if (files.length > 0) {
+    // Unchanged-content gate (SKIP_UNCHANGED_CONTENT=on). It trusts only the
+    // snapshot rows written up to the account's last completed run (less a
+    // clock-skew margin): a retried window's failed attempt wrote rows whose
+    // observations may never have landed. No completed run yet, or a failed
+    // read: every file is interpreted, as with the flag off.
+    let unchangedGate: { notAfter: Date } | null = null;
+    if (config.SKIP_UNCHANGED_CONTENT === 'on') {
+      try {
+        const notAfter = await gateCutoff(fargs.accountId);
+        if (notAfter) {
+          unchangedGate = { notAfter };
+          log(`  ⏭ unchanged-content gate on — compared with rows up to ${notAfter.toISOString()}`);
+        } else {
+          log('  ⏭ unchanged-content gate on — no completed run yet, every file is interpreted');
+        }
+      } catch (err) {
+        log(
+          `  ⚠ unchanged-content cutoff unreadable (${summarizeError(err)}) — every file is interpreted`,
+        );
+      }
+    }
     const outcome = await processBatch(files, {
       ctx,
       attributor: structure.attributor,
@@ -255,7 +280,9 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
       application: 'propose',
       editedAt: scanDate,
       concurrency: DEFAULT_CONCURRENCY,
+      unchangedGate,
     });
+    filesUnchanged = outcome.filesUnchanged;
     // Window-commit gate: don't advance the cursor unless every entity's
     // proposals landed (stage 3, failed distills included) and no file's
     // observations were lost to a transient error — the queue retry
@@ -312,6 +339,9 @@ async function runForwardInner(fargs: ForwardArgs): Promise<BackfillRunResult> {
     log(
       `  ⚠ ${filesUnfetchable} file(s) dropped — metadata unreadable after retries; their changes are not in this scan`,
     );
+  }
+  if (filesUnchanged > 0) {
+    log(`  ⏭ ${filesUnchanged} file(s) unchanged since their last interpret — model calls skipped`);
   }
   log(
     rule(
