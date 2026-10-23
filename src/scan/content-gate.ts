@@ -29,6 +29,7 @@
  * every file once, as expected.
  */
 import crypto from 'node:crypto';
+import { prisma } from '../prisma';
 import type { EntityAttribution } from '../drive/structure';
 import type { TraversedFile } from '../drive/types';
 import { isDownloadedMime } from '../drive/extract';
@@ -72,4 +73,18 @@ export function binaryContentHash(file: TraversedFile, zone: string): string | n
 /** The hash to store on an extracted file's snapshot row. */
 export function contentHashFor(file: TraversedFile, text: string, zone: string): string {
   return binaryContentHash(file, zone) ?? textContentHash(text, file, zone);
+}
+
+/**
+ * When the account's last scan run completed: the gate only trusts snapshot
+ * rows written by then (see loadLastExtractedHashes). Null before the first
+ * completed run, which leaves the gate with nothing to match.
+ */
+export async function lastCompletedRunAt(accountId: string): Promise<Date | null> {
+  const run = await prisma.driveSyncRun.findFirst({
+    where: { accountId, status: 'completed', completedAt: { not: null } },
+    orderBy: { completedAt: 'desc' },
+    select: { completedAt: true },
+  });
+  return run?.completedAt ?? null;
 }

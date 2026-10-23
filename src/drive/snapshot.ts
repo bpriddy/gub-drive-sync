@@ -87,6 +87,41 @@ export async function checkDelta(file: TraversedFile): Promise<DeltaCheck> {
   };
 }
 
+const LOOKUP_CHUNK = 1000;
+
+/**
+ * The content hash on each file's latest EXTRACTED row written at or before
+ * `notAfter`: what the unchanged-content gate compares against. One query per
+ * 1000 ids, never a lookup per file. Files with no such row are absent.
+ *
+ * The cutoff keeps out rows from an attempt that has not committed. A forward
+ * window whose later stage failed is retried (H2's window-commit gate), and
+ * its first attempt has already written was_extracted rows with the new
+ * hashes. Matching those would skip the very files whose observations the
+ * failure lost.
+ */
+export async function loadLastExtractedHashes(
+  fileIds: string[],
+  notAfter: Date,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = [...new Set(fileIds)];
+  for (let i = 0; i < ids.length; i += LOOKUP_CHUNK) {
+    const chunk = ids.slice(i, i + LOOKUP_CHUNK);
+    const rows = await prisma.$queryRaw<Array<{ fileId: string; contentHash: string | null }>>`
+      SELECT DISTINCT ON (file_id)
+             file_id AS "fileId", content_hash AS "contentHash"
+        FROM drive_file_snapshots
+       WHERE file_id = ANY(${chunk}::text[])
+         AND was_extracted
+         AND scanned_at <= ${notAfter}
+       ORDER BY file_id, scanned_at DESC
+    `;
+    for (const r of rows) if (r.contentHash) out.set(r.fileId, r.contentHash);
+  }
+  return out;
+}
+
 export interface WriteSnapshotInput {
   /**
    * The `sync_runs` row of a v1 full sync. The column references that v1
