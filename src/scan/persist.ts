@@ -44,6 +44,7 @@ export const DistillationSchema = z.object({
       z.object({
         text: z.string(),
         source_file_ids: z.array(z.string()).default([]),
+        confidence: z.number().min(0).max(1),
       }),
     )
     .default([]),
