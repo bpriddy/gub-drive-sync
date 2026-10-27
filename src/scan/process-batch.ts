@@ -1407,7 +1407,8 @@ export async function processBatch(
       // review-gated pipeline's writers, not this engine's.
       let distillResult: EntitySynthesisResult['distillResult'] = null;
       const validatedChanges: ValidatedChange[] = [];
-      let distilledNotes: Array<{ text: string; source_file_ids: string[] }> = [];
+      let distilledNotes: Array<{ text: string; source_file_ids: string[]; confidence: number }> =
+        [];
       // A failed distill is a stage-3 failure: on the propose path the
       // observations reach review ONLY through distillation, so carrying on
       // would advance the cursor past them. Nothing for this target is
@@ -1453,6 +1454,7 @@ export async function processBatch(
           distilledNotes = dry.notes.map((n) => ({
             text: n.text,
             source_file_ids: n.source_file_ids,
+            confidence: n.confidence,
           }));
           distillResult = {
             proposalsCreated: dry.field_changes.length,

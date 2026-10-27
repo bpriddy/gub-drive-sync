@@ -117,8 +117,17 @@ function distillationNoteItem(): Schema {
         type: SchemaType.ARRAY,
         items: { type: SchemaType.STRING },
       },
+      // GUB#157-notes-confidence: lets a high-confidence batch of notes clear
+      // a daily review pile it was never asked to join the queue for (the
+      // reader's own 30-minute reminder, then GUB's auto-approve sweep —
+      // never this process). Same 0-1 scale and phrasing as field_changes'
+      // confidence above; keep them worded identically if either changes.
+      confidence: {
+        type: SchemaType.NUMBER,
+        description: '0.0–1.0 — your subjective certainty that this note is accurate and worth recording.',
+      },
     },
-    required: ['text', 'source_file_ids'],
+    required: ['text', 'source_file_ids', 'confidence'],
   };
 }
 

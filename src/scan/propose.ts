@@ -32,6 +32,10 @@ import { newCandidateMarker } from './note-marker';
 export interface ProposeNoteItem {
   text: string;
   source_file_ids: string[];
+  /** 0.0-1.0, the distillation step's own certainty (GUB#157-notes-confidence).
+   *  Read by GUB's auto-approve sweep — a batch clears only once EVERY item
+   *  in it meets the threshold; nothing is ever dropped on its account. */
+  confidence: number;
 }
 
 export interface ProposeTargetInput {
@@ -78,10 +82,12 @@ export async function proposeTarget(input: ProposeTargetInput): Promise<ProposeT
       ...validatedChanges.map((vc) => ({
         text: `${newCandidateMarker(input.entityName)} ${vc.field}: ${vc.proposedValueRaw ?? '(null)'}`,
         source_file_ids: vc.sourceFileIds,
+        confidence: vc.confidence,
       })),
       ...notes.map((n) => ({
         text: `${newCandidateMarker(input.entityName)} ${n.text}`,
         source_file_ids: n.source_file_ids,
+        confidence: n.confidence,
       })),
     ];
     if (items.length === 0) return { fieldProposals: 0, noteItems: 0, duplicatesSkipped: 0 };

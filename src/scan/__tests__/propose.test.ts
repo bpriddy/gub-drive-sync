@@ -261,10 +261,14 @@ describe('proposeTarget: re-propose guard', () => {
 });
 
 describe('proposeTarget: note batches', () => {
-  it('writes ONE additional_update row per target with the union of source files', async () => {
+  it('writes ONE additional_update row per target with the union of source files, confidence intact', async () => {
     const notes = [
-      { text: 'Client prefers Tuesday syncs', source_file_ids: ['file-1', 'file-2'] },
-      { text: 'Legal review pending', source_file_ids: ['file-2', 'file-3'] },
+      {
+        text: 'Client prefers Tuesday syncs',
+        source_file_ids: ['file-1', 'file-2'],
+        confidence: 0.92,
+      },
+      { text: 'Legal review pending', source_file_ids: ['file-2', 'file-3'], confidence: 0.4 },
     ];
     const result = await proposeTarget(makeInput({ notes }));
 
@@ -337,7 +341,7 @@ describe('proposeTarget: new-candidate fallback', () => {
         validatedChanges: [
           makeChange({ field: 'budget', proposedValueRaw: '9000', sourceFileIds: ['file-1'] }),
         ],
-        notes: [{ text: 'Kickoff next week', source_file_ids: ['file-2'] }],
+        notes: [{ text: 'Kickoff next week', source_file_ids: ['file-2'], confidence: 0.6 }],
       }),
     );
 
@@ -359,10 +363,12 @@ describe('proposeTarget: new-candidate fallback', () => {
         {
           text: '[new campaign candidate "Summer Promo"] budget: 9000',
           source_file_ids: ['file-1'],
+          confidence: 0.8,
         },
         {
           text: '[new campaign candidate "Summer Promo"] Kickoff next week',
           source_file_ids: ['file-2'],
+          confidence: 0.6,
         },
       ],
     });
