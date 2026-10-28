@@ -149,7 +149,7 @@ jobs:
                 "--service-account=$RUNTIME_SA"
                 "--set-cloudsql-instances=$CLOUDSQL"
                 "--set-env-vars=NODE_ENV=production,GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=$REGION,DRIVE_SYNC_JOB_NAME=$JOB,DRIVE_ROOT_FOLDER_ID=$DRIVE_ROOT_FOLDER_ID,DRIVE_DELAY_BETWEEN_ACCOUNTS_MS=5000,DRIVE_DELAY_BETWEEN_CAMPAIGNS_MS=2000,DRIVE_MAX_FILE_SIZE_BYTES=314572800,DRIVE_PROPOSAL_TTL_DAYS=14,GEMINI_MAX_INPUT_CHARS=40000,MAIL_DRIVER=console,MAIL_FROM_NAME=GUB,MAILGUN_REGION=us,GUB_ADMIN_BASE_URL=$GUB_ADMIN_BASE_URL,GUB_REVIEW_BASE_URL=$GUB_REVIEW_BASE_URL,SNAPSHOT_WRITE_FAILURE_LIMIT=0,SKIP_UNCHANGED_CONTENT=on"
-                "--set-secrets=DATABASE_URL=gub-drive-sync-db-url-dev:latest,GUB_BOT_OAUTH_CLIENT_ID=gub-drive-sync-bot-oauth-client-id-dev:latest,GUB_BOT_OAUTH_CLIENT_SECRET=gub-drive-sync-bot-oauth-client-secret-dev:latest,GEMINI_API_KEY=gub-drive-sync-gemini-api-key-dev:latest,MAILGUN_API_KEY=gub-drive-sync-mailgun-api-key-dev:latest"
+                "--set-secrets=DATABASE_URL=gub-drive-sync-db-url-dev:latest,GUB_BOT_OAUTH_CLIENT_ID=gub-drive-sync-bot-oauth-client-id-dev:latest,GUB_BOT_OAUTH_CLIENT_SECRET=gub-drive-sync-bot-oauth-client-secret-dev:latest,MAILGUN_API_KEY=gub-drive-sync-mailgun-api-key-dev:latest"
               )
               ;;
             *)
