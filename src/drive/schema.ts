@@ -99,15 +99,17 @@ export type AccountCurrentState = {
   [K in AccountWritableField]: string | null;
 };
 
-export function buildAccountCurrentState(a: Pick<
-  Account,
-  | 'status'
-  | 'accountExecStaffId'
-  | 'industry'
-  | 'primaryContactName'
-  | 'primaryContactEmail'
-  | 'notes'
->): AccountCurrentState {
+export function buildAccountCurrentState(
+  a: Pick<
+    Account,
+    | 'status'
+    | 'accountExecStaffId'
+    | 'industry'
+    | 'primaryContactName'
+    | 'primaryContactEmail'
+    | 'notes'
+  >,
+): AccountCurrentState {
   return {
     status: a.status ?? null,
     account_exec_staff_id: a.accountExecStaffId ?? null,
@@ -133,14 +135,21 @@ const dateString = z
   .string()
   .nullable()
   .transform((v) => (v === null || v === '' ? null : v))
-  .pipe(z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD').nullable());
+  .pipe(
+    z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD')
+      .nullable(),
+  );
 
 export const CAMPAIGN_FIELD_VALIDATORS = {
   status: z
     .string()
     .nullable()
     .transform((v) => (v === null || v === '' ? null : v))
-    .pipe(z.enum(['pitch', 'awarded', 'live', 'ended', 'lost']).nullable()),
+    .pipe(
+      z.enum(['pitch', 'awarded', 'in_progress', 'live', 'paused', 'ended', 'lost']).nullable(),
+    ),
   budget: z
     .union([z.string(), z.number(), z.null()])
     .transform((v) => {
@@ -160,10 +169,9 @@ export type CampaignCurrentState = {
   [K in CampaignWritableField]: string | null;
 };
 
-export function buildCampaignCurrentState(c: Pick<
-  Campaign,
-  'status' | 'budget' | 'awardedAt' | 'liveAt' | 'endsAt'
->): CampaignCurrentState {
+export function buildCampaignCurrentState(
+  c: Pick<Campaign, 'status' | 'budget' | 'awardedAt' | 'liveAt' | 'endsAt'>,
+): CampaignCurrentState {
   return {
     status: c.status ?? null,
     budget: c.budget ? c.budget.toString() : null,
@@ -201,9 +209,7 @@ export const CAMPAIGN_FIELD_WRITE: Record<CampaignWritableField, FieldWriteSpec>
 
 // ── Utilities shared by interpret/distill ───────────────────────────────────
 
-export type ValidationResult =
-  | { ok: true; value: unknown }
-  | { ok: false; reason: string };
+export type ValidationResult = { ok: true; value: unknown } | { ok: false; reason: string };
 
 export function validateProposedValue(
   entity: 'account' | 'campaign',
